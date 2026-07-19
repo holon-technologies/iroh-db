@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-19
 - Decision owner: iroh-db protocol
+- Authorization amended by: ADR 0004 (`Read` is also required)
 
 ## Context
 
@@ -24,9 +25,9 @@ domains.
 1. iroh-db continues to mount the standard iroh-blobs ALPN and delegates all
    byte transfer, range handling, and verification to iroh-blobs.
 2. The iroh-blobs provider event interceptor rejects a connection unless its
-   authenticated QUIC endpoint currently has `FetchBlobs` in the `SyncNode`'s
-   selected domain. Private domains use their existing trusted-device implicit
-   capability.
+   authenticated QUIC endpoint currently has both `Read` and `FetchBlobs` in
+   the `SyncNode`'s selected domain. Private domains use their existing
+   trusted-device implicit capability.
 3. Every individual GET revalidates the endpoint against the current durable
    epoch and capability state. Revocation and epoch rotation therefore take
    effect for subsequent requests on already-open connections.
@@ -40,8 +41,8 @@ domains.
    immutable object.
 6. Downloaded, authenticated manifests and chunks are claimed for the receiving
    domain so an authorized cache can safely become a later provider.
-7. Client APIs also fail early when the local endpoint lacks `FetchBlobs`, but
-   provider-side checks are authoritative.
+7. Client APIs also fail early when the local endpoint lacks `Read` or
+   `FetchBlobs`, but provider-side checks are authoritative.
 
 ## Privacy and failure behavior
 

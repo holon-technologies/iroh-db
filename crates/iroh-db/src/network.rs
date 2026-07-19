@@ -16,7 +16,7 @@ use iroh_blobs::provider::events::{
 };
 use iroh_db_blobs::{BlobEngine, BlobRef, BlobStream, FetchMetrics, FetchOptions};
 use iroh_db_core::{AuthorId, BlobHash, CommitEnvelope, CommitId, DomainId};
-use iroh_db_security::{Invitation, verify_gossip_signature};
+use iroh_db_security::{Invitation, Permission, verify_gossip_signature};
 use iroh_db_sync::{
     GossipHint, MAX_CONTROL_FRAME, MAX_REFERENCES, MAX_SESSION_REFERENCES, SyncFrame,
     missing_commits,
@@ -193,6 +193,7 @@ impl SyncNode {
         &self,
         bootstrap: Vec<EndpointAddr>,
     ) -> Result<GossipSession, DbError> {
+        self.core.require_local_permission(Permission::Read)?;
         for peer in &bootstrap {
             self.lookup.add_endpoint_info(peer.clone());
         }
@@ -235,6 +236,7 @@ pub struct GossipSession {
 impl GossipSession {
     /// Broadcasts a signed hash-only hint for the current commit frontier.
     pub async fn announce(&self) -> Result<GossipHint, DbError> {
+        self.core.require_local_permission(Permission::Read)?;
         let commits = self.core.commit_ids()?;
         let commit = commits
             .last()
@@ -255,6 +257,7 @@ impl GossipSession {
 
     /// Waits for a valid hint and runs ordinary authenticated reconciliation with its provider.
     pub async fn sync_next(&mut self) -> Result<SyncReport, DbError> {
+        self.core.require_local_permission(Permission::Read)?;
         loop {
             let event = self
                 .receiver
@@ -266,13 +269,15 @@ impl GossipSession {
                 continue;
             };
             let provider = author_id(message.delivered_from);
-            if self.core.require_trusted(provider).is_err() {
+            if !self.core.peer_has_permission(provider, Permission::Read) {
                 continue;
             }
             let Ok(hint) = GossipHint::decode_canonical(&message.content) else {
                 continue;
             };
-            if self.core.require_trusted(hint.author()).is_err()
+            if !self
+                .core
+                .peer_has_permission(hint.author(), Permission::Read)
                 || verify_gossip_signature(
                     hint.author(),
                     &hint.signing_bytes().map_err(sync_error)?,
@@ -412,6 +417,7 @@ impl SyncCore {
         send: &mut SendStream,
         recv: &mut RecvStream,
     ) -> Result<(), DbError> {
+        self.require_local_permission(Permission::Read)?;
         let local_nonce = random_nonce()?;
         send_frame(
             send,
@@ -501,7 +507,7 @@ impl SyncCore {
                 return send_frame(send, &SyncFrame::Invitation { payload }).await;
             }
             SyncFrame::DomainRequest { domain_id, proof }
-                if self.require_trusted(peer).is_ok()
+                if self.peer_has_permission(peer, Permission::Read)
                     && domain_id == self.domain_id()
                     && proof == self.proof(remote_nonce, local_nonce, peer)? => {}
             _ => return Err(DbError::UnauthorizedDevice),
@@ -551,6 +557,12 @@ impl SyncCore {
     }
 
     fn require_local_blob_fetch(&self) -> Result<(), DbError> {
+        self.require_local_permission(Permission::Read)?;
+        self.require_local_permission(Permission::FetchBlobs)?;
+        Ok(())
+    }
+
+    fn require_local_permission(&self, permission: Permission) -> Result<(), DbError> {
         let active_epoch = self.db.inner.store.current_epoch(self.domain_id())?;
         if self.db.epoch() != active_epoch {
             return Err(DbError::StaleEpoch {
@@ -558,27 +570,25 @@ impl SyncCore {
                 active: active_epoch,
             });
         }
-        self.db.capability_for_permission(
-            self.db.author_id(),
-            iroh_db_security::Permission::FetchBlobs,
-            active_epoch,
-        )?;
+        self.db
+            .capability_for_permission(self.db.author_id(), permission, active_epoch)?;
         Ok(())
     }
 
-    fn can_peer_fetch_blob(&self, peer: AuthorId, hash: BlobHash) -> bool {
+    fn peer_has_permission(&self, peer: AuthorId, permission: Permission) -> bool {
         let Ok(active_epoch) = self.db.inner.store.current_epoch(self.domain_id()) else {
             return false;
         };
         self.db.epoch() == active_epoch
             && self
                 .db
-                .capability_for_permission(
-                    peer,
-                    iroh_db_security::Permission::FetchBlobs,
-                    active_epoch,
-                )
+                .capability_for_permission(peer, permission, active_epoch)
                 .is_ok()
+    }
+
+    fn can_peer_fetch_blob(&self, peer: AuthorId, hash: BlobHash) -> bool {
+        self.peer_has_permission(peer, Permission::Read)
+            && self.peer_has_permission(peer, Permission::FetchBlobs)
             && self
                 .db
                 .inner
@@ -605,19 +615,8 @@ impl SyncCore {
                     ProviderMessage::ClientConnected(message) => {
                         let peer = message.endpoint_id.map(author_id);
                         let allowed = peer.is_some_and(|peer| {
-                            let Ok(epoch) = core.db.inner.store.current_epoch(core.domain_id())
-                            else {
-                                return false;
-                            };
-                            core.db.epoch() == epoch
-                                && core
-                                    .db
-                                    .capability_for_permission(
-                                        peer,
-                                        iroh_db_security::Permission::FetchBlobs,
-                                        epoch,
-                                    )
-                                    .is_ok()
+                            core.peer_has_permission(peer, Permission::Read)
+                                && core.peer_has_permission(peer, Permission::FetchBlobs)
                         });
                         if let Some(peer) = peer.filter(|_| allowed) {
                             peers.insert(message.connection_id, peer);

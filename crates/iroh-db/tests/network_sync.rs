@@ -317,6 +317,118 @@ async fn blob_provider_does_not_cross_shared_store_domain_boundary() {
 }
 
 #[tokio::test]
+async fn sync_requires_explicit_read_permission() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_device = IrohDb::open(source_dir.path()).await.unwrap();
+    let target_device = IrohDb::open(target_dir.path()).await.unwrap();
+    let source = source_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = source
+        .invite(
+            target_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::FetchBlobs]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let target = target_device.import_invitation(&invitation).unwrap();
+    source
+        .issue_capability(
+            target.author_id(),
+            PermissionSet::from_permissions(&[Permission::FetchBlobs]),
+            PermissionSet::empty(),
+            source.domain_seed().epoch(),
+            None,
+        )
+        .unwrap();
+    source
+        .collection::<Note>()
+        .put(note("private", "not readable", source.author_id()))
+        .await
+        .unwrap();
+    let source_node = source.start_sync().await.unwrap();
+    let target_node = target.start_sync().await.unwrap();
+
+    assert!(target_node.sync_with(source_node.addr()).await.is_err());
+    assert!(
+        target
+            .collection::<Note>()
+            .get(&"private".to_owned())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    source_node.shutdown().await.unwrap();
+    target_node.shutdown().await.unwrap();
+    drop(source);
+    drop(target);
+    source_device.close().await.unwrap();
+    target_device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_bootstrap_requires_receiver_read_permission() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_device = IrohDb::open(source_dir.path()).await.unwrap();
+    let target_device = IrohDb::open(target_dir.path()).await.unwrap();
+    let source = source_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = source
+        .invite(
+            target_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::FetchBlobs]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let target = target_device.import_invitation(&invitation).unwrap();
+    source
+        .issue_capability(
+            target.author_id(),
+            PermissionSet::from_permissions(&[Permission::FetchBlobs]),
+            PermissionSet::empty(),
+            source.domain_seed().epoch(),
+            None,
+        )
+        .unwrap();
+    source
+        .collection::<Note>()
+        .put(note("private", "not bootstrapped", source.author_id()))
+        .await
+        .unwrap();
+    let snapshot = source.snapshot().await.unwrap();
+    let source_node = source.start_sync().await.unwrap();
+    let target_node = target.start_sync().await.unwrap();
+
+    assert!(
+        target_node
+            .bootstrap_from(source_node.addr(), snapshot)
+            .await
+            .is_err()
+    );
+    assert!(
+        target
+            .collection::<Note>()
+            .get(&"private".to_owned())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    source_node.shutdown().await.unwrap();
+    target_node.shutdown().await.unwrap();
+    drop(source);
+    drop(target);
+    source_device.close().await.unwrap();
+    target_device.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn three_partitioned_peers_converge_after_reordered_pairwise_sessions() {
     let seed = DomainSeed::generate().unwrap();
     let dirs = [
