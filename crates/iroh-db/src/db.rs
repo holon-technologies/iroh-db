@@ -860,10 +860,19 @@ impl IrohDb {
             })
             .collect();
         let invalid: Vec<_> = invalid.into_iter().collect();
+        let previous_records = self.inner.store.export_materialized(self.domain_id())?;
         self.inner
             .store
             .quarantine_equivocation(&evidence, &invalid, &frontier, &author_heads, &mutations)
             .await?;
+        let changes = materialization_changes(&previous_records, &mutations);
+        if !changes.is_empty() {
+            let _no_subscribers = self.changes().send(ChangeBatch {
+                commit_id: evidence.commit_id(),
+                sequence,
+                changes,
+            });
+        }
         Ok(RemoteApply::Quarantined { author, sequence })
     }
 
@@ -1896,6 +1905,44 @@ fn prepare_delete<Record: IrohRecord>(id: &Record::Id) -> Result<PreparedRecord,
 
 type RecordTarget = (CollectionId, Vec<u8>);
 type RecordCandidates = BTreeMap<RecordTarget, Vec<(CommitId, MaterializedRecord)>>;
+
+fn materialization_changes(
+    before: &[MaterializedRecord],
+    after: &[MaterializedRecord],
+) -> Vec<Change> {
+    let before = present_records(before);
+    let after = present_records(after);
+    before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|target| before.get(target) != after.get(target))
+        .map(|(collection_id, record_id)| Change {
+            collection_id,
+            kind: if after.contains_key(&(collection_id, record_id.clone())) {
+                ChangeKind::Upserted
+            } else {
+                ChangeKind::Deleted
+            },
+            record_id,
+        })
+        .collect()
+}
+
+fn present_records(values: &[MaterializedRecord]) -> BTreeMap<RecordTarget, &MaterializedRecord> {
+    values
+        .iter()
+        .filter(|record| record.state().is_some())
+        .map(|record| {
+            (
+                (record.schema().collection_id(), record.record_id().to_vec()),
+                record,
+            )
+        })
+        .collect()
+}
 
 fn validate_incoming_operations(
     envelope: &CommitEnvelope,

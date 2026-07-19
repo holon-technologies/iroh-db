@@ -1,6 +1,6 @@
 use iroh_db::{
-    AuthorId, CapabilityId, DbError, DomainSeed, Dot, IrohDb, IrohRecord, Lww, RemoteApply,
-    TransactionId, VersionVector,
+    AuthorId, CapabilityId, ChangeKind, DbError, DomainSeed, Dot, IrohDb, IrohRecord, Lww,
+    RemoteApply, SubscriptionEvent, TransactionId, VersionVector,
 };
 use iroh_db_core::{CommitBody, CommitHeader, Operation, OperationKind};
 use iroh_db_security::{LocalCredentials, seal_commit};
@@ -229,6 +229,7 @@ fn equivocation_commit(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn replicas_quarantine_equivocation_independently_of_receipt_order() {
     let seed = DomainSeed::generate().unwrap();
     let first_dir = tempfile::tempdir().unwrap();
@@ -243,8 +244,13 @@ async fn replicas_quarantine_equivocation_independently_of_receipt_order() {
     let writer = IrohDb::create_in_domain(writer_dir.path(), &seed)
         .await
         .unwrap();
-    first.collection::<Note>();
+    let first_notes = first.collection::<Note>();
     second.collection::<Note>();
+    let mut changes = first_notes.subscribe().unwrap();
+    assert!(matches!(
+        changes.recv().await.unwrap(),
+        SubscriptionEvent::Initial(records) if records.is_empty()
+    ));
     first.trust_device(writer.author_id()).unwrap();
     second.trust_device(writer.author_id()).unwrap();
     let credentials = LocalCredentials::load_or_create(writer_dir.path().join("keys")).unwrap();
@@ -258,6 +264,11 @@ async fn replicas_quarantine_equivocation_independently_of_receipt_order() {
             .await
             .unwrap(),
         RemoteApply::Applied(_)
+    ));
+    assert!(matches!(
+        changes.recv().await.unwrap(),
+        SubscriptionEvent::Changes(batch)
+            if batch.changes().iter().any(|change| change.kind() == ChangeKind::Upserted)
     ));
     assert!(matches!(
         second
@@ -274,6 +285,14 @@ async fn replicas_quarantine_equivocation_independently_of_receipt_order() {
             .await
             .unwrap(),
         RemoteApply::Quarantined { author, sequence: 0 } if author == writer.author_id()
+    ));
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        SubscriptionEvent::Changes(batch)
+            if batch.changes().iter().any(|change| change.kind() == ChangeKind::Deleted)
     ));
     assert!(matches!(
         second
@@ -311,6 +330,8 @@ async fn replicas_quarantine_equivocation_independently_of_receipt_order() {
     ));
     assert_eq!(first.state_root().unwrap(), empty_root);
 
+    drop(changes);
+    drop(first_notes);
     writer.close().await.unwrap();
     first.close().await.unwrap();
     second.close().await.unwrap();
