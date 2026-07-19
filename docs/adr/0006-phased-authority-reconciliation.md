@@ -28,8 +28,9 @@ reconciliation:
    only when the authenticated receiver remains trusted and has `READ` plus
    `FETCH_BLOBS` at the new epoch. Required capability-chain objects accompany
    the transition but grant no authority until locally validated.
-5. The receiver observes the control object, durably stages the digest-matching
-   key, atomically applies control, and activates the staged key.
+5. The receiver durably stages the digest-matching key, atomically installs the
+   signed successor capability evidence with the control head, and activates
+   the staged key. Invalid evidence changes neither active capability nor head.
 6. The process repeats for every missed epoch, then ordinary bidirectional tail
    reconciliation runs at the common active epoch.
 

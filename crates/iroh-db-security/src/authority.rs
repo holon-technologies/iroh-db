@@ -9,7 +9,7 @@ use crate::{
 };
 
 const AUTHORITY_VERSION: u16 = 1;
-const CONTROL_VERSION: u16 = 2;
+const CONTROL_VERSION: u16 = 3;
 const MAX_DELEGATION_DEPTH: u8 = 8;
 const MAX_CONTROL_COMMITS: usize = 65_536;
 const MAX_CONTROL_REVOKED: usize = 1_024;
@@ -475,6 +475,7 @@ pub struct ControlTransition {
     revoked_subjects: Vec<AuthorId>,
     writer: AuthorId,
     controller: AuthorId,
+    controller_capability: CapabilityId,
     key_distribution_digest: [u8; 32],
     author: AuthorId,
     author_capability: CapabilityId,
@@ -493,6 +494,7 @@ impl ControlTransition {
         mut revoked_subjects: Vec<AuthorId>,
         writer: AuthorId,
         controller: AuthorId,
+        controller_capability: CapabilityId,
         key_distribution_digest: [u8; 32],
         author_capability: CapabilityId,
         nonce: [u8; 32],
@@ -512,6 +514,7 @@ impl ControlTransition {
             revoked_subjects,
             writer,
             controller,
+            controller_capability,
             key_distribution_digest,
             author: signer.author(),
             author_capability,
@@ -550,6 +553,10 @@ impl ControlTransition {
     /// Returns the endpoint designated to author the next control transition.
     pub const fn controller(&self) -> AuthorId {
         self.controller
+    }
+    /// Returns the capability that authorizes the designated successor.
+    pub const fn controller_capability(&self) -> CapabilityId {
+        self.controller_capability
     }
     pub const fn key_distribution_digest(&self) -> [u8; 32] {
         self.key_distribution_digest
@@ -605,6 +612,7 @@ impl ControlTransition {
             revoked_subjects: content.revoked_subjects,
             writer: content.writer,
             controller: content.controller,
+            controller_capability: content.controller_capability,
             key_distribution_digest: content.key_distribution_digest,
             author: content.author,
             author_capability: content.author_capability,
@@ -644,6 +652,7 @@ impl ControlTransition {
             revoked_subjects: self.revoked_subjects.clone(),
             writer: self.writer,
             controller: self.controller,
+            controller_capability: self.controller_capability,
             key_distribution_digest: self.key_distribution_digest,
             author: self.author,
             author_capability: self.author_capability,
@@ -774,6 +783,8 @@ struct ControlContent {
     nonce: [u8; 32],
     #[n(13)]
     controller: AuthorId,
+    #[n(14)]
+    controller_capability: CapabilityId,
 }
 
 #[derive(minicbor::Encode, minicbor::Decode)]

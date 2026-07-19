@@ -58,6 +58,12 @@ impl DomainSeed {
         self.domain_key.clone()
     }
 
+    /// Exposes key bytes only to an authenticated epoch-distribution protocol.
+    #[doc(hidden)]
+    pub const fn epoch_key_bytes(&self) -> [u8; 32] {
+        *self.domain_key.as_bytes()
+    }
+
     /// Creates the next epoch for this stable domain using a fresh random key.
     pub fn next_epoch(&self) -> Result<Self, SecurityError> {
         Ok(Self {
@@ -85,6 +91,12 @@ impl DomainSeed {
             epoch,
             domain_key,
         }
+    }
+
+    /// Reconstructs a digest-verified epoch grant received over authenticated transport.
+    #[doc(hidden)]
+    pub const fn from_epoch_key(domain_id: DomainId, epoch: u64, key: [u8; 32]) -> Self {
+        Self::from_parts(domain_id, epoch, DomainKey::from_bytes(key))
     }
 }
 

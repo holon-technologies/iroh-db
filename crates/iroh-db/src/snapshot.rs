@@ -112,7 +112,10 @@ impl IrohDb {
     /// Verifies and atomically installs a local snapshot's derived state.
     pub async fn install_snapshot(&self, snapshot: Snapshot) -> Result<(), DbError> {
         let _writer = self.inner.writer.lock().await;
-        let mut stream = self.blob_engine().open(&snapshot.blob).await?;
+        let mut stream = self
+            .blob_engine_for_epoch(snapshot.blob.epoch())?
+            .open(&snapshot.blob)
+            .await?;
         let mut bytes = Vec::new();
         stream
             .read_to_end(&mut bytes)

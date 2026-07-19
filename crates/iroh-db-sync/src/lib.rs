@@ -18,6 +18,8 @@ const GOSSIP_VERSION: u16 = 1;
 pub const MAX_GOSSIP_HINT: usize = 512;
 /// Maximum capability objects carried by one authenticated authority message.
 pub const MAX_CAPABILITY_CHAIN: usize = 9;
+/// Maximum objects in the exact successor chain carried by a control grant.
+pub const MAX_CONTROL_CAPABILITIES: usize = MAX_CAPABILITY_CHAIN;
 /// Maximum canonical capability-certificate size.
 pub const MAX_CAPABILITY_BYTES: usize = 4_096;
 
@@ -121,7 +123,7 @@ impl GossipHint {
 }
 
 /// One canonical `/iroh-db/sync/1` control-plane message.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SyncFrame {
     /// Negotiates the protocol and binds a fresh session nonce.
     Hello {
@@ -145,7 +147,7 @@ pub enum SyncFrame {
     AuthorityState {
         /// Active domain epoch.
         epoch: u64,
-        /// Accepted control sequence, equal to the epoch for format v2.
+        /// Accepted control sequence, equal to the epoch for control format v3.
         sequence: u64,
         /// Canonical control-head ID, absent at genesis.
         head: Option<[u8; 32]>,
@@ -158,6 +160,11 @@ pub enum SyncFrame {
         epoch_key: [u8; 32],
         /// Capability evidence required to validate transition authority.
         capability_chain: Vec<Vec<u8>>,
+    },
+    /// Exchanges a signed control head as equivocation evidence without key material.
+    ControlEvidence {
+        /// Canonical signed [`iroh_db_security::ControlTransition`] bytes.
+        transition: Vec<u8>,
     },
     /// Advertises a bounded local commit frontier or accepted set.
     Frontier {
@@ -193,6 +200,75 @@ pub enum SyncFrame {
         /// Canonical signed invitation payload.
         payload: Vec<u8>,
     },
+}
+
+impl std::fmt::Debug for SyncFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hello { max_frame, .. } => formatter
+                .debug_struct("Hello")
+                .field("max_frame", max_frame)
+                .finish_non_exhaustive(),
+            Self::DomainRequest {
+                domain_id,
+                epoch,
+                capability_chain,
+                ..
+            } => formatter
+                .debug_struct("DomainRequest")
+                .field("domain_id", domain_id)
+                .field("epoch", epoch)
+                .field("capability_count", &capability_chain.len())
+                .finish_non_exhaustive(),
+            Self::AuthorityState {
+                epoch,
+                sequence,
+                head,
+            } => formatter
+                .debug_struct("AuthorityState")
+                .field("epoch", epoch)
+                .field("sequence", sequence)
+                .field("head", head)
+                .finish(),
+            Self::ControlGrant {
+                capability_chain, ..
+            } => formatter
+                .debug_struct("ControlGrant")
+                .field("capability_count", &capability_chain.len())
+                .field("key_material", &"[redacted]")
+                .finish_non_exhaustive(),
+            Self::ControlEvidence { transition } => formatter
+                .debug_struct("ControlEvidence")
+                .field("transition_len", &transition.len())
+                .finish(),
+            Self::Frontier { commits } => debug_references(formatter, "Frontier", commits),
+            Self::Need { commits } => debug_references(formatter, "Need", commits),
+            Self::Refs { commits } => debug_references(formatter, "Refs", commits),
+            Self::Ack { commit } => formatter
+                .debug_struct("Ack")
+                .field("commit", commit)
+                .finish(),
+            Self::Done => formatter.write_str("Done"),
+            Self::Error { code } => formatter.debug_struct("Error").field("code", code).finish(),
+            Self::InvitationRequest => formatter.write_str("InvitationRequest"),
+            Self::Invitation { payload } => formatter
+                .debug_struct("Invitation")
+                .field("payload_len", &payload.len())
+                .field("payload", &"[redacted]")
+                .finish(),
+        }
+    }
+}
+
+fn debug_references(
+    formatter: &mut std::fmt::Formatter<'_>,
+    name: &str,
+    commits: &[CommitId],
+) -> std::fmt::Result {
+    formatter
+        .debug_struct(name)
+        .field("commit_count", &commits.len())
+        .finish()
 }
 
 impl SyncFrame {
@@ -423,6 +499,10 @@ impl From<&SyncFrame> for WireFrame {
                 wire.epoch_key = Some((*epoch_key).into());
                 wire.payloads.clone_from(capability_chain);
             }
+            SyncFrame::ControlEvidence { transition } => {
+                wire.kind = 12;
+                wire.payload = Some(transition.clone());
+            }
         }
         wire
     }
@@ -545,6 +625,17 @@ fn decode_authority_frame(wire: WireFrame) -> Result<SyncFrame, SyncFrameError> 
                 capability_chain: wire.payloads,
             })
         }
+        12 if common_shape
+            && wire.epoch.is_none()
+            && wire.sequence.is_none()
+            && wire.head.is_none()
+            && wire.epoch_key.is_none()
+            && wire.payloads.is_empty() =>
+        {
+            Ok(SyncFrame::ControlEvidence {
+                transition: wire.payload.ok_or(SyncFrameError::InvalidShape)?,
+            })
+        }
         _ => Err(SyncFrameError::InvalidShape),
     }
 }
@@ -598,16 +689,16 @@ fn validate(frame: &SyncFrame) -> Result<(), SyncFrameError> {
         }
         SyncFrame::DomainRequest {
             capability_chain, ..
-        }
-        | SyncFrame::ControlGrant {
+        } => validate_capability_chain(capability_chain, MAX_CAPABILITY_CHAIN),
+        SyncFrame::ControlGrant {
             capability_chain, ..
-        } => validate_capability_chain(capability_chain),
+        } => validate_capability_chain(capability_chain, MAX_CONTROL_CAPABILITIES),
         _ => Ok(()),
     }
 }
 
-fn validate_capability_chain(chain: &[Vec<u8>]) -> Result<(), SyncFrameError> {
-    if chain.len() > MAX_CAPABILITY_CHAIN {
+fn validate_capability_chain(chain: &[Vec<u8>], maximum: usize) -> Result<(), SyncFrameError> {
+    if chain.len() > maximum {
         return Err(SyncFrameError::TooManyAuthorityObjects(chain.len()));
     }
     if let Some(object) = chain

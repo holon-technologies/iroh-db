@@ -106,6 +106,11 @@ impl AuthorityFixture {
         controller: AuthorId,
         nonce: u8,
     ) -> ControlTransition {
+        let controller_capability = if controller == self.delegate.author() {
+            self.delegate_capability.id().unwrap()
+        } else {
+            self.root.id().unwrap()
+        };
         ControlTransition::issue(
             self.domain,
             sequence,
@@ -115,6 +120,7 @@ impl AuthorityFixture {
             Vec::new(),
             self.owner.author(),
             controller,
+            controller_capability,
             [nonce; 32],
             capability.id().unwrap(),
             [nonce.wrapping_add(1); 32],
@@ -122,6 +128,156 @@ impl AuthorityFixture {
         )
         .unwrap()
     }
+}
+
+#[test]
+fn successor_capability_and_control_advance_atomically() {
+    let fixture = AuthorityFixture::new();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    store
+        .bootstrap_domain(&fixture.descriptor, &fixture.root)
+        .unwrap();
+    let transfer = fixture.control(
+        &fixture.owner,
+        &fixture.root,
+        1,
+        None,
+        0,
+        fixture.delegate.author(),
+        47,
+    );
+
+    store
+        .apply_control_bundle(
+            &transfer,
+            &[fixture.root.clone(), fixture.delegate_capability.clone()],
+        )
+        .unwrap();
+
+    assert_eq!(store.control_head(fixture.domain).unwrap(), Some(transfer));
+    assert_eq!(
+        store
+            .active_capability(fixture.domain, fixture.delegate.author())
+            .unwrap(),
+        Some(fixture.delegate_capability.id().unwrap())
+    );
+}
+
+#[test]
+fn rejected_control_bundle_leaves_capability_and_head_unchanged() {
+    let fixture = AuthorityFixture::new();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    store
+        .bootstrap_domain(&fixture.descriptor, &fixture.root)
+        .unwrap();
+    let invalid = fixture.control(
+        &fixture.owner,
+        &fixture.root,
+        1,
+        None,
+        1,
+        fixture.delegate.author(),
+        48,
+    );
+
+    assert!(matches!(
+        store.apply_control_bundle(
+            &invalid,
+            &[fixture.root.clone(), fixture.delegate_capability.clone()],
+        ),
+        Err(StoreError::InvalidAuthority(_))
+    ));
+    assert!(store.control_head(fixture.domain).unwrap().is_none());
+    assert!(
+        store
+            .capability(fixture.delegate_capability.id().unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .active_capability(fixture.domain, fixture.delegate.author())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn invitation_authority_import_is_atomic_and_activates_only_root_and_leaf() {
+    let fixture = AuthorityFixture::new();
+    let invalid_directory = tempfile::tempdir().unwrap();
+    let invalid_store =
+        Store::open(invalid_directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    let sibling_signer = IrohSigner::from_secret_bytes([47; 32]);
+    let sibling = fixture
+        .root
+        .delegate(
+            &fixture.owner,
+            sibling_signer.author(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            0,
+            None,
+            [48; 32],
+        )
+        .unwrap();
+    assert!(matches!(
+        invalid_store.import_domain_authority_atomic(
+            &fixture.descriptor,
+            &[
+                fixture.root.clone(),
+                fixture.delegate_capability.clone(),
+                sibling,
+            ],
+        ),
+        Err(StoreError::InvalidAuthority(_))
+    ));
+    assert!(
+        invalid_store
+            .domain_descriptor(fixture.domain)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        invalid_store
+            .capability(fixture.root.id().unwrap())
+            .unwrap()
+            .is_none()
+    );
+
+    let valid_directory = tempfile::tempdir().unwrap();
+    let valid_store =
+        Store::open(valid_directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    valid_store
+        .import_domain_authority_atomic(
+            &fixture.descriptor,
+            &[fixture.root.clone(), fixture.delegate_capability.clone()],
+        )
+        .unwrap();
+    assert_eq!(
+        valid_store
+            .active_capability(fixture.domain, fixture.delegate.author())
+            .unwrap(),
+        Some(fixture.delegate_capability.id().unwrap())
+    );
+    assert_eq!(
+        valid_store
+            .active_capability(fixture.domain, fixture.owner.author())
+            .unwrap(),
+        Some(fixture.root.id().unwrap())
+    );
+    assert!(
+        valid_store
+            .is_author_trusted(fixture.domain, fixture.owner.author())
+            .unwrap()
+    );
+    assert!(
+        valid_store
+            .is_author_trusted(fixture.domain, fixture.delegate.author())
+            .unwrap()
+    );
 }
 
 #[test]
@@ -234,6 +390,10 @@ fn only_designated_controller_can_advance_and_transfer_control() {
     );
     store.apply_control(&next).unwrap();
     assert_eq!(store.current_epoch(fixture.domain).unwrap(), 2);
+    assert_eq!(
+        store.accepted_control_chain(fixture.domain).unwrap(),
+        vec![transfer, next]
+    );
 }
 
 #[test]
@@ -319,6 +479,7 @@ fn sibling_detection_does_not_depend_on_first_arrival_revocations() {
         vec![fixture.delegate.author()],
         fixture.owner.author(),
         fixture.owner.author(),
+        fixture.root.id().unwrap(),
         [70; 32],
         fixture.root.id().unwrap(),
         [71; 32],

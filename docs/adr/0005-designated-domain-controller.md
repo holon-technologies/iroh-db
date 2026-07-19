@@ -21,9 +21,11 @@ reorganizations and nonce grinding by an administrator.
 2. Only the current controller may sign the next control transition. The
    endpoint must also hold an active `Admin` or `Revoke` capability for the
    transition's previous epoch; designation never bypasses capabilities.
-3. Each transition names the controller for its successor state. A transfer is
-   valid only when the successor controller already has an active `Admin`
-   capability that covers the new epoch and is not revoked by that transition.
+3. Each transition names the controller for its successor state and signs the
+   exact successor capability ID. A transfer is valid only when that capability
+   grants the successor `Admin` at the new epoch and is not revoked by the
+   transition. Replicated successor evidence and the control head are installed
+   in one durable transaction, so validation never depends on receipt order.
 4. `MultiWriter`, `SingleWriter`, and `AppendOnly` continue to govern application
    commits independently. The existing `writer` field remains the application
    writer; the new `controller` field governs only the control chain.
@@ -62,9 +64,10 @@ crash point recoverable without treating the key catalog as authority.
 
 ## Verification
 
-Canonical-codec tests bind the successor controller into the signature and
-content ID. Store tests prove that a delegated administrator cannot rotate,
-controller transfer takes effect exactly at the next transition, and opposite
-receipt orders of two controller siblings leave both replicas durably frozen.
+Canonical-codec tests bind the successor controller and capability ID into the
+signature and content ID. Store tests prove that a delegated administrator
+cannot rotate, controller transfer takes effect exactly at the next transition,
+and opposite receipt orders of two controller siblings leave both replicas
+durably frozen.
 Facade tests prove a frozen domain rejects reads of the active epoch for network
 authorization and refuses subsequent local writes.

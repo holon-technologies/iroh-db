@@ -909,6 +909,43 @@ impl Store {
         Ok(ids)
     }
 
+    /// Lists locally stored accepted commits visible through an epoch.
+    pub fn list_stored_commit_ids_through(
+        &self,
+        domain_id: DomainId,
+        max_epoch: u64,
+    ) -> Result<Vec<CommitId>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let commits = read.open_table(COMMIT_METADATA).map_err(database_error)?;
+        let quarantined = read
+            .open_table(QUARANTINED_COMMITS)
+            .map_err(database_error)?;
+        let mut ids = Vec::new();
+        for entry in commits.iter().map_err(database_error)? {
+            let (key, value) = entry.map_err(database_error)?;
+            let metadata = value.value();
+            if metadata.len() != 112 || !metadata.starts_with(domain_id.as_bytes()) {
+                continue;
+            }
+            let epoch = u64::from_be_bytes(metadata[64..72].try_into().map_err(|_| {
+                StoreError::CorruptDerivedMetadata("commit epoch metadata is invalid".into())
+            })?);
+            if epoch <= max_epoch
+                && quarantined
+                    .get(key.value())
+                    .map_err(database_error)?
+                    .is_none()
+            {
+                let bytes: [u8; 32] = key.value().try_into().map_err(|_| {
+                    StoreError::CorruptDerivedMetadata("commit ID length is invalid".into())
+                })?;
+                ids.push(CommitId::from_bytes(bytes));
+            }
+        }
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
     /// Exports durable per-author sequence baselines for a snapshot.
     pub fn author_sequences(
         &self,
@@ -1107,6 +1144,9 @@ impl Store {
         descriptor: &DomainDescriptor,
         root: &CapabilityCertificate,
     ) -> Result<(), StoreError> {
+        let _control_writer = self.inner.control_writer.lock().map_err(|_| {
+            StoreError::InvalidAuthority("control writer lock is unavailable".into())
+        })?;
         descriptor.verify().map_err(authority_error)?;
         root.verify_signature().map_err(authority_error)?;
         if root.domain_id() != descriptor.domain_id()
@@ -1149,11 +1189,120 @@ impl Store {
         write.commit().map_err(database_error)
     }
 
+    /// Atomically imports a descriptor, chain, active root/leaf, and trust set.
+    pub fn import_domain_authority_atomic(
+        &self,
+        descriptor: &DomainDescriptor,
+        chain: &[CapabilityCertificate],
+    ) -> Result<CapabilityId, StoreError> {
+        let _control_writer = self.inner.control_writer.lock().map_err(|_| {
+            StoreError::InvalidAuthority("control writer lock is unavailable".into())
+        })?;
+        descriptor.verify().map_err(authority_error)?;
+        if chain.is_empty() || chain.len() > 9 {
+            return Err(StoreError::InvalidAuthority(
+                "capability chain has invalid depth".into(),
+            ));
+        }
+        let root = &chain[0];
+        root.verify_signature().map_err(authority_error)?;
+        if root.domain_id() != descriptor.domain_id()
+            || root.subject() != descriptor.owner()
+            || root.issuer_capability().is_some()
+            || !root.permissions().contains(Permission::Admin)
+        {
+            return Err(StoreError::InvalidAuthority(
+                "capability root does not match descriptor".into(),
+            ));
+        }
+        for pair in chain.windows(2) {
+            pair[1]
+                .validate_delegation(&pair[0])
+                .map_err(authority_error)?;
+        }
+        if let Some(existing) = self.domain_descriptor(descriptor.domain_id())?
+            && existing != *descriptor
+        {
+            return Err(StoreError::InvalidAuthority(
+                "domain descriptor conflicts with genesis".into(),
+            ));
+        }
+        let mut validated = Vec::with_capacity(chain.len());
+        for capability in chain {
+            if capability.domain_id() != descriptor.domain_id() {
+                return Err(StoreError::InvalidAuthority(
+                    "capability chain crosses domains".into(),
+                ));
+            }
+            let capability_id = capability.id().map_err(authority_error)?;
+            let bytes = capability.encode_canonical().map_err(authority_error)?;
+            if let Some(stored) = self.capability(capability_id)?
+                && stored != *capability
+            {
+                return Err(StoreError::InvalidAuthority(
+                    "capability ID collision".into(),
+                ));
+            }
+            validated.push((capability.clone(), capability_id, bytes));
+        }
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let revoked = read
+            .open_table(REVOKED_CAPABILITIES)
+            .map_err(database_error)?;
+        for (_, capability_id, _) in &validated {
+            if revoked
+                .get(capability_id.as_bytes().as_slice())
+                .map_err(database_error)?
+                .is_some()
+            {
+                return Err(StoreError::InvalidAuthority(
+                    "capability chain contains revoked evidence".into(),
+                ));
+            }
+        }
+        drop(revoked);
+        drop(read);
+
+        let descriptor_bytes = descriptor.encode_canonical().map_err(authority_error)?;
+        let (leaf, leaf_id, _) = validated
+            .last()
+            .ok_or_else(|| StoreError::InvalidAuthority("capability chain is empty".into()))?;
+        let write = self.inner.database.begin_write().map_err(database_error)?;
+        write
+            .open_table(DOMAIN_DESCRIPTORS)
+            .map_err(database_error)?
+            .insert(
+                descriptor.domain_id().as_bytes().as_slice(),
+                descriptor_bytes.as_slice(),
+            )
+            .map_err(database_error)?;
+        for (_, capability_id, bytes) in &validated {
+            insert_capability_record(&write, *capability_id, bytes)?;
+        }
+        let (root, root_id, _) = validated
+            .first()
+            .ok_or_else(|| StoreError::InvalidAuthority("capability chain is empty".into()))?;
+        set_active_capability(&write, root, *root_id)?;
+        set_active_capability(&write, leaf, *leaf_id)?;
+        {
+            let mut trusted = write.open_table(TRUSTED_AUTHORS).map_err(database_error)?;
+            for (capability, _, _) in &validated {
+                let key = trusted_author_key(descriptor.domain_id(), capability.subject());
+                trusted.insert(key.as_slice(), 1).map_err(database_error)?;
+            }
+        }
+        write.commit().map_err(database_error)?;
+        Ok(*leaf_id)
+    }
+
     /// Installs a delegated capability after validating its durable issuer link.
     pub fn install_capability(
         &self,
         capability: &CapabilityCertificate,
     ) -> Result<CapabilityId, StoreError> {
+        let _control_writer = self.inner.control_writer.lock().map_err(|_| {
+            StoreError::InvalidAuthority("control writer lock is unavailable".into())
+        })?;
         let issuer_id = capability.issuer_capability().ok_or_else(|| {
             StoreError::InvalidAuthority("delegated capability lacks issuer".into())
         })?;
@@ -1169,6 +1318,31 @@ impl Store {
         insert_capability_tables(&write, capability, capability_id, &bytes)?;
         write.commit().map_err(database_error)?;
         Ok(capability_id)
+    }
+
+    /// Atomically installs a validated root-to-leaf capability chain.
+    ///
+    /// Only the leaf becomes active. Intermediate certificates are retained as
+    /// immutable delegation evidence and cannot replace another subject's
+    /// active capability as a side effect of authenticating the leaf.
+    pub fn install_capability_chain_atomic(
+        &self,
+        chain: &[CapabilityCertificate],
+    ) -> Result<CapabilityId, StoreError> {
+        let _control_writer = self.inner.control_writer.lock().map_err(|_| {
+            StoreError::InvalidAuthority("control writer lock is unavailable".into())
+        })?;
+        let validated = self.validate_capability_chain_for_install(chain, None)?;
+        let (leaf, leaf_id, _) = validated
+            .last()
+            .ok_or_else(|| StoreError::InvalidAuthority("capability chain is empty".into()))?;
+        let write = self.inner.database.begin_write().map_err(database_error)?;
+        for (_, capability_id, bytes) in &validated {
+            insert_capability_record(&write, *capability_id, bytes)?;
+        }
+        set_active_capability(&write, leaf, *leaf_id)?;
+        write.commit().map_err(database_error)?;
+        Ok(*leaf_id)
     }
 
     /// Loads one verified capability certificate by content ID.
@@ -1303,6 +1477,58 @@ impl Store {
             .transpose()
     }
 
+    /// Returns the accepted control chain in ascending sequence order.
+    pub fn accepted_control_chain(
+        &self,
+        domain_id: DomainId,
+    ) -> Result<Vec<ControlTransition>, StoreError> {
+        self.ensure_control_not_forked(domain_id)?;
+        let Some(mut current) = self.control_head(domain_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut reversed = Vec::new();
+        loop {
+            let predecessor = current.predecessor();
+            reversed.push(current);
+            let Some(predecessor) = predecessor else {
+                break;
+            };
+            current = self
+                .control_object(domain_id, predecessor)?
+                .ok_or_else(|| {
+                    StoreError::CorruptDerivedMetadata(
+                        "accepted control predecessor is missing".into(),
+                    )
+                })?;
+        }
+        reversed.reverse();
+        for (index, control) in reversed.iter().enumerate() {
+            let expected = u64::try_from(index)
+                .map_err(|_| {
+                    StoreError::CorruptDerivedMetadata("control chain is too long".into())
+                })?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    StoreError::CorruptDerivedMetadata("control sequence overflow".into())
+                })?;
+            if control.domain_id() != domain_id || control.sequence() != expected {
+                return Err(StoreError::CorruptDerivedMetadata(
+                    "accepted control chain is not contiguous".into(),
+                ));
+            }
+        }
+        Ok(reversed)
+    }
+
+    /// Loads one retained canonical control object by content ID.
+    pub fn control_transition(
+        &self,
+        domain_id: DomainId,
+        control_id: [u8; 32],
+    ) -> Result<Option<ControlTransition>, StoreError> {
+        self.control_object(domain_id, control_id)
+    }
+
     /// Returns the epoch authorized by the durable control chain.
     pub fn current_epoch(&self, domain_id: DomainId) -> Result<u64, StoreError> {
         self.ensure_control_not_forked(domain_id)?;
@@ -1386,6 +1612,7 @@ impl Store {
             control,
             self.current_controller(control.domain_id())?,
             epoch,
+            None,
         )?;
         let write = self.inner.database.begin_write().map_err(database_error)?;
         insert_control_observation(&write, control, control_id)?;
@@ -1394,6 +1621,15 @@ impl Store {
 
     /// Atomically advances authority, records the causal cut, and revokes endpoint access.
     pub fn apply_control(&self, control: &ControlTransition) -> Result<(), StoreError> {
+        self.apply_control_bundle(control, &[])
+    }
+
+    /// Atomically installs successor capability evidence and advances authority.
+    pub fn apply_control_bundle(
+        &self,
+        control: &ControlTransition,
+        successor_chain: &[CapabilityCertificate],
+    ) -> Result<(), StoreError> {
         let _control_writer = self.inner.control_writer.lock().map_err(|_| {
             StoreError::InvalidAuthority("control writer lock is unavailable".into())
         })?;
@@ -1439,10 +1675,22 @@ impl Store {
                 "control transition does not extend the active head".into(),
             ));
         }
+        let validated_successor = if successor_chain.is_empty() {
+            Vec::new()
+        } else {
+            self.validate_capability_chain_for_install(
+                successor_chain,
+                Some(control.controller_capability()),
+            )?
+        };
+        let candidate_successor = validated_successor
+            .last()
+            .map(|(capability, _, _)| capability);
         self.validate_control_authority(
             control,
             self.current_controller(control.domain_id())?,
             epoch,
+            candidate_successor,
         )?;
         if control.revoked_subjects().contains(&control.author()) {
             return Err(StoreError::InvalidAuthority(
@@ -1452,41 +1700,19 @@ impl Store {
         let bytes = control.encode_canonical().map_err(authority_error)?;
         let write = self.inner.database.begin_write().map_err(database_error)?;
         {
+            for (_, capability_id, capability_bytes) in &validated_successor {
+                insert_capability_record(&write, *capability_id, capability_bytes)?;
+            }
+            if let Some((leaf, leaf_id, _)) = validated_successor.last() {
+                set_active_capability(&write, leaf, *leaf_id)?;
+            }
             insert_control_observation(&write, control, control_id)?;
             let mut heads = write.open_table(CONTROL_HEADS).map_err(database_error)?;
             heads
                 .insert(control.domain_id().as_bytes().as_slice(), bytes.as_slice())
                 .map_err(database_error)?;
         }
-        for subject in control.revoked_subjects() {
-            let active_key = active_capability_key(control.domain_id(), *subject);
-            let capability_id = {
-                let mut active = write
-                    .open_table(ACTIVE_CAPABILITIES)
-                    .map_err(database_error)?;
-                let id = active
-                    .get(active_key.as_slice())
-                    .map_err(database_error)?
-                    .map(|value| value.value().to_vec());
-                active
-                    .remove(active_key.as_slice())
-                    .map_err(database_error)?;
-                id
-            };
-            if let Some(capability_id) = capability_id {
-                write
-                    .open_table(REVOKED_CAPABILITIES)
-                    .map_err(database_error)?
-                    .insert(capability_id.as_slice(), control.sequence())
-                    .map_err(database_error)?;
-            }
-            let trusted_key = trusted_author_key(control.domain_id(), *subject);
-            write
-                .open_table(TRUSTED_AUTHORS)
-                .map_err(database_error)?
-                .remove(trusted_key.as_slice())
-                .map_err(database_error)?;
-        }
+        apply_control_revocations(&write, control)?;
         write.commit().map_err(database_error)
     }
 
@@ -1495,6 +1721,7 @@ impl Store {
         control: &ControlTransition,
         expected_controller: AuthorId,
         epoch: u64,
+        candidate_successor: Option<&CapabilityCertificate>,
     ) -> Result<(), StoreError> {
         let can_control = self.authorize_capability(
             control.domain_id(),
@@ -1509,19 +1736,35 @@ impl Store {
             Permission::Admin,
             epoch,
         )?;
-        let next_can_admin = if let Some(capability_id) =
-            self.active_capability(control.domain_id(), control.controller())?
-        {
-            self.authorize_capability(
-                control.domain_id(),
-                control.controller(),
-                capability_id,
-                Permission::Admin,
-                control.new_epoch(),
-            )?
+        let next_capability = if let Some(candidate) = candidate_successor {
+            if candidate.id().map_err(authority_error)? != control.controller_capability() {
+                return Err(StoreError::InvalidAuthority(
+                    "successor capability does not match signed control".into(),
+                ));
+            }
+            Some(candidate.clone())
         } else {
-            false
+            self.capability(control.controller_capability())?
         };
+        let next_revoked = {
+            let read = self.inner.database.begin_read().map_err(database_error)?;
+            let revoked = read
+                .open_table(REVOKED_CAPABILITIES)
+                .map_err(database_error)?;
+            revoked
+                .get(control.controller_capability().as_bytes().as_slice())
+                .map_err(database_error)?
+                .is_some()
+        };
+        let next_can_admin = next_capability.is_some_and(|capability| {
+            capability.domain_id() == control.domain_id()
+                && capability.subject() == control.controller()
+                && capability.permits(Permission::Admin, control.new_epoch())
+        }) && !next_revoked
+            && (candidate_successor.is_some()
+                || self
+                    .capability_chain(control.controller_capability())
+                    .is_ok());
         if control.author() != expected_controller
             || !can_control
             || !next_can_admin
@@ -1532,6 +1775,90 @@ impl Store {
             ));
         }
         Ok(())
+    }
+
+    fn validate_capability_chain_for_install(
+        &self,
+        chain: &[CapabilityCertificate],
+        replace_leaf: Option<CapabilityId>,
+    ) -> Result<Vec<(CapabilityCertificate, CapabilityId, Vec<u8>)>, StoreError> {
+        if chain.is_empty() || chain.len() > 9 {
+            return Err(StoreError::InvalidAuthority(
+                "capability chain has invalid depth".into(),
+            ));
+        }
+        let root = &chain[0];
+        let descriptor = self
+            .domain_descriptor(root.domain_id())?
+            .ok_or_else(|| StoreError::InvalidAuthority("domain descriptor is missing".into()))?;
+        let root_id = root.id().map_err(authority_error)?;
+        let stored_root = self
+            .capability(root_id)?
+            .ok_or_else(|| StoreError::InvalidAuthority("capability root is unknown".into()))?;
+        if root.subject() != descriptor.owner()
+            || root.issuer_capability().is_some()
+            || stored_root != *root
+        {
+            return Err(StoreError::InvalidAuthority(
+                "capability chain has an invalid root".into(),
+            ));
+        }
+        for pair in chain.windows(2) {
+            pair[1]
+                .validate_delegation(&pair[0])
+                .map_err(authority_error)?;
+        }
+        let mut validated = Vec::with_capacity(chain.len());
+        for capability in chain {
+            if capability.domain_id() != root.domain_id() {
+                return Err(StoreError::InvalidAuthority(
+                    "capability chain crosses domains".into(),
+                ));
+            }
+            let capability_id = capability.id().map_err(authority_error)?;
+            let bytes = capability.encode_canonical().map_err(authority_error)?;
+            if let Some(stored) = self.capability(capability_id)?
+                && stored != *capability
+            {
+                return Err(StoreError::InvalidAuthority(
+                    "capability ID collision".into(),
+                ));
+            }
+            validated.push((capability.clone(), capability_id, bytes));
+        }
+        let (leaf, leaf_id, _) = validated
+            .last()
+            .ok_or_else(|| StoreError::InvalidAuthority("capability chain is empty".into()))?;
+        if replace_leaf.is_some_and(|expected| expected != *leaf_id) {
+            return Err(StoreError::InvalidAuthority(
+                "capability chain leaf does not match signed successor".into(),
+            ));
+        }
+        if replace_leaf.is_none()
+            && self
+                .active_capability(leaf.domain_id(), leaf.subject())?
+                .is_some_and(|active| active != *leaf_id)
+        {
+            return Err(StoreError::InvalidAuthority(
+                "capability chain would replace an active leaf".into(),
+            ));
+        }
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let revoked = read
+            .open_table(REVOKED_CAPABILITIES)
+            .map_err(database_error)?;
+        for (_, capability_id, _) in &validated {
+            if revoked
+                .get(capability_id.as_bytes().as_slice())
+                .map_err(database_error)?
+                .is_some()
+            {
+                return Err(StoreError::InvalidAuthority(
+                    "capability chain contains revoked evidence".into(),
+                ));
+            }
+        }
+        Ok(validated)
     }
 
     fn validate_control_sibling(
@@ -1958,6 +2285,42 @@ fn insert_control_observation(
     Ok(())
 }
 
+fn apply_control_revocations(
+    write: &redb::WriteTransaction,
+    control: &ControlTransition,
+) -> Result<(), StoreError> {
+    for subject in control.revoked_subjects() {
+        let active_key = active_capability_key(control.domain_id(), *subject);
+        let capability_id = {
+            let mut active = write
+                .open_table(ACTIVE_CAPABILITIES)
+                .map_err(database_error)?;
+            let id = active
+                .get(active_key.as_slice())
+                .map_err(database_error)?
+                .map(|value| value.value().to_vec());
+            active
+                .remove(active_key.as_slice())
+                .map_err(database_error)?;
+            id
+        };
+        if let Some(capability_id) = capability_id {
+            write
+                .open_table(REVOKED_CAPABILITIES)
+                .map_err(database_error)?
+                .insert(capability_id.as_slice(), control.sequence())
+                .map_err(database_error)?;
+        }
+        let trusted_key = trusted_author_key(control.domain_id(), *subject);
+        write
+            .open_table(TRUSTED_AUTHORS)
+            .map_err(database_error)?
+            .remove(trusted_key.as_slice())
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
 fn device_group_key(domain_id: DomainId, label: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(32 + label.len());
     key.extend_from_slice(domain_id.as_bytes());
@@ -1968,6 +2331,15 @@ fn device_group_key(domain_id: DomainId, label: &str) -> Vec<u8> {
 fn insert_capability_tables(
     write: &redb::WriteTransaction,
     capability: &CapabilityCertificate,
+    capability_id: CapabilityId,
+    bytes: &[u8],
+) -> Result<(), StoreError> {
+    insert_capability_record(write, capability_id, bytes)?;
+    set_active_capability(write, capability, capability_id)
+}
+
+fn insert_capability_record(
+    write: &redb::WriteTransaction,
     capability_id: CapabilityId,
     bytes: &[u8],
 ) -> Result<(), StoreError> {
@@ -1986,15 +2358,21 @@ fn insert_capability_tables(
             .insert(capability_id.as_bytes().as_slice(), bytes)
             .map_err(database_error)?;
     }
-    {
-        let mut active = write
-            .open_table(ACTIVE_CAPABILITIES)
-            .map_err(database_error)?;
-        let key = active_capability_key(capability.domain_id(), capability.subject());
-        active
-            .insert(key.as_slice(), capability_id.as_bytes().as_slice())
-            .map_err(database_error)?;
-    }
+    Ok(())
+}
+
+fn set_active_capability(
+    write: &redb::WriteTransaction,
+    capability: &CapabilityCertificate,
+    capability_id: CapabilityId,
+) -> Result<(), StoreError> {
+    let mut active = write
+        .open_table(ACTIVE_CAPABILITIES)
+        .map_err(database_error)?;
+    let key = active_capability_key(capability.domain_id(), capability.subject());
+    active
+        .insert(key.as_slice(), capability_id.as_bytes().as_slice())
+        .map_err(database_error)?;
     Ok(())
 }
 

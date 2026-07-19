@@ -81,10 +81,23 @@ fn commit_variant(
     dependencies: Vec<CommitId>,
     variant: u8,
 ) -> CommitEnvelope {
+    commit_at_epoch(signer, key, domain, 1, sequence, dependencies, variant)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_at_epoch(
+    signer: &IrohSigner,
+    key: &DomainKey,
+    domain: DomainId,
+    epoch: u64,
+    sequence: u64,
+    dependencies: Vec<CommitId>,
+    variant: u8,
+) -> CommitEnvelope {
     let sequence_byte = u8::try_from(sequence).unwrap();
     let header = CommitHeader::new(
         domain,
-        1,
+        epoch,
         signer.author(),
         sequence,
         dependencies,
@@ -99,6 +112,31 @@ fn commit_variant(
     )
     .unwrap();
     seal_commit(header, &body, key, signer).unwrap()
+}
+
+#[tokio::test]
+async fn stored_commit_export_can_stop_at_an_epoch_boundary() {
+    let directory = tempfile::tempdir().unwrap();
+    let blobs = Arc::new(MemoryBlobs::default());
+    let signer = IrohSigner::from_secret_bytes(id(7));
+    let key = DomainKey::from_bytes(id(8));
+    let domain = DomainId::from_bytes(id(1));
+    let first = commit_at_epoch(&signer, &key, domain, 0, 0, Vec::new(), 1);
+    let second = commit_at_epoch(&signer, &key, domain, 1, 1, vec![first.commit_id()], 1);
+    let store = Store::open(directory.path(), blobs).unwrap();
+    store.persist_commit(&first).await.unwrap();
+    store.persist_commit(&second).await.unwrap();
+
+    assert_eq!(
+        store.list_stored_commit_ids_through(domain, 0).unwrap(),
+        vec![first.commit_id()]
+    );
+    let mut both = vec![first.commit_id(), second.commit_id()];
+    both.sort_unstable();
+    assert_eq!(
+        store.list_stored_commit_ids_through(domain, 1).unwrap(),
+        both
+    );
 }
 
 #[tokio::test]

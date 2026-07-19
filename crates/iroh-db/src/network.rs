@@ -16,7 +16,10 @@ use iroh_blobs::provider::events::{
 };
 use iroh_db_blobs::{BlobEngine, BlobRef, BlobStream, FetchMetrics, FetchOptions};
 use iroh_db_core::{AuthorId, BlobHash, CommitEnvelope, CommitId, DomainId};
-use iroh_db_security::{ControlTransition, Invitation, Permission, verify_gossip_signature};
+use iroh_db_security::{
+    CapabilityCertificate, ControlTransition, DomainSeed, Invitation, Permission,
+    verify_gossip_signature,
+};
 use iroh_db_sync::{
     GossipHint, MAX_CONTROL_FRAME, MAX_REFERENCES, MAX_SESSION_REFERENCES, SyncFrame,
     missing_commits,
@@ -318,6 +321,13 @@ struct SyncCore {
     pending_invitations: Arc<RwLock<BTreeMap<AuthorId, Vec<u8>>>>,
 }
 
+#[derive(Clone, Copy)]
+struct AuthorityPosition {
+    epoch: u64,
+    sequence: u64,
+    head: Option<[u8; 32]>,
+}
+
 #[derive(Clone)]
 struct SyncProtocol {
     core: SyncCore,
@@ -395,14 +405,77 @@ impl SyncCore {
             .map_err(network_error)?;
         let (mut send, mut recv) = connection.open_bi().await.map_err(network_error)?;
 
-        self.outbound_handshake(peer, &mut send, &mut recv).await?;
+        let mut remote_authority = self.outbound_handshake(peer, &mut send, &mut recv).await?;
+        let mut report = SyncReport {
+            received: 0,
+            sent: 0,
+        };
+        while self.db.epoch() != remote_authority.epoch {
+            let boundary = self.db.epoch().min(remote_authority.epoch);
+            let round = self
+                .outbound_commit_round(
+                    peer,
+                    &mut send,
+                    &mut recv,
+                    blobs_connection.clone(),
+                    boundary,
+                )
+                .await?;
+            report.received += round.received;
+            report.sent += round.sent;
+            if self.db.epoch() > remote_authority.epoch {
+                let next_sequence = remote_authority
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| protocol_error("remote control sequence exhausted"))?;
+                let disclosure = self.db.inner.control_gate.read().await;
+                let grant = self.control_grant(next_sequence, peer)?;
+                send_frame(&mut send, &grant).await?;
+                drop(disclosure);
+                expect_done(&mut recv).await?;
+                remote_authority.epoch = remote_authority
+                    .epoch
+                    .checked_add(1)
+                    .ok_or_else(|| protocol_error("remote control epoch exhausted"))?;
+                remote_authority.sequence = next_sequence;
+                remote_authority.head = Some(self.control_id(next_sequence)?);
+            } else {
+                let grant = recv_frame(&mut recv).await?;
+                self.apply_control_grant(grant)?;
+                send_frame(&mut send, &SyncFrame::Done).await?;
+            }
+        }
+        self.reconcile_authority_head(remote_authority, &mut send, &mut recv)
+            .await?;
+        let round = self
+            .outbound_commit_round(
+                peer,
+                &mut send,
+                &mut recv,
+                blobs_connection,
+                self.db.epoch(),
+            )
+            .await?;
+        report.received += round.received;
+        report.sent += round.sent;
+        send.finish().map_err(network_error)?;
+        Ok(report)
+    }
 
-        let local = self.commit_ids()?;
-        send_commit_pages(&mut send, FrameKind::Frontier, &local).await?;
-        let remote = recv_commit_pages(&mut recv, FrameKind::Frontier).await?;
+    async fn outbound_commit_round(
+        &self,
+        peer: AuthorId,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        blobs_connection: Connection,
+        max_epoch: u64,
+    ) -> Result<SyncReport, DbError> {
+        let local = self.commit_ids_through(max_epoch)?;
+        send_commit_pages(send, FrameKind::Frontier, &local).await?;
+        let remote = recv_commit_pages(recv, FrameKind::Frontier).await?;
         let receive = missing_commits(&local, &remote).map_err(sync_error)?;
-        send_commit_pages(&mut send, FrameKind::Need, &receive).await?;
-        let to_send = recv_commit_pages(&mut recv, FrameKind::Need).await?;
+        send_commit_pages(send, FrameKind::Need, &receive).await?;
+        let to_send = recv_commit_pages(recv, FrameKind::Need).await?;
         let expected_send = missing_commits(&remote, &local).map_err(sync_error)?;
         if to_send != expected_send {
             return Err(protocol_error("peer requested an invalid reference set"));
@@ -410,12 +483,9 @@ impl SyncCore {
 
         self.fetch_blobs(blobs_connection, &receive).await?;
         self.apply_downloaded(peer, &receive).await?;
-        send_commit_pages(&mut send, FrameKind::Refs, &to_send).await?;
-        send_frame(&mut send, &SyncFrame::Done).await?;
-        if recv_frame(&mut recv).await? != SyncFrame::Done {
-            return Err(protocol_error("expected done"));
-        }
-        send.finish().map_err(network_error)?;
+        send_commit_pages(send, FrameKind::Refs, &to_send).await?;
+        send_frame(send, &SyncFrame::Done).await?;
+        expect_done(recv).await?;
         Ok(SyncReport {
             received: receive.len(),
             sent: to_send.len(),
@@ -427,7 +497,7 @@ impl SyncCore {
         peer: AuthorId,
         send: &mut SendStream,
         recv: &mut RecvStream,
-    ) -> Result<(), DbError> {
+    ) -> Result<AuthorityPosition, DbError> {
         self.require_local_permission(Permission::Read)?;
         let local_nonce = random_nonce()?;
         send_frame(
@@ -448,7 +518,8 @@ impl SyncCore {
         send_frame(send, &self.authority_state()?).await?;
         let SyncFrame::AuthorityState {
             epoch: remote_epoch,
-            ..
+            sequence,
+            head,
         } = recv_frame(recv).await?
         else {
             return Err(protocol_error("expected authority state"));
@@ -469,12 +540,18 @@ impl SyncCore {
                 domain_id,
                 epoch,
                 proof,
-                ..
+                capability_chain,
             } if domain_id == self.domain_id()
                 && epoch == proof_epoch
                 && proof == self.proof(local_nonce, remote_nonce, peer, proof_epoch)? =>
             {
-                Ok(())
+                self.authenticate_peer_capability(peer, &capability_chain)
+                    .await?;
+                Ok(AuthorityPosition {
+                    epoch: remote_epoch,
+                    sequence,
+                    head,
+                })
             }
             _ => Err(DbError::UnauthorizedDevice),
         }
@@ -525,48 +602,35 @@ impl SyncCore {
         .await?;
         let next = recv_frame(recv).await?;
         if next == SyncFrame::InvitationRequest {
-            let control_reader = self.db.inner.control_gate.read().await;
-            self.require_local_permission(Permission::Invite)?;
-            let payload = self
-                .pending_invitations
-                .read()
-                .map_err(|_| protocol_error("invitation registry is unavailable"))?
-                .get(&peer)
-                .cloned()
-                .ok_or(DbError::UnauthorizedDevice)?;
-            let invitation = Invitation::decode_canonical(&payload)?;
-            if invitation.domain_seed().epoch() != self.db.epoch() {
-                return Err(DbError::UnauthorizedDevice);
-            }
-            self.pending_invitations
-                .write()
-                .map_err(|_| protocol_error("invitation registry is unavailable"))?
-                .remove(&peer);
-            let result = send_frame(send, &SyncFrame::Invitation { payload }).await;
-            drop(control_reader);
-            return result;
+            return self.serve_invitation(peer, send).await;
         }
         let SyncFrame::AuthorityState {
             epoch: remote_epoch,
-            ..
+            sequence: remote_sequence,
+            head: remote_head,
         } = next
         else {
             return Err(protocol_error("expected authority state"));
         };
         send_frame(send, &self.authority_state()?).await?;
         let proof_epoch = self.db.epoch().min(remote_epoch);
-        match recv_frame(recv).await? {
-            SyncFrame::DomainRequest {
-                domain_id,
-                epoch,
-                proof,
-                ..
-            } if self.peer_has_permission(peer, Permission::Read)
-                && domain_id == self.domain_id()
-                && epoch == proof_epoch
-                && proof == self.proof(remote_nonce, local_nonce, peer, proof_epoch)? => {}
-            _ => return Err(DbError::UnauthorizedDevice),
+        let SyncFrame::DomainRequest {
+            domain_id,
+            epoch,
+            proof,
+            capability_chain,
+        } = recv_frame(recv).await?
+        else {
+            return Err(DbError::UnauthorizedDevice);
+        };
+        if domain_id != self.domain_id()
+            || epoch != proof_epoch
+            || proof != self.proof(remote_nonce, local_nonce, peer, proof_epoch)?
+        {
+            return Err(DbError::UnauthorizedDevice);
         }
+        self.authenticate_peer_capability(peer, &capability_chain)
+            .await?;
         send_frame(
             send,
             &SyncFrame::DomainRequest {
@@ -577,9 +641,81 @@ impl SyncCore {
             },
         )
         .await?;
+        let blobs_connection = self
+            .endpoint
+            .connect(EndpointAddr::new(peer_endpoint), iroh_blobs::ALPN)
+            .await
+            .map_err(network_error)?;
+        let mut remote_authority = AuthorityPosition {
+            epoch: remote_epoch,
+            sequence: remote_sequence,
+            head: remote_head,
+        };
+        while self.db.epoch() != remote_authority.epoch {
+            let boundary = self.db.epoch().min(remote_authority.epoch);
+            self.serve_commit_round(peer, send, recv, blobs_connection.clone(), boundary)
+                .await?;
+            if self.db.epoch() > remote_authority.epoch {
+                let next_sequence = remote_authority
+                    .sequence
+                    .checked_add(1)
+                    .ok_or_else(|| protocol_error("remote control sequence exhausted"))?;
+                let disclosure = self.db.inner.control_gate.read().await;
+                let grant = self.control_grant(next_sequence, peer)?;
+                send_frame(send, &grant).await?;
+                drop(disclosure);
+                expect_done(recv).await?;
+                remote_authority.epoch = remote_authority
+                    .epoch
+                    .checked_add(1)
+                    .ok_or_else(|| protocol_error("remote control epoch exhausted"))?;
+                remote_authority.sequence = next_sequence;
+                remote_authority.head = Some(self.control_id(next_sequence)?);
+            } else {
+                let grant = recv_frame(recv).await?;
+                self.apply_control_grant(grant)?;
+                send_frame(send, &SyncFrame::Done).await?;
+            }
+        }
+        self.reconcile_authority_head(remote_authority, send, recv)
+            .await?;
+        self.serve_commit_round(peer, send, recv, blobs_connection, self.db.epoch())
+            .await
+    }
 
+    async fn serve_invitation(&self, peer: AuthorId, send: &mut SendStream) -> Result<(), DbError> {
+        let control_reader = self.db.inner.control_gate.read().await;
+        self.require_local_permission(Permission::Invite)?;
+        let payload = self
+            .pending_invitations
+            .read()
+            .map_err(|_| protocol_error("invitation registry is unavailable"))?
+            .get(&peer)
+            .cloned()
+            .ok_or(DbError::UnauthorizedDevice)?;
+        let invitation = Invitation::decode_canonical(&payload)?;
+        if invitation.domain_seed().epoch() != self.db.epoch() {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        self.pending_invitations
+            .write()
+            .map_err(|_| protocol_error("invitation registry is unavailable"))?
+            .remove(&peer);
+        let result = send_frame(send, &SyncFrame::Invitation { payload }).await;
+        drop(control_reader);
+        result
+    }
+
+    async fn serve_commit_round(
+        &self,
+        peer: AuthorId,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+        blobs_connection: Connection,
+        max_epoch: u64,
+    ) -> Result<(), DbError> {
         let remote = recv_commit_pages(recv, FrameKind::Frontier).await?;
-        let local = self.commit_ids()?;
+        let local = self.commit_ids_through(max_epoch)?;
         send_commit_pages(send, FrameKind::Frontier, &local).await?;
         let remote_need = recv_commit_pages(recv, FrameKind::Need).await?;
         let expected_remote_need = missing_commits(&remote, &local).map_err(sync_error)?;
@@ -592,16 +728,9 @@ impl SyncCore {
         if pushed != need {
             return Err(protocol_error("pushed reference set mismatch"));
         }
-        let blobs_connection = self
-            .endpoint
-            .connect(EndpointAddr::new(peer_endpoint), iroh_blobs::ALPN)
-            .await
-            .map_err(network_error)?;
         self.fetch_blobs(blobs_connection, &pushed).await?;
         self.apply_downloaded(peer, &pushed).await?;
-        if recv_frame(recv).await? != SyncFrame::Done {
-            return Err(protocol_error("expected done"));
-        }
+        expect_done(recv).await?;
         send_frame(send, &SyncFrame::Done).await
     }
 
@@ -641,6 +770,70 @@ impl SyncCore {
                 .db
                 .capability_for_permission(peer, permission, active_epoch)
                 .is_ok()
+    }
+
+    fn peer_has_permission_at(&self, peer: AuthorId, permission: Permission, epoch: u64) -> bool {
+        let Ok(Some(capability_id)) = self
+            .db
+            .inner
+            .store
+            .active_capability(self.domain_id(), peer)
+        else {
+            return false;
+        };
+        self.db
+            .inner
+            .store
+            .authorize_capability(self.domain_id(), peer, capability_id, permission, epoch)
+            .unwrap_or(false)
+    }
+
+    async fn authenticate_peer_capability(
+        &self,
+        peer: AuthorId,
+        encoded_chain: &[Vec<u8>],
+    ) -> Result<(), DbError> {
+        let _control_writer = self.db.inner.control_gate.write().await;
+        let Some(descriptor) = self.db.inner.store.domain_descriptor(self.domain_id())? else {
+            return self.require_trusted(peer);
+        };
+        if self
+            .db
+            .inner
+            .store
+            .accepted_control_chain(self.domain_id())?
+            .iter()
+            .any(|control| control.revoked_subjects().contains(&peer))
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        let chain = encoded_chain
+            .iter()
+            .map(|bytes| CapabilityCertificate::decode_canonical(bytes).map_err(DbError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        let root = chain.first().ok_or(DbError::UnauthorizedDevice)?;
+        if root.domain_id() != self.domain_id()
+            || root.subject() != descriptor.owner()
+            || root.issuer_capability().is_some()
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        for pair in chain.windows(2) {
+            pair[1].validate_delegation(&pair[0])?;
+        }
+        let leaf = chain.last().ok_or(DbError::UnauthorizedDevice)?;
+        if leaf.subject() != peer
+            || !leaf.permits(Permission::Read, self.db.epoch())
+            || !leaf.permits(Permission::FetchBlobs, self.db.epoch())
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        self.db
+            .inner
+            .store
+            .install_capability_chain_atomic(&chain)?;
+        self.db.inner.store.trust_author(self.domain_id(), peer)?;
+        Ok(())
     }
 
     fn can_peer_fetch_blob(&self, peer: AuthorId, hash: BlobHash) -> bool {
@@ -773,6 +966,211 @@ impl SyncCore {
             .iter()
             .map(|capability| capability.encode_canonical().map_err(DbError::from))
             .collect()
+    }
+
+    fn control_grant(&self, sequence: u64, peer: AuthorId) -> Result<SyncFrame, DbError> {
+        let chain = self
+            .db
+            .inner
+            .store
+            .accepted_control_chain(self.domain_id())?;
+        let index = usize::try_from(
+            sequence
+                .checked_sub(1)
+                .ok_or_else(|| protocol_error("control grant sequence cannot be zero"))?,
+        )
+        .map_err(|_| protocol_error("control grant sequence is too large"))?;
+        let control = chain
+            .get(index)
+            .ok_or_else(|| protocol_error("requested control transition is unavailable"))?;
+        if !self
+            .db
+            .inner
+            .store
+            .is_author_trusted(self.domain_id(), peer)?
+            || !self.peer_has_permission_at(peer, Permission::Read, control.new_epoch())
+            || !self.peer_has_permission_at(peer, Permission::FetchBlobs, control.new_epoch())
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        let capability_chain = self
+            .db
+            .inner
+            .store
+            .capability_chain(control.controller_capability())?
+            .iter()
+            .map(|capability| capability.encode_canonical().map_err(DbError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        let seed = self
+            .db
+            .inner
+            .credentials
+            .load_domain_epoch(self.domain_id(), control.new_epoch())?;
+        Ok(SyncFrame::ControlGrant {
+            transition: control.encode_canonical()?,
+            epoch_key: seed.epoch_key_bytes(),
+            capability_chain,
+        })
+    }
+
+    fn control_id(&self, sequence: u64) -> Result<[u8; 32], DbError> {
+        let index = usize::try_from(
+            sequence
+                .checked_sub(1)
+                .ok_or_else(|| protocol_error("control sequence cannot be zero"))?,
+        )
+        .map_err(|_| protocol_error("control sequence is too large"))?;
+        self.db
+            .inner
+            .store
+            .accepted_control_chain(self.domain_id())?
+            .get(index)
+            .ok_or_else(|| protocol_error("control transition is unavailable"))?
+            .id()
+            .map_err(DbError::from)
+    }
+
+    async fn reconcile_authority_head(
+        &self,
+        remote: AuthorityPosition,
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+    ) -> Result<(), DbError> {
+        let SyncFrame::AuthorityState {
+            epoch,
+            sequence,
+            head,
+        } = self.authority_state()?
+        else {
+            unreachable!("authority_state always returns AuthorityState")
+        };
+        if epoch == remote.epoch && sequence == remote.sequence && head == remote.head {
+            return Ok(());
+        }
+        if epoch != remote.epoch || sequence != remote.sequence {
+            return Err(protocol_error("authority positions do not converge"));
+        }
+        let local_head = head.ok_or_else(|| protocol_error("local control head is missing"))?;
+        let remote_head = remote
+            .head
+            .ok_or_else(|| protocol_error("remote control head is missing"))?;
+        let local = self
+            .db
+            .inner
+            .store
+            .control_transition(self.domain_id(), local_head)?
+            .ok_or_else(|| protocol_error("local control object is missing"))?;
+        send_frame(
+            send,
+            &SyncFrame::ControlEvidence {
+                transition: local.encode_canonical()?,
+            },
+        )
+        .await?;
+        let SyncFrame::ControlEvidence { transition } = recv_frame(recv).await? else {
+            return Err(protocol_error("expected control evidence"));
+        };
+        let conflicting = ControlTransition::decode_canonical(&transition)?;
+        if conflicting.id()? != remote_head {
+            return Err(protocol_error(
+                "remote control evidence does not match its head",
+            ));
+        }
+        match self.db.inner.store.observe_control(&conflicting) {
+            Err(error @ iroh_db_store::StoreError::ControlFork { .. }) => {
+                Err(DbError::Store(error))
+            }
+            Err(error) => Err(DbError::Store(error)),
+            Ok(()) => Err(protocol_error("authority heads do not converge")),
+        }
+    }
+
+    fn apply_control_grant(&self, frame: SyncFrame) -> Result<(), DbError> {
+        let SyncFrame::ControlGrant {
+            transition,
+            epoch_key,
+            capability_chain,
+        } = frame
+        else {
+            return Err(protocol_error("expected control grant"));
+        };
+        let control = ControlTransition::decode_canonical(&transition)?;
+        self.validate_incoming_control(&control)?;
+        let seed = DomainSeed::from_epoch_key(self.domain_id(), control.new_epoch(), epoch_key);
+        if seed.distribution_digest() != control.key_distribution_digest()
+            || control.revoked_subjects().contains(&self.db.author_id())
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        let capability_chain = capability_chain
+            .iter()
+            .map(|bytes| CapabilityCertificate::decode_canonical(bytes).map_err(DbError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        for capability in &capability_chain {
+            if capability.domain_id() != self.domain_id() {
+                return Err(DbError::UnauthorizedDevice);
+            }
+        }
+        self.db
+            .apply_epoch_rotation_with_capabilities(&control, &seed, &capability_chain)?;
+        for subject in [control.author(), control.controller()] {
+            if !control.revoked_subjects().contains(&subject) {
+                self.db
+                    .inner
+                    .store
+                    .trust_author(self.domain_id(), subject)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_incoming_control(&self, control: &ControlTransition) -> Result<(), DbError> {
+        let head = self.db.inner.store.control_head(self.domain_id())?;
+        let expected_sequence = head
+            .as_ref()
+            .map_or(Some(1), |head| head.sequence().checked_add(1))
+            .ok_or_else(|| protocol_error("control sequence exhausted"))?;
+        let expected_predecessor = head.as_ref().map(ControlTransition::id).transpose()?;
+        let can_control = self.db.inner.store.authorize_capability(
+            self.domain_id(),
+            control.author(),
+            control.author_capability(),
+            Permission::Revoke,
+            self.db.epoch(),
+        )? || self.db.inner.store.authorize_capability(
+            self.domain_id(),
+            control.author(),
+            control.author_capability(),
+            Permission::Admin,
+            self.db.epoch(),
+        )?;
+        if control.domain_id() != self.domain_id()
+            || control.sequence() != expected_sequence
+            || control.predecessor() != expected_predecessor
+            || control.previous_epoch() != self.db.epoch()
+            || control.cut() != self.db.inner.store.frontier(self.domain_id())?
+            || control.author() != self.db.inner.store.current_controller(self.domain_id())?
+            || !can_control
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        Ok(())
+    }
+
+    fn commit_ids_through(&self, epoch: u64) -> Result<Vec<CommitId>, DbError> {
+        if epoch == self.db.inner.store.current_epoch(self.domain_id())? {
+            self.db
+                .inner
+                .store
+                .list_commit_ids(self.domain_id())
+                .map_err(DbError::from)
+        } else {
+            self.db
+                .inner
+                .store
+                .list_stored_commit_ids_through(self.domain_id(), epoch)
+                .map_err(DbError::from)
+        }
     }
 
     fn commit_ids(&self) -> Result<Vec<CommitId>, DbError> {
@@ -948,6 +1346,14 @@ async fn recv_frame(recv: &mut RecvStream) -> Result<SyncFrame, DbError> {
     SyncFrame::decode_canonical(&bytes).map_err(sync_error)
 }
 
+async fn expect_done(recv: &mut RecvStream) -> Result<(), DbError> {
+    if recv_frame(recv).await? == SyncFrame::Done {
+        Ok(())
+    } else {
+        Err(protocol_error("expected done"))
+    }
+}
+
 fn random_nonce() -> Result<[u8; 32], DbError> {
     let mut nonce = [0_u8; 32];
     getrandom::fill(&mut nonce).map_err(|_| DbError::RandomnessUnavailable)?;
@@ -1055,5 +1461,53 @@ mod tests {
         drop(target);
         source_device.close().await.unwrap();
         target_device.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrong_epoch_key_is_rejected_before_authority_mutation() {
+        let owner_directory = tempfile::tempdir().unwrap();
+        let member_directory = tempfile::tempdir().unwrap();
+        let owner_device = IrohDb::open(owner_directory.path()).await.unwrap();
+        let member_device = IrohDb::open(member_directory.path()).await.unwrap();
+        let owner = owner_device
+            .create_domain(ConsistencyMode::MultiWriter)
+            .unwrap();
+        let invitation = owner
+            .invite(
+                member_device.author_id(),
+                PermissionSet::from_permissions(&[Permission::Read, Permission::FetchBlobs]),
+                PermissionSet::empty(),
+                None,
+            )
+            .unwrap();
+        let member = member_device.import_invitation(&invitation).unwrap();
+        let member_node = member.start_sync().await.unwrap();
+        let (rotated, control) = owner.rotate_epoch(&[]).unwrap();
+        let grant = SyncFrame::ControlGrant {
+            transition: control.encode_canonical().unwrap(),
+            epoch_key: [0; 32],
+            capability_chain: Vec::new(),
+        };
+
+        assert!(matches!(
+            member_node.core.apply_control_grant(grant),
+            Err(DbError::UnauthorizedDevice)
+        ));
+        assert_eq!(member.domain_seed().epoch(), 0);
+        assert!(
+            member
+                .inner
+                .store
+                .control_head(member.domain_id())
+                .unwrap()
+                .is_none()
+        );
+
+        member_node.shutdown().await.unwrap();
+        drop(owner);
+        drop(rotated);
+        drop(member);
+        owner_device.close().await.unwrap();
+        member_device.close().await.unwrap();
     }
 }

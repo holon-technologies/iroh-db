@@ -135,6 +135,7 @@ fn control_transition_is_canonical_signed_bounded_and_tamper_evident() {
         vec![AuthorId::from_bytes([3; 32])],
         owner.author(),
         owner.author(),
+        root.id().unwrap(),
         [24; 32],
         root.id().unwrap(),
         [25; 32],
@@ -145,8 +146,8 @@ fn control_transition_is_canonical_signed_bounded_and_tamper_evident() {
     assert_eq!(
         transition.id().unwrap(),
         [
-            150, 62, 99, 116, 144, 238, 95, 227, 50, 59, 212, 92, 188, 47, 245, 194, 165, 122, 35,
-            81, 192, 133, 241, 224, 183, 188, 218, 20, 86, 70, 128, 53,
+            7, 75, 217, 42, 248, 215, 60, 242, 184, 80, 67, 52, 93, 60, 106, 202, 247, 141, 44, 25,
+            143, 194, 206, 43, 119, 45, 44, 54, 32, 246, 243, 80,
         ]
     );
     assert_eq!(
@@ -164,6 +165,7 @@ fn control_transition_is_canonical_signed_bounded_and_tamper_evident() {
         vec![AuthorId::from_bytes([3; 32])],
         owner.author(),
         AuthorId::from_bytes([26; 32]),
+        root.id().unwrap(),
         [24; 32],
         root.id().unwrap(),
         [25; 32],

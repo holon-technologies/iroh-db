@@ -86,6 +86,18 @@ fn authority_frames_are_strict_bounded_and_canonical() {
     };
     let grant_bytes = grant.encode_canonical().unwrap();
     assert_eq!(SyncFrame::decode_canonical(&grant_bytes).unwrap(), grant);
+    let debug = format!("{grant:?}");
+    assert!(debug.contains("[redacted]"));
+    assert!(!debug.contains(&format!("{:?}", [5_u8; 32])));
+
+    let evidence = SyncFrame::ControlEvidence {
+        transition: vec![7; 128],
+    };
+    let evidence_bytes = evidence.encode_canonical().unwrap();
+    assert_eq!(
+        SyncFrame::decode_canonical(&evidence_bytes).unwrap(),
+        evidence
+    );
 
     assert!(
         SyncFrame::ControlGrant {

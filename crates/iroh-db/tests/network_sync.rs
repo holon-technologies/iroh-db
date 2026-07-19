@@ -218,6 +218,214 @@ async fn controlled_domain_accepts_snapshot_from_explicit_authority() {
 }
 
 #[tokio::test]
+async fn sync_automatically_installs_a_non_revoked_members_next_epoch() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let member_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let member_device = IrohDb::open(member_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = owner
+        .invite(
+            member_device.author_id(),
+            PermissionSet::from_permissions(&[
+                Permission::Read,
+                Permission::Write,
+                Permission::FetchBlobs,
+            ]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let member = member_device.import_invitation(&invitation).unwrap();
+    let owner_node = owner.start_sync().await.unwrap();
+    let member_node = member.start_sync().await.unwrap();
+    member_node.sync_with(owner_node.addr()).await.unwrap();
+
+    let (rotated_owner, _) = owner.rotate_epoch(&[]).unwrap();
+    member_node.sync_with(owner_node.addr()).await.unwrap();
+
+    assert_eq!(rotated_owner.domain_seed().epoch(), 1);
+    assert_eq!(member.domain_seed().epoch(), 1);
+    assert_eq!(
+        rotated_owner.domain_seed().distribution_digest(),
+        member.domain_seed().distribution_digest()
+    );
+
+    owner_node.shutdown().await.unwrap();
+    member_node.shutdown().await.unwrap();
+    drop(owner);
+    drop(rotated_owner);
+    drop(member);
+    owner_device.close().await.unwrap();
+    member_device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn sync_catches_up_multiple_epochs_at_their_causal_cuts() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let member_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let member_device = IrohDb::open(member_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = owner
+        .invite(
+            member_device.author_id(),
+            PermissionSet::from_permissions(&[
+                Permission::Read,
+                Permission::Write,
+                Permission::FetchBlobs,
+            ]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let member = member_device.import_invitation(&invitation).unwrap();
+    let owner_notes = owner.collection::<Note>();
+    let member_notes = member.collection::<Note>();
+    let owner_node = owner.start_sync().await.unwrap();
+    let member_node = member.start_sync().await.unwrap();
+    member_node.sync_with(owner_node.addr()).await.unwrap();
+
+    let (epoch_one, _) = owner.rotate_epoch(&[]).unwrap();
+    owner_notes
+        .put(note("between", "epoch one", owner.author_id()))
+        .await
+        .unwrap();
+    let (epoch_two, _) = epoch_one.rotate_epoch(&[]).unwrap();
+    member_node.sync_with(owner_node.addr()).await.unwrap();
+
+    assert_eq!(member.domain_seed().epoch(), 2);
+    assert_eq!(epoch_two.domain_seed().epoch(), 2);
+    assert!(
+        member_notes
+            .get(&"between".to_owned())
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    owner_node.shutdown().await.unwrap();
+    member_node.shutdown().await.unwrap();
+    drop(owner_notes);
+    drop(member_notes);
+    drop(owner);
+    drop(epoch_one);
+    drop(epoch_two);
+    drop(member);
+    owner_device.close().await.unwrap();
+    member_device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn sync_never_delivers_a_rotated_key_to_a_revoked_member() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let member_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let member_device = IrohDb::open(member_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = owner
+        .invite(
+            member_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::FetchBlobs]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let member = member_device.import_invitation(&invitation).unwrap();
+    let owner_node = owner.start_sync().await.unwrap();
+    let member_node = member.start_sync().await.unwrap();
+    member_node.sync_with(owner_node.addr()).await.unwrap();
+
+    let (rotated, _) = owner.rotate_epoch(&[member.author_id()]).unwrap();
+    assert!(member_node.sync_with(owner_node.addr()).await.is_err());
+    assert_eq!(member.domain_seed().epoch(), 0);
+
+    owner_node.shutdown().await.unwrap();
+    member_node.shutdown().await.unwrap();
+    drop(owner);
+    drop(rotated);
+    drop(member);
+    owner_device.close().await.unwrap();
+    member_device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn controller_transfer_propagates_authority_for_peer_mesh_sync() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let successor_dir = tempfile::tempdir().unwrap();
+    let observer_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let successor_device = IrohDb::open(successor_dir.path()).await.unwrap();
+    let observer_device = IrohDb::open(observer_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let successor_invitation = owner
+        .invite(
+            successor_device.author_id(),
+            PermissionSet::from_permissions(&[
+                Permission::Read,
+                Permission::Write,
+                Permission::Revoke,
+                Permission::FetchBlobs,
+                Permission::Admin,
+            ]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let observer_invitation = owner
+        .invite(
+            observer_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::FetchBlobs]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let successor = successor_device
+        .import_invitation(&successor_invitation)
+        .unwrap();
+    let observer = observer_device
+        .import_invitation(&observer_invitation)
+        .unwrap();
+    let owner_node = owner.start_sync().await.unwrap();
+    let successor_node = successor.start_sync().await.unwrap();
+    let observer_node = observer.start_sync().await.unwrap();
+
+    let (owner_epoch_one, _) = owner
+        .rotate_epoch_with_controller(&[], successor.author_id())
+        .unwrap();
+    successor_node.sync_with(owner_node.addr()).await.unwrap();
+    observer_node.sync_with(owner_node.addr()).await.unwrap();
+    let (successor_epoch_two, _) = successor.rotate_epoch(&[]).unwrap();
+    observer_node
+        .sync_with(successor_node.addr())
+        .await
+        .unwrap();
+
+    assert_eq!(observer.domain_seed().epoch(), 2);
+    assert_eq!(successor_epoch_two.domain_seed().epoch(), 2);
+
+    owner_node.shutdown().await.unwrap();
+    successor_node.shutdown().await.unwrap();
+    observer_node.shutdown().await.unwrap();
+    drop(owner);
+    drop(owner_epoch_one);
+    drop(successor);
+    drop(successor_epoch_two);
+    drop(observer);
+    owner_device.close().await.unwrap();
+    successor_device.close().await.unwrap();
+    observer_device.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn blob_provider_requires_explicit_fetch_permission() {
     let source_dir = tempfile::tempdir().unwrap();
     let target_dir = tempfile::tempdir().unwrap();

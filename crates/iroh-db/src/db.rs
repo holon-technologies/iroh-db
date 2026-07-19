@@ -175,7 +175,7 @@ pub enum SubscriptionError {
 #[derive(Clone)]
 pub struct IrohDb {
     pub(crate) inner: Arc<DbInner>,
-    pub(crate) domain: DomainSeed,
+    pub(crate) domain: Arc<RwLock<DomainSeed>>,
 }
 
 pub(crate) struct DbInner {
@@ -184,6 +184,7 @@ pub(crate) struct DbInner {
     pub(crate) credentials: LocalCredentials,
     pub(crate) writer: Mutex<()>,
     pub(crate) control_gate: AsyncRwLock<()>,
+    domains: RwLock<BTreeMap<iroh_db_core::DomainId, Arc<RwLock<DomainSeed>>>>,
     changes: RwLock<BTreeMap<iroh_db_core::DomainId, broadcast::Sender<ChangeBatch>>>,
     adapters: RwLock<BTreeMap<CollectionId, RecordAdapter>>,
 }
@@ -314,9 +315,24 @@ impl IrohDb {
         store.trust_author(credentials.domain_id(), credentials.signer().author())?;
         let domain = credentials.domain_seed();
         credentials.store_domain(&domain)?;
+        let domain = Arc::new(RwLock::new(domain));
         let (changes, _) = broadcast::channel(CHANGE_CAPACITY);
         let mut domain_changes = BTreeMap::new();
-        domain_changes.insert(domain.domain_id(), changes);
+        domain_changes.insert(
+            domain
+                .read()
+                .expect("domain seed lock is not poisoned")
+                .domain_id(),
+            changes,
+        );
+        let mut domains = BTreeMap::new();
+        domains.insert(
+            domain
+                .read()
+                .expect("domain seed lock is not poisoned")
+                .domain_id(),
+            domain.clone(),
+        );
         Ok(Self {
             inner: Arc::new(DbInner {
                 store,
@@ -324,6 +340,7 @@ impl IrohDb {
                 credentials,
                 writer: Mutex::new(()),
                 control_gate: AsyncRwLock::new(()),
+                domains: RwLock::new(domains),
                 changes: RwLock::new(domain_changes),
                 adapters: RwLock::new(BTreeMap::new()),
             }),
@@ -383,12 +400,18 @@ impl IrohDb {
 
     /// Exports sensitive domain bootstrap material for a trusted device-add workflow.
     pub fn domain_seed(&self) -> DomainSeed {
-        self.domain.clone()
+        self.domain
+            .read()
+            .expect("domain seed lock is not poisoned")
+            .clone()
     }
 
     /// Returns this handle's isolated security and replication domain.
-    pub const fn domain_id(&self) -> iroh_db_core::DomainId {
-        self.domain.domain_id()
+    pub fn domain_id(&self) -> iroh_db_core::DomainId {
+        self.domain
+            .read()
+            .expect("domain seed lock is not poisoned")
+            .domain_id()
     }
 
     /// Attaches an independently encrypted domain to this device and returns its handle.
@@ -398,10 +421,7 @@ impl IrohDb {
             .store
             .trust_author(seed.domain_id(), self.author_id())?;
         self.ensure_change_channel(seed.domain_id());
-        Ok(Self {
-            inner: self.inner.clone(),
-            domain: seed.clone(),
-        })
+        self.domain(seed.domain_id())
     }
 
     /// Creates a capability-controlled domain owned by this device.
@@ -476,11 +496,16 @@ impl IrohDb {
                 .ok_or(DbError::SequenceExhausted)
         })?;
         let predecessor = head.as_ref().map(ControlTransition::id).transpose()?;
-        let next_seed = self.domain.next_epoch()?;
+        let next_seed = self.domain_seed().next_epoch()?;
         let writer = self
             .inner
             .store
             .current_writer(self.domain_id())?
+            .ok_or(DbError::UnauthorizedDevice)?;
+        let next_controller_capability = self
+            .inner
+            .store
+            .active_capability(self.domain_id(), next_controller)?
             .ok_or(DbError::UnauthorizedDevice)?;
         let mut nonce = [0_u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| DbError::RandomnessUnavailable)?;
@@ -493,6 +518,7 @@ impl IrohDb {
             revoked_subjects.to_vec(),
             writer,
             next_controller,
+            next_controller_capability,
             next_seed.distribution_digest(),
             author_capability,
             nonce,
@@ -504,6 +530,7 @@ impl IrohDb {
             return Err(DbError::Store(error));
         }
         self.inner.credentials.activate_domain(&next_seed)?;
+        self.set_domain_seed(&next_seed);
         Ok((self.domain(self.domain_id())?, control))
     }
 
@@ -512,6 +539,15 @@ impl IrohDb {
         &self,
         control: &ControlTransition,
         next_seed: &DomainSeed,
+    ) -> Result<Self, DbError> {
+        self.apply_epoch_rotation_with_capabilities(control, next_seed, &[])
+    }
+
+    pub(crate) fn apply_epoch_rotation_with_capabilities(
+        &self,
+        control: &ControlTransition,
+        next_seed: &DomainSeed,
+        successor_chain: &[CapabilityCertificate],
     ) -> Result<Self, DbError> {
         let _control_writer = self
             .inner
@@ -526,18 +562,50 @@ impl IrohDb {
         {
             return Err(DbError::UnauthorizedDevice);
         }
-        self.inner.store.observe_control(control)?;
+        if successor_chain.is_empty() {
+            self.inner.store.observe_control(control)?;
+        }
         self.inner.credentials.stage_domain(next_seed)?;
-        if let Err(error) = self.inner.store.apply_control(control) {
+        let apply_result = if successor_chain.is_empty() {
+            self.inner.store.apply_control(control)
+        } else {
+            self.inner
+                .store
+                .apply_control_bundle(control, successor_chain)
+        };
+        if let Err(error) = apply_result {
             return Err(DbError::Store(error));
         }
         self.inner.credentials.activate_domain(next_seed)?;
+        self.set_domain_seed(next_seed);
         self.domain(self.domain_id())
     }
 
     /// Issues and installs a narrowed endpoint capability from this device's active grant.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_capability(
+        &self,
+        subject: AuthorId,
+        permissions: PermissionSet,
+        delegation_permissions: PermissionSet,
+        valid_from_epoch: u64,
+        valid_through_epoch: Option<u64>,
+    ) -> Result<CapabilityCertificate, DbError> {
+        let _control_writer = self
+            .inner
+            .control_gate
+            .try_write()
+            .map_err(|_| DbError::Operation("control plane is busy".into()))?;
+        self.issue_capability_guarded(
+            subject,
+            permissions,
+            delegation_permissions,
+            valid_from_epoch,
+            valid_through_epoch,
+        )
+    }
+
+    fn issue_capability_guarded(
         &self,
         subject: AuthorId,
         permissions: PermissionSet,
@@ -649,6 +717,19 @@ impl IrohDb {
         )
     }
 
+    pub(crate) fn blob_engine_for_epoch(&self, epoch: u64) -> Result<BlobEngine, DbError> {
+        Ok(BlobEngine::new_at_epoch(
+            Arc::new(DomainBlobStore {
+                blobs: self.inner.blobs.clone(),
+                metadata: self.inner.store.clone(),
+                domain_id: self.domain_id(),
+            }),
+            self.domain_id(),
+            epoch,
+            self.domain_key_for(epoch)?,
+        ))
+    }
+
     /// Issues a targeted signed invitation carrying the current epoch key and capability chain.
     pub fn invite(
         &self,
@@ -657,7 +738,12 @@ impl IrohDb {
         delegation_permissions: PermissionSet,
         valid_through_epoch: Option<u64>,
     ) -> Result<Invitation, DbError> {
-        let capability = self.issue_capability(
+        let _control_writer = self
+            .inner
+            .control_gate
+            .try_write()
+            .map_err(|_| DbError::Operation("control plane is busy".into()))?;
+        let capability = self.issue_capability_guarded(
             subject,
             permissions,
             delegation_permissions,
@@ -680,6 +766,15 @@ impl IrohDb {
 
     /// Imports a validated invitation only when it names this device endpoint.
     pub fn import_invitation(&self, invitation: &Invitation) -> Result<Self, DbError> {
+        let _control_writer = self
+            .inner
+            .control_gate
+            .try_write()
+            .map_err(|_| DbError::Operation("control plane is busy".into()))?;
+        self.import_invitation_guarded(invitation)
+    }
+
+    fn import_invitation_guarded(&self, invitation: &Invitation) -> Result<Self, DbError> {
         if invitation.subject() != self.author_id() {
             return Err(DbError::UnauthorizedDevice);
         }
@@ -694,21 +789,12 @@ impl IrohDb {
                 .current_epoch(invitation.descriptor().domain_id())?;
         }
         let chain = invitation.capability_chain();
-        let root = chain.first().ok_or(DbError::UnauthorizedDevice)?;
         self.inner
             .store
-            .bootstrap_domain(invitation.descriptor(), root)?;
-        for capability in chain.iter().skip(1) {
-            self.inner.store.install_capability(capability)?;
-        }
+            .import_domain_authority_atomic(invitation.descriptor(), chain)?;
         self.inner
             .credentials
             .store_domain(&invitation.domain_seed())?;
-        for capability in chain {
-            self.inner
-                .store
-                .trust_author(invitation.descriptor().domain_id(), capability.subject())?;
-        }
         self.domain(invitation.descriptor().domain_id())
     }
 
@@ -719,19 +805,32 @@ impl IrohDb {
         secret: &InvitationSecret,
     ) -> Result<Self, DbError> {
         let invitation = ticket.open(secret, self.author_id())?;
+        let _control_writer = self
+            .inner
+            .control_gate
+            .try_write()
+            .map_err(|_| DbError::Operation("control plane is busy".into()))?;
         if !self.inner.store.consume_invitation(ticket.id()?)? {
             return Err(DbError::InvitationAlreadyUsed);
         }
-        self.import_invitation(&invitation)
+        self.import_invitation_guarded(&invitation)
     }
 
     /// Opens a previously attached domain under the same device identity and local store.
     pub fn domain(&self, domain_id: iroh_db_core::DomainId) -> Result<Self, DbError> {
         let seed = self.inner.credentials.load_domain(domain_id)?;
         self.ensure_change_channel(domain_id);
+        let domain = self
+            .inner
+            .domains
+            .write()
+            .expect("domain context lock is not poisoned")
+            .entry(domain_id)
+            .or_insert_with(|| Arc::new(RwLock::new(seed)))
+            .clone();
         Ok(Self {
             inner: self.inner.clone(),
-            domain: seed,
+            domain,
         })
     }
 
@@ -1171,7 +1270,7 @@ impl IrohDb {
     }
 
     pub(crate) fn domain_key(&self) -> iroh_db_security::DomainKey {
-        self.domain.domain_key()
+        self.domain_seed().domain_key()
     }
 
     fn domain_key_for(&self, epoch: u64) -> Result<iroh_db_security::DomainKey, DbError> {
@@ -1182,8 +1281,18 @@ impl IrohDb {
             .map_err(DbError::from)
     }
 
-    pub(crate) const fn epoch(&self) -> u64 {
-        self.domain.epoch()
+    pub(crate) fn epoch(&self) -> u64 {
+        self.domain
+            .read()
+            .expect("domain seed lock is not poisoned")
+            .epoch()
+    }
+
+    fn set_domain_seed(&self, seed: &DomainSeed) {
+        *self
+            .domain
+            .write()
+            .expect("domain seed lock is not poisoned") = seed.clone();
     }
 
     fn ensure_change_channel(&self, domain_id: iroh_db_core::DomainId) {
@@ -2400,11 +2509,38 @@ mod control_recovery_tests {
             domain.rotate_epoch(&[]),
             Err(DbError::Operation(message)) if message == "control plane is busy"
         ));
+        assert!(matches!(
+            domain.invite(
+                AuthorId::from_bytes([91; 32]),
+                PermissionSet::from_permissions(&[Permission::Read]),
+                PermissionSet::empty(),
+                None,
+            ),
+            Err(DbError::Operation(message)) if message == "control plane is busy"
+        ));
         assert!(domain.domain_descriptor().unwrap().is_some());
         drop(disclosure);
         let (rotated, _) = domain.rotate_epoch(&[]).unwrap();
         assert_eq!(rotated.domain_seed().epoch(), 1);
         drop(domain);
+        drop(rotated);
+        device.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rotation_updates_every_live_handle_for_the_domain() {
+        let directory = tempfile::tempdir().unwrap();
+        let device = IrohDb::open(directory.path()).await.unwrap();
+        let domain = device.create_domain(ConsistencyMode::MultiWriter).unwrap();
+        let clone = domain.clone();
+        let (rotated, _) = domain.rotate_epoch(&[]).unwrap();
+
+        assert_eq!(clone.epoch(), 1);
+        assert_eq!(clone.domain_seed().epoch(), 1);
+        assert_eq!(rotated.epoch(), 1);
+
+        drop(domain);
+        drop(clone);
         drop(rotated);
         device.close().await.unwrap();
     }
