@@ -6,8 +6,8 @@ use std::{
 };
 
 use iroh_db_core::{
-    BlobHash, CapabilityId, CommitBody, CommitEnvelope, CommitHeader, CommitId, CrdtKind, DomainId,
-    FieldDescriptor, SchemaDescriptor, SchemaId, TransactionId,
+    AuthorId, BlobHash, CapabilityId, CommitBody, CommitEnvelope, CommitHeader, CommitId, CrdtKind,
+    DomainId, FieldDescriptor, SchemaDescriptor, SchemaId, TransactionId,
 };
 use iroh_db_security::{DomainKey, IrohSigner, seal_commit};
 use iroh_db_store::{
@@ -366,4 +366,82 @@ async fn records_schemas_and_indexes_publish_atomically_with_commit_metadata() {
             .unwrap(),
         Some(b"canonical record state".to_vec())
     );
+}
+
+#[tokio::test]
+async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let blobs = Arc::new(MemoryBlobs::default());
+    let signer = IrohSigner::from_secret_bytes(id(7));
+    let key = DomainKey::from_bytes(id(8));
+    let domain = DomainId::from_bytes(id(1));
+    let accepted = commit(&signer, &key, domain, 0, Vec::new());
+    let accepted_id = accepted.commit_id();
+    let outside_coverage = CommitId::from_bytes(id(99));
+    let store = Store::open(directory.path(), blobs).unwrap();
+    store.persist_commit(&accepted).await.unwrap();
+
+    assert!(
+        store
+            .install_snapshot(
+                domain,
+                &[],
+                &[accepted_id],
+                &[outside_coverage],
+                &[(signer.author(), 0)],
+            )
+            .is_err()
+    );
+    assert_eq!(store.frontier(domain).unwrap(), vec![accepted_id]);
+
+    assert!(
+        store
+            .install_snapshot(
+                domain,
+                &[],
+                &[accepted_id, accepted_id],
+                &[accepted_id],
+                &[(signer.author(), 0)],
+            )
+            .is_err()
+    );
+    assert_eq!(store.frontier(domain).unwrap(), vec![accepted_id]);
+
+    let first_author = AuthorId::from_bytes(id(9));
+    let second_author = AuthorId::from_bytes(id(6));
+    assert!(first_author > second_author);
+    assert!(
+        store
+            .install_snapshot(
+                domain,
+                &[],
+                &[accepted_id],
+                &[accepted_id],
+                &[(first_author, 0), (second_author, 0)],
+            )
+            .is_err()
+    );
+    assert_eq!(store.frontier(domain).unwrap(), vec![accepted_id]);
+
+    let schema = SchemaDescriptor::new(
+        "snapshot-records",
+        1,
+        vec![FieldDescriptor::new(1, "id", CrdtKind::Immutable, "String").record_id()],
+    )
+    .unwrap();
+    let record =
+        MaterializedRecord::upsert(schema, b"duplicate".to_vec(), b"state".to_vec(), Vec::new())
+            .unwrap();
+    assert!(
+        store
+            .install_snapshot(
+                domain,
+                &[record.clone(), record],
+                &[accepted_id],
+                &[accepted_id],
+                &[(signer.author(), 0)],
+            )
+            .is_err()
+    );
+    assert_eq!(store.frontier(domain).unwrap(), vec![accepted_id]);
 }

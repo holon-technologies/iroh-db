@@ -1,12 +1,12 @@
 use iroh_db_blobs::{BlobEngine, BlobRef};
-use iroh_db_core::{AuthorId, CommitId};
-use iroh_db_security::verify_snapshot_signature;
-use iroh_db_store::MaterializedRecord;
+use iroh_db_core::{AuthorId, CapabilityId, CommitId};
+use iroh_db_security::{Permission, verify_snapshot_signature};
+use iroh_db_store::{MaterializedRecord, StoreError};
 use tokio::io::AsyncReadExt as _;
 
 use crate::{DbError, IrohDb};
 
-const SNAPSHOT_VERSION: u16 = 1;
+const SNAPSHOT_VERSION: u16 = 2;
 
 /// An immutable encrypted local snapshot and its verified state root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,12 @@ struct SnapshotContent {
     covered_commits: Vec<CommitId>,
     #[n(5)]
     author_sequences: Vec<(AuthorId, u64)>,
+    #[n(6)]
+    epoch: u64,
+    #[n(7)]
+    control_head: Option<[u8; 32]>,
+    #[n(8)]
+    capability_id: CapabilityId,
 }
 
 #[derive(minicbor::Encode, minicbor::Decode)]
@@ -67,6 +73,15 @@ impl IrohDb {
     pub async fn snapshot(&self) -> Result<Snapshot, DbError> {
         let _writer = self.inner.writer.lock().await;
         let domain_id = self.domain_id();
+        let active_epoch = self.inner.store.current_epoch(domain_id)?;
+        if self.epoch() != active_epoch {
+            return Err(DbError::StaleEpoch {
+                handle: self.epoch(),
+                active: active_epoch,
+            });
+        }
+        let capability_id =
+            self.capability_for_permission(self.author_id(), Permission::Snapshot, active_epoch)?;
         let records = self.inner.store.export_materialized(domain_id)?;
         let content = SnapshotContent {
             version: SNAPSHOT_VERSION,
@@ -75,6 +90,9 @@ impl IrohDb {
             records: encode_records(&records)?,
             covered_commits: self.inner.store.list_commit_ids(domain_id)?,
             author_sequences: self.inner.store.author_sequences(domain_id)?,
+            epoch: active_epoch,
+            control_head: control_head_id(self)?,
+            capability_id,
         };
         let content = minicbor::to_vec(content).map_err(snapshot_codec)?;
         let state_root = state_root(&records)?;
@@ -107,30 +125,46 @@ impl IrohDb {
         let signing_bytes =
             snapshot_signing_bytes(&envelope.content, &envelope.state_root, envelope.author)?;
         verify_snapshot_signature(envelope.author, &signing_bytes, &envelope.signature)?;
-        if !self
-            .inner
-            .store
-            .is_author_trusted(self.domain_id(), envelope.author)?
-        {
-            return Err(DbError::UnauthorizedDevice);
-        }
         let content: SnapshotContent = decode_canonical(&envelope.content)?;
         if content.version != SNAPSHOT_VERSION || content.domain_id != self.domain_id() {
             return Err(DbError::InvalidSnapshot(
                 "unsupported version or wrong domain".into(),
             ));
         }
+        let active_epoch = self.inner.store.current_epoch(self.domain_id())?;
+        if content.epoch != active_epoch || self.epoch() != active_epoch {
+            return Err(DbError::InvalidSnapshot(
+                "snapshot epoch does not match active authority".into(),
+            ));
+        }
+        if content.control_head != control_head_id(self)? {
+            return Err(DbError::InvalidSnapshot(
+                "snapshot control head does not match active authority".into(),
+            ));
+        }
+        let capability_id =
+            self.capability_for_permission(envelope.author, Permission::Snapshot, content.epoch)?;
+        if content.capability_id != capability_id {
+            return Err(DbError::UnauthorizedDevice);
+        }
         let records = decode_records(&content.records)?;
         if state_root(&records)? != envelope.state_root {
             return Err(DbError::InvalidSnapshot("state root mismatch".into()));
         }
-        self.inner.store.install_snapshot(
+        if let Err(error) = self.inner.store.install_snapshot(
             content.domain_id,
             &records,
             &content.covered_commits,
             &content.frontier,
             &content.author_sequences,
-        )?;
+        ) {
+            return match error {
+                StoreError::InvalidSnapshotMetadata(message) => {
+                    Err(DbError::InvalidSnapshot(message))
+                }
+                error => Err(DbError::Store(error)),
+            };
+        }
         Ok(())
     }
 
@@ -159,6 +193,16 @@ fn blob_engine(db: &IrohDb) -> BlobEngine {
         db.epoch(),
         db.domain_key(),
     )
+}
+
+fn control_head_id(db: &IrohDb) -> Result<Option<[u8; 32]>, DbError> {
+    db.inner
+        .store
+        .control_head(db.domain_id())?
+        .as_ref()
+        .map(iroh_db_security::ControlTransition::id)
+        .transpose()
+        .map_err(DbError::from)
 }
 
 fn encode_records(records: &[MaterializedRecord]) -> Result<Vec<Vec<u8>>, DbError> {

@@ -514,6 +514,44 @@ impl IrohDb {
             .map_err(DbError::from)
     }
 
+    pub(crate) fn capability_for_permission(
+        &self,
+        subject: AuthorId,
+        permission: Permission,
+        epoch: u64,
+    ) -> Result<CapabilityId, DbError> {
+        if !self
+            .inner
+            .store
+            .is_author_trusted(self.domain_id(), subject)?
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        if self
+            .inner
+            .store
+            .domain_descriptor(self.domain_id())?
+            .is_none()
+        {
+            return Ok(private_capability(self.domain_id()));
+        }
+        let capability_id = self
+            .inner
+            .store
+            .active_capability(self.domain_id(), subject)?
+            .ok_or(DbError::UnauthorizedDevice)?;
+        if !self.inner.store.authorize_capability(
+            self.domain_id(),
+            subject,
+            capability_id,
+            permission,
+            epoch,
+        )? {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        Ok(capability_id)
+    }
+
     /// Issues a targeted signed invitation carrying the current epoch key and capability chain.
     pub fn invite(
         &self,
@@ -2165,7 +2203,7 @@ fn canonicalize_materialized<Record: IrohRecord>(
     .map_err(DbError::from)
 }
 
-fn private_capability(domain_id: iroh_db_core::DomainId) -> CapabilityId {
+pub(crate) fn private_capability(domain_id: iroh_db_core::DomainId) -> CapabilityId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"iroh-db/private-capability/v1");
     hasher.update(domain_id.as_bytes());

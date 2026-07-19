@@ -1,4 +1,7 @@
-use iroh_db::{AuthorId, DomainSeed, Dot, IrohDb, IrohRecord, Lww, VersionVector};
+use iroh_db::{
+    AuthorId, ConsistencyMode, DomainSeed, Dot, IrohDb, IrohRecord, Lww, Permission, PermissionSet,
+    VersionVector,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, IrohRecord)]
 #[iroh_db(collection = "network-notes", version = 1)]
@@ -171,6 +174,47 @@ async fn encrypted_snapshot_bootstrap_fetches_only_the_commit_tail() {
     drop(target_notes);
     source.close().await.unwrap();
     target.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn controlled_domain_accepts_snapshot_from_explicit_authority() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_device = IrohDb::open(source_dir.path()).await.unwrap();
+    let target_device = IrohDb::open(target_dir.path()).await.unwrap();
+    let source = source_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = source
+        .invite(
+            target_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::FetchBlobs]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let target = target_device.import_invitation(&invitation).unwrap();
+    source
+        .collection::<Note>()
+        .put(note("base", "authorized", source.author_id()))
+        .await
+        .unwrap();
+    let snapshot = source.snapshot().await.unwrap();
+
+    let source_node = source.start_sync().await.unwrap();
+    let target_node = target.start_sync().await.unwrap();
+    target_node
+        .bootstrap_from(source_node.addr(), snapshot)
+        .await
+        .unwrap();
+    assert_eq!(target.state_root().unwrap(), source.state_root().unwrap());
+
+    source_node.shutdown().await.unwrap();
+    target_node.shutdown().await.unwrap();
+    drop(source);
+    drop(target);
+    source_device.close().await.unwrap();
+    target_device.close().await.unwrap();
 }
 
 #[tokio::test]

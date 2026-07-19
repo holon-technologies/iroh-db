@@ -164,6 +164,9 @@ pub enum StoreError {
     /// Stored derived metadata was structurally corrupt.
     #[error("derived metadata is corrupt: {0}")]
     CorruptDerivedMetadata(String),
+    /// A snapshot supplied a noncanonical or inconsistent causal baseline.
+    #[error("snapshot metadata is invalid: {0}")]
+    InvalidSnapshotMetadata(String),
     /// A signed domain authority object failed validation or conflicted with durable state.
     #[error("domain authority metadata is invalid: {0}")]
     InvalidAuthority(String),
@@ -945,6 +948,7 @@ impl Store {
         frontier_commits: &[CommitId],
         author_sequences: &[(AuthorId, u64)],
     ) -> Result<(), StoreError> {
+        validate_snapshot_metadata(records, covered_commits, frontier_commits, author_sequences)?;
         let write = self.inner.database.begin_write().map_err(database_error)?;
         clear_materialized_domain(&write, domain_id)?;
         clear_domain_snapshot_metadata(&write, domain_id)?;
@@ -1471,6 +1475,56 @@ impl Store {
         write.commit().map_err(database_error)?;
         Ok(fresh)
     }
+}
+
+fn validate_snapshot_metadata(
+    records: &[MaterializedRecord],
+    covered_commits: &[CommitId],
+    frontier_commits: &[CommitId],
+    author_sequences: &[(AuthorId, u64)],
+) -> Result<(), StoreError> {
+    let records_are_ordered = records.windows(2).all(|pair| {
+        (pair[0].schema().collection_id(), pair[0].record_id())
+            < (pair[1].schema().collection_id(), pair[1].record_id())
+    });
+    if !records_are_ordered || records.iter().any(|record| record.state().is_none()) {
+        return Err(StoreError::InvalidSnapshotMetadata(
+            "materialized records are not unique canonical upserts".into(),
+        ));
+    }
+    if !strictly_sorted(covered_commits) || !strictly_sorted(frontier_commits) {
+        return Err(StoreError::InvalidSnapshotMetadata(
+            "commit coverage and frontier must be strictly ordered".into(),
+        ));
+    }
+    if !author_sequences
+        .windows(2)
+        .all(|pair| pair[0].0 < pair[1].0)
+    {
+        return Err(StoreError::InvalidSnapshotMetadata(
+            "author sequence entries must be strictly ordered".into(),
+        ));
+    }
+    if frontier_commits
+        .iter()
+        .any(|commit_id| covered_commits.binary_search(commit_id).is_err())
+    {
+        return Err(StoreError::InvalidSnapshotMetadata(
+            "snapshot frontier is not covered by the snapshot".into(),
+        ));
+    }
+    if covered_commits.is_empty() != frontier_commits.is_empty()
+        || covered_commits.is_empty() != author_sequences.is_empty()
+    {
+        return Err(StoreError::InvalidSnapshotMetadata(
+            "empty history must have an empty frontier and version vector".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn initialize_tables(database: &Database) -> Result<(), StoreError> {
