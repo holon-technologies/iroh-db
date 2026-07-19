@@ -21,7 +21,13 @@ const SNAPSHOT_COVERAGE: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("snapshot_coverage_v1");
 const AUTHOR_SEQUENCES: TableDefinition<'static, &[u8], u64> =
     TableDefinition::new("author_sequences_v1");
+const AUTHOR_HEADS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("author_heads_v1");
 const FRONTIER: TableDefinition<'static, &[u8], u8> = TableDefinition::new("frontier_v1");
+const QUARANTINED_COMMITS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("quarantined_commits_v1");
+const QUARANTINED_AUTHORS: TableDefinition<'static, &[u8], u64> =
+    TableDefinition::new("quarantined_authors_v1");
 const SCHEMAS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("schemas_v1");
 const RECORDS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("records_v1");
 const RECORD_INDEX_KEYS: TableDefinition<'static, &[u8], &[u8]> =
@@ -54,6 +60,13 @@ pub enum ApplyOutcome {
     Duplicate(CommitId),
 }
 
+enum CommitPreflight {
+    Duplicate(CommitId),
+    Ready {
+        previous_author_head: Option<CommitId>,
+    },
+}
+
 /// A local durable-store failure.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
@@ -76,6 +89,43 @@ pub enum StoreError {
         expected: u64,
         /// The sequence supplied by the commit.
         actual: u64,
+    },
+    /// The next author sequence did not causally extend that author's accepted head.
+    #[error("commit does not extend previous author commit {previous}")]
+    AuthorChainMissing {
+        /// The accepted author commit that must be in dependency ancestry.
+        previous: CommitId,
+    },
+    /// A post-snapshot author commit did not extend the complete installed frontier.
+    #[error("commit does not extend installed snapshot frontier commit {frontier}")]
+    SnapshotBaselineMissing {
+        /// A current frontier commit absent from incoming dependency ancestry.
+        frontier: CommitId,
+    },
+    /// Two different immutable commits claim one author-local sequence.
+    #[error(
+        "author {author} equivocated at sequence {sequence}: conflicting commits {first} and {second}"
+    )]
+    AuthorEquivocation {
+        /// The signing author that reused a sequence.
+        author: AuthorId,
+        /// The reused author-local sequence.
+        sequence: u64,
+        /// Lexicographically first conflicting commit ID.
+        first: CommitId,
+        /// Lexicographically second conflicting commit ID.
+        second: CommitId,
+    },
+    /// A commit is immutable evidence in a quarantined equivocation branch.
+    #[error("commit is quarantined: {0}")]
+    QuarantinedCommit(CommitId),
+    /// An author's signing key equivocated and cannot extend that branch.
+    #[error("author {author} is quarantined from sequence {from_sequence}")]
+    QuarantinedAuthor {
+        /// The equivocated author identity.
+        author: AuthorId,
+        /// The first sequence no longer accepted from this author.
+        from_sequence: u64,
     },
     /// A declared causal dependency is not accepted locally.
     #[error("commit dependency is missing: {0}")]
@@ -185,12 +235,30 @@ impl Store {
         records: &[MaterializedRecord],
     ) -> Result<ApplyOutcome, StoreError> {
         let commit_id = envelope.commit_id();
+        let previous_author_head = match self.commit_preflight(envelope).await? {
+            CommitPreflight::Duplicate(commit_id) => {
+                return Ok(ApplyOutcome::Duplicate(commit_id));
+            }
+            CommitPreflight::Ready {
+                previous_author_head,
+            } => previous_author_head,
+        };
         let expected_blob_hash = BlobHash::from_bytes(commit_id.to_bytes());
         let actual_blob_hash = self.inner.blobs.put(envelope.encode_canonical()).await?;
         if actual_blob_hash != expected_blob_hash {
             return Err(StoreError::BlobHashMismatch);
         }
 
+        self.publish_commit_with_records(envelope, records, previous_author_head)
+    }
+
+    fn publish_commit_with_records(
+        &self,
+        envelope: &CommitEnvelope,
+        records: &[MaterializedRecord],
+        previous_author_head: Option<CommitId>,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let commit_id = envelope.commit_id();
         let write = self.inner.database.begin_write().map_err(database_error)?;
         {
             let mut commits = write.open_table(COMMIT_METADATA).map_err(database_error)?;
@@ -240,12 +308,35 @@ impl Store {
                 });
             }
 
+            let mut author_heads = write.open_table(AUTHOR_HEADS).map_err(database_error)?;
+            let current_author_head = author_heads
+                .get(author_key.as_slice())
+                .map_err(database_error)?
+                .map(|value| {
+                    let bytes: [u8; 32] = value.value().try_into().map_err(|_| {
+                        StoreError::CorruptDerivedMetadata(
+                            "author head commit ID is invalid".into(),
+                        )
+                    })?;
+                    Ok::<CommitId, StoreError>(CommitId::from_bytes(bytes))
+                })
+                .transpose()?;
+            if current_author_head != previous_author_head {
+                return Err(StoreError::SequenceGap {
+                    expected: expected_sequence,
+                    actual: envelope.header().author_sequence(),
+                });
+            }
+
             let metadata = encode_metadata(envelope);
             commits
                 .insert(commit_id.as_bytes().as_slice(), metadata.as_slice())
                 .map_err(database_error)?;
             sequences
                 .insert(author_key.as_slice(), envelope.header().author_sequence())
+                .map_err(database_error)?;
+            author_heads
+                .insert(author_key.as_slice(), commit_id.as_bytes().as_slice())
                 .map_err(database_error)?;
 
             let mut frontier = write.open_table(FRONTIER).map_err(database_error)?;
@@ -266,20 +357,122 @@ impl Store {
         Ok(ApplyOutcome::Applied(commit_id))
     }
 
+    async fn commit_preflight(
+        &self,
+        envelope: &CommitEnvelope,
+    ) -> Result<CommitPreflight, StoreError> {
+        let commit_id = envelope.commit_id();
+        if self.is_commit_quarantined(commit_id)? {
+            return Err(StoreError::QuarantinedCommit(commit_id));
+        }
+        if let Some(from_sequence) =
+            self.author_quarantine(envelope.header().domain_id(), envelope.header().author())?
+            && envelope.header().author_sequence() >= from_sequence
+        {
+            return Err(StoreError::QuarantinedAuthor {
+                author: envelope.header().author(),
+                from_sequence,
+            });
+        }
+        if self.contains_commit(commit_id)? {
+            return Ok(CommitPreflight::Duplicate(commit_id));
+        }
+        if let Some(existing) = self.accepted_author_commit(
+            envelope.header().domain_id(),
+            envelope.header().author(),
+            envelope.header().author_sequence(),
+        )? && existing != commit_id
+        {
+            let (first, second) = if existing < commit_id {
+                (existing, commit_id)
+            } else {
+                (commit_id, existing)
+            };
+            return Err(StoreError::AuthorEquivocation {
+                author: envelope.header().author(),
+                sequence: envelope.header().author_sequence(),
+                first,
+                second,
+            });
+        }
+        let previous_author_head =
+            self.author_head(envelope.header().domain_id(), envelope.header().author())?;
+        if let Some(previous) = previous_author_head
+            && !self
+                .dependencies_include_ancestor(envelope.header().dependencies(), previous)
+                .await?
+        {
+            return Err(StoreError::AuthorChainMissing { previous });
+        }
+        if previous_author_head.is_none()
+            && self
+                .last_sequence(envelope.header().domain_id(), envelope.header().author())?
+                .is_some()
+        {
+            for frontier in self.frontier(envelope.header().domain_id())? {
+                if !self
+                    .dependencies_include_ancestor(envelope.header().dependencies(), frontier)
+                    .await?
+                {
+                    return Err(StoreError::SnapshotBaselineMissing { frontier });
+                }
+            }
+        }
+        Ok(CommitPreflight::Ready {
+            previous_author_head,
+        })
+    }
+
     /// Returns whether commit metadata is accepted locally.
     pub fn contains_commit(&self, commit_id: CommitId) -> Result<bool, StoreError> {
         let read = self.inner.database.begin_read().map_err(database_error)?;
         let commits = read.open_table(COMMIT_METADATA).map_err(database_error)?;
         let coverage = read.open_table(SNAPSHOT_COVERAGE).map_err(database_error)?;
+        let quarantined = read
+            .open_table(QUARANTINED_COMMITS)
+            .map_err(database_error)?;
         let stored = commits
             .get(commit_id.as_bytes().as_slice())
             .map_err(database_error)?
-            .is_some();
+            .is_some()
+            && quarantined
+                .get(commit_id.as_bytes().as_slice())
+                .map_err(database_error)?
+                .is_none();
         let snapshotted = coverage
             .get(commit_id.as_bytes().as_slice())
             .map_err(database_error)?
             .is_some();
         Ok(stored || snapshotted)
+    }
+
+    /// Returns whether a commit ID is retained only as equivocation evidence.
+    pub fn is_commit_quarantined(&self, commit_id: CommitId) -> Result<bool, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let quarantined = read
+            .open_table(QUARANTINED_COMMITS)
+            .map_err(database_error)?;
+        Ok(quarantined
+            .get(commit_id.as_bytes().as_slice())
+            .map_err(database_error)?
+            .is_some())
+    }
+
+    /// Returns the first rejected sequence for an equivocated author, if any.
+    pub fn author_quarantine(
+        &self,
+        domain_id: DomainId,
+        author: AuthorId,
+    ) -> Result<Option<u64>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let quarantined = read
+            .open_table(QUARANTINED_AUTHORS)
+            .map_err(database_error)?;
+        let key = author_sequence_key(domain_id, author);
+        Ok(quarantined
+            .get(key.as_slice())
+            .map_err(database_error)?
+            .map(|value| value.value()))
     }
 
     /// Returns the latest accepted author sequence in a domain.
@@ -295,6 +488,193 @@ impl Store {
             .get(key.as_slice())
             .map_err(database_error)?
             .map(|value| value.value()))
+    }
+
+    /// Returns the latest accepted immutable commit for an author in a domain.
+    pub fn author_head(
+        &self,
+        domain_id: DomainId,
+        author: AuthorId,
+    ) -> Result<Option<CommitId>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let heads = read.open_table(AUTHOR_HEADS).map_err(database_error)?;
+        let key = author_sequence_key(domain_id, author);
+        heads
+            .get(key.as_slice())
+            .map_err(database_error)?
+            .map(|value| {
+                let bytes: [u8; 32] = value.value().try_into().map_err(|_| {
+                    StoreError::CorruptDerivedMetadata("author head commit ID is invalid".into())
+                })?;
+                Ok(CommitId::from_bytes(bytes))
+            })
+            .transpose()
+    }
+
+    /// Returns an accepted conflicting commit for the envelope's author sequence.
+    pub fn conflicting_author_commit(
+        &self,
+        envelope: &CommitEnvelope,
+    ) -> Result<Option<CommitId>, StoreError> {
+        let commit_id = envelope.commit_id();
+        Ok(self
+            .accepted_author_commit(
+                envelope.header().domain_id(),
+                envelope.header().author(),
+                envelope.header().author_sequence(),
+            )?
+            .filter(|existing| *existing != commit_id))
+    }
+
+    /// Atomically quarantines an equivocated branch and publishes rebuilt accepted state.
+    pub async fn quarantine_equivocation(
+        &self,
+        evidence: &CommitEnvelope,
+        invalid_commits: &[CommitId],
+        accepted_frontier: &[CommitId],
+        author_heads: &[(AuthorId, u64, CommitId)],
+        records: &[MaterializedRecord],
+    ) -> Result<(), StoreError> {
+        let evidence_id = evidence.commit_id();
+        let expected_hash = BlobHash::from_bytes(evidence_id.to_bytes());
+        if self.inner.blobs.put(evidence.encode_canonical()).await? != expected_hash {
+            return Err(StoreError::BlobHashMismatch);
+        }
+        let domain_id = evidence.header().domain_id();
+        let write = self.inner.database.begin_write().map_err(database_error)?;
+        clear_materialized_domain(&write, domain_id)?;
+        apply_materialized_records(&write, domain_id, records)?;
+        {
+            let mut quarantined = write
+                .open_table(QUARANTINED_COMMITS)
+                .map_err(database_error)?;
+            for commit_id in invalid_commits
+                .iter()
+                .copied()
+                .chain(std::iter::once(evidence_id))
+            {
+                quarantined
+                    .insert(
+                        commit_id.as_bytes().as_slice(),
+                        domain_id.as_bytes().as_slice(),
+                    )
+                    .map_err(database_error)?;
+            }
+        }
+        {
+            let mut authors = write
+                .open_table(QUARANTINED_AUTHORS)
+                .map_err(database_error)?;
+            let key = author_sequence_key(domain_id, evidence.header().author());
+            let existing = authors
+                .get(key.as_slice())
+                .map_err(database_error)?
+                .map(|value| value.value());
+            let from_sequence = existing.map_or(evidence.header().author_sequence(), |current| {
+                current.min(evidence.header().author_sequence())
+            });
+            authors
+                .insert(key.as_slice(), from_sequence)
+                .map_err(database_error)?;
+        }
+        {
+            let mut sequences = write.open_table(AUTHOR_SEQUENCES).map_err(database_error)?;
+            let keys = table_u64_keys_with_prefix(&sequences, domain_id.as_bytes())?;
+            for key in keys {
+                sequences.remove(key.as_slice()).map_err(database_error)?;
+            }
+            let mut heads = write.open_table(AUTHOR_HEADS).map_err(database_error)?;
+            let keys = table_keys_with_prefix(&heads, domain_id.as_bytes())?;
+            for key in keys {
+                heads.remove(key.as_slice()).map_err(database_error)?;
+            }
+            for (author, sequence, commit_id) in author_heads {
+                let key = author_sequence_key(domain_id, *author);
+                sequences
+                    .insert(key.as_slice(), *sequence)
+                    .map_err(database_error)?;
+                heads
+                    .insert(key.as_slice(), commit_id.as_bytes().as_slice())
+                    .map_err(database_error)?;
+            }
+        }
+        {
+            let mut frontier = write.open_table(FRONTIER).map_err(database_error)?;
+            let keys = table_u8_keys_with_prefix(&frontier, domain_id.as_bytes())?;
+            for key in keys {
+                frontier.remove(key.as_slice()).map_err(database_error)?;
+            }
+            for commit_id in accepted_frontier {
+                let key = frontier_key(domain_id, *commit_id);
+                frontier.insert(key.as_slice(), 0).map_err(database_error)?;
+            }
+        }
+        write.commit().map_err(database_error)
+    }
+
+    fn accepted_author_commit(
+        &self,
+        domain_id: DomainId,
+        author: AuthorId,
+        sequence: u64,
+    ) -> Result<Option<CommitId>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let commits = read.open_table(COMMIT_METADATA).map_err(database_error)?;
+        let quarantined = read
+            .open_table(QUARANTINED_COMMITS)
+            .map_err(database_error)?;
+        for entry in commits.iter().map_err(database_error)? {
+            let (key, value) = entry.map_err(database_error)?;
+            if quarantined
+                .get(key.value())
+                .map_err(database_error)?
+                .is_some()
+            {
+                continue;
+            }
+            let metadata = value.value();
+            if metadata.len() != 112 {
+                return Err(StoreError::CorruptDerivedMetadata(
+                    "commit metadata length is invalid".into(),
+                ));
+            }
+            if &metadata[..32] != domain_id.as_bytes()
+                || &metadata[32..64] != author.as_bytes()
+                || metadata[72..80] != sequence.to_be_bytes()
+            {
+                continue;
+            }
+            let bytes: [u8; 32] = key.value().try_into().map_err(|_| {
+                StoreError::CorruptDerivedMetadata("commit ID length is invalid".into())
+            })?;
+            return Ok(Some(CommitId::from_bytes(bytes)));
+        }
+        Ok(None)
+    }
+
+    async fn dependencies_include_ancestor(
+        &self,
+        dependencies: &[CommitId],
+        ancestor: CommitId,
+    ) -> Result<bool, StoreError> {
+        let mut pending = dependencies.to_vec();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(commit_id) = pending.pop() {
+            if commit_id == ancestor {
+                return Ok(true);
+            }
+            if !visited.insert(commit_id) {
+                continue;
+            }
+            match self.load_commit(commit_id).await {
+                Ok(envelope) => pending.extend_from_slice(envelope.header().dependencies()),
+                Err(StoreError::MissingCommitBlob(_)) if self.contains_commit(commit_id)? => {
+                    // Snapshot-covered history is trusted as an opaque causal baseline.
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
     }
 
     /// Returns the canonical sorted commit frontier for a domain.
@@ -446,10 +826,18 @@ impl Store {
     pub fn list_stored_commit_ids(&self, domain_id: DomainId) -> Result<Vec<CommitId>, StoreError> {
         let read = self.inner.database.begin_read().map_err(database_error)?;
         let commits = read.open_table(COMMIT_METADATA).map_err(database_error)?;
+        let quarantined = read
+            .open_table(QUARANTINED_COMMITS)
+            .map_err(database_error)?;
         let mut ids = Vec::new();
         for entry in commits.iter().map_err(database_error)? {
             let (key, value) = entry.map_err(database_error)?;
-            if value.value().starts_with(domain_id.as_bytes()) {
+            if value.value().starts_with(domain_id.as_bytes())
+                && quarantined
+                    .get(key.value())
+                    .map_err(database_error)?
+                    .is_none()
+            {
                 let bytes: [u8; 32] = key.value().try_into().map_err(|_| {
                     StoreError::CorruptDerivedMetadata("commit ID length is invalid".into())
                 })?;
@@ -1092,7 +1480,14 @@ fn initialize_tables(database: &Database) -> Result<(), StoreError> {
         .open_table(SNAPSHOT_COVERAGE)
         .map_err(database_error)?;
     write.open_table(AUTHOR_SEQUENCES).map_err(database_error)?;
+    write.open_table(AUTHOR_HEADS).map_err(database_error)?;
     write.open_table(FRONTIER).map_err(database_error)?;
+    write
+        .open_table(QUARANTINED_COMMITS)
+        .map_err(database_error)?;
+    write
+        .open_table(QUARANTINED_AUTHORS)
+        .map_err(database_error)?;
     write.open_table(SCHEMAS).map_err(database_error)?;
     write.open_table(RECORDS).map_err(database_error)?;
     write
@@ -1374,6 +1769,13 @@ fn clear_domain_snapshot_metadata(
             sequences.remove(key.as_slice()).map_err(database_error)?;
         }
     }
+    {
+        let mut heads = write.open_table(AUTHOR_HEADS).map_err(database_error)?;
+        let keys = table_keys_with_prefix(&heads, domain_id.as_bytes())?;
+        for key in keys {
+            heads.remove(key.as_slice()).map_err(database_error)?;
+        }
+    }
     Ok(())
 }
 
@@ -1393,6 +1795,20 @@ fn table_keys_with_prefix(
 
 fn table_u8_keys_with_prefix(
     table: &impl redb::ReadableTable<&'static [u8], u8>,
+    prefix: &[u8],
+) -> Result<Vec<Vec<u8>>, StoreError> {
+    let mut keys = Vec::new();
+    for entry in table.iter().map_err(database_error)? {
+        let (key, _) = entry.map_err(database_error)?;
+        if key.value().starts_with(prefix) {
+            keys.push(key.value().to_vec());
+        }
+    }
+    Ok(keys)
+}
+
+fn table_u64_keys_with_prefix(
+    table: &impl redb::ReadableTable<&'static [u8], u64>,
     prefix: &[u8],
 ) -> Result<Vec<Vec<u8>>, StoreError> {
     let mut keys = Vec::new();

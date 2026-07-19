@@ -1,6 +1,10 @@
 use iroh_db::{
-    AuthorId, DbError, DomainSeed, Dot, IrohDb, IrohRecord, Lww, RemoteApply, VersionVector,
+    AuthorId, CapabilityId, DbError, DomainSeed, Dot, IrohDb, IrohRecord, Lww, RemoteApply,
+    TransactionId, VersionVector,
 };
+use iroh_db_core::{CommitBody, CommitHeader, Operation, OperationKind};
+use iroh_db_security::{LocalCredentials, seal_commit};
+use iroh_db_store::{IndexValue, MaterializedRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq, IrohRecord)]
 #[iroh_db(collection = "shared-notes", version = 1)]
@@ -110,6 +114,206 @@ async fn untrusted_peer_cannot_mutate_state() {
 
     left.close().await.unwrap();
     right.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn authenticated_writer_cannot_forge_causal_metadata() {
+    let seed = DomainSeed::generate().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let writer_dir = tempfile::tempdir().unwrap();
+    let receiver = IrohDb::create_in_domain(receiver_dir.path(), &seed)
+        .await
+        .unwrap();
+    let writer = IrohDb::create_in_domain(writer_dir.path(), &seed)
+        .await
+        .unwrap();
+    receiver.collection::<Note>();
+    receiver.trust_device(writer.author_id()).unwrap();
+    let credentials = LocalCredentials::load_or_create(writer_dir.path().join("keys")).unwrap();
+    let forged_author = AuthorId::from_bytes([0xff; 32]);
+    let forged = note("forged", "dominant", forged_author);
+    let schema = Note::schema().unwrap();
+    let record_id = forged.record_id().unwrap();
+    let mutation = MaterializedRecord::upsert(
+        schema.clone(),
+        record_id.clone(),
+        forged.encode_record().unwrap(),
+        forged
+            .field_values(Note::text.field_id())
+            .unwrap()
+            .into_iter()
+            .map(|value| IndexValue::new(Note::text.field_id(), value))
+            .collect(),
+    )
+    .unwrap();
+    let operation = Operation::new(
+        schema.collection_id(),
+        record_id,
+        0,
+        OperationKind::FieldStateMerge,
+        mutation.encode_canonical().unwrap(),
+    )
+    .unwrap();
+    let body = CommitBody::new(TransactionId::from_bytes([3; 32]), vec![operation]).unwrap();
+    let header = CommitHeader::new(
+        seed.domain_id(),
+        seed.epoch(),
+        credentials.signer().author(),
+        0,
+        Vec::new(),
+        CapabilityId::from_bytes([4; 32]),
+        vec![schema.schema_id()],
+        [5; 24],
+    )
+    .unwrap();
+    let envelope = seal_commit(header, &body, &seed.domain_key(), &credentials.signer()).unwrap();
+    let root_before = receiver.state_root().unwrap();
+
+    assert!(matches!(
+        receiver
+            .accept_remote_commit(writer.author_id(), envelope)
+            .await,
+        Err(DbError::InvalidRemoteCommit(message))
+            if message == "record contains causal metadata not issued by its commit"
+    ));
+    assert_eq!(receiver.state_root().unwrap(), root_before);
+    assert!(receiver.commit_envelopes().await.unwrap().is_empty());
+
+    writer.close().await.unwrap();
+    receiver.close().await.unwrap();
+}
+
+fn equivocation_commit(
+    seed: &DomainSeed,
+    credentials: &LocalCredentials,
+    text: &str,
+    variant: u8,
+) -> iroh_db::CommitEnvelope {
+    let author = credentials.signer().author();
+    let canonical = note("equivocated", text, author);
+    let schema = Note::schema().unwrap();
+    let record_id = canonical.record_id().unwrap();
+    let mutation = MaterializedRecord::upsert(
+        schema.clone(),
+        record_id.clone(),
+        canonical.encode_record().unwrap(),
+        canonical
+            .field_values(Note::text.field_id())
+            .unwrap()
+            .into_iter()
+            .map(|value| IndexValue::new(Note::text.field_id(), value))
+            .collect(),
+    )
+    .unwrap();
+    let operation = Operation::new(
+        schema.collection_id(),
+        record_id,
+        0,
+        OperationKind::FieldStateMerge,
+        mutation.encode_canonical().unwrap(),
+    )
+    .unwrap();
+    let body = CommitBody::new(TransactionId::from_bytes([variant; 32]), vec![operation]).unwrap();
+    let header = CommitHeader::new(
+        seed.domain_id(),
+        seed.epoch(),
+        author,
+        0,
+        Vec::new(),
+        CapabilityId::from_bytes([4; 32]),
+        vec![schema.schema_id()],
+        [variant; 24],
+    )
+    .unwrap();
+    seal_commit(header, &body, &seed.domain_key(), &credentials.signer()).unwrap()
+}
+
+#[tokio::test]
+async fn replicas_quarantine_equivocation_independently_of_receipt_order() {
+    let seed = DomainSeed::generate().unwrap();
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let writer_dir = tempfile::tempdir().unwrap();
+    let first = IrohDb::create_in_domain(first_dir.path(), &seed)
+        .await
+        .unwrap();
+    let second = IrohDb::create_in_domain(second_dir.path(), &seed)
+        .await
+        .unwrap();
+    let writer = IrohDb::create_in_domain(writer_dir.path(), &seed)
+        .await
+        .unwrap();
+    first.collection::<Note>();
+    second.collection::<Note>();
+    first.trust_device(writer.author_id()).unwrap();
+    second.trust_device(writer.author_id()).unwrap();
+    let credentials = LocalCredentials::load_or_create(writer_dir.path().join("keys")).unwrap();
+    let left = equivocation_commit(&seed, &credentials, "left", 11);
+    let right = equivocation_commit(&seed, &credentials, "right", 12);
+    let empty_root = first.state_root().unwrap();
+
+    assert!(matches!(
+        first
+            .accept_remote_commit(writer.author_id(), left.clone())
+            .await
+            .unwrap(),
+        RemoteApply::Applied(_)
+    ));
+    assert!(matches!(
+        second
+            .accept_remote_commit(writer.author_id(), right.clone())
+            .await
+            .unwrap(),
+        RemoteApply::Applied(_)
+    ));
+    assert_ne!(first.state_root().unwrap(), second.state_root().unwrap());
+
+    assert!(matches!(
+        first
+            .accept_remote_commit(writer.author_id(), right.clone())
+            .await
+            .unwrap(),
+        RemoteApply::Quarantined { author, sequence: 0 } if author == writer.author_id()
+    ));
+    assert!(matches!(
+        second
+            .accept_remote_commit(writer.author_id(), left.clone())
+            .await
+            .unwrap(),
+        RemoteApply::Quarantined { author, sequence: 0 } if author == writer.author_id()
+    ));
+    assert_eq!(first.state_root().unwrap(), empty_root);
+    assert_eq!(second.state_root().unwrap(), empty_root);
+    assert_eq!(first.state_root().unwrap(), second.state_root().unwrap());
+    assert!(first.commit_envelopes().await.unwrap().is_empty());
+    assert!(second.commit_envelopes().await.unwrap().is_empty());
+    assert!(matches!(
+        first
+            .accept_remote_commit(writer.author_id(), right)
+            .await
+            .unwrap(),
+        RemoteApply::Quarantined { .. }
+    ));
+    assert!(matches!(
+        second
+            .accept_remote_commit(writer.author_id(), left)
+            .await
+            .unwrap(),
+        RemoteApply::Quarantined { .. }
+    ));
+    let third = equivocation_commit(&seed, &credentials, "third", 13);
+    assert!(matches!(
+        first
+            .accept_remote_commit(writer.author_id(), third)
+            .await
+            .unwrap(),
+        RemoteApply::Quarantined { author, sequence: 0 } if author == writer.author_id()
+    ));
+    assert_eq!(first.state_root().unwrap(), empty_root);
+
+    writer.close().await.unwrap();
+    first.close().await.unwrap();
+    second.close().await.unwrap();
 }
 
 #[tokio::test]

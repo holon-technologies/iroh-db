@@ -9,8 +9,8 @@ use std::{
 use iroh_db_blobs::{BlobEngine, BlobError, BlobRef, BlobStream, IrohBlobStore};
 use iroh_db_core::{
     AuthorId, CapabilityId, CollectionId, CommitBody, CommitCodecError, CommitEnvelope,
-    CommitHeader, CommitId, EqualityFilter, IrohRecord, Operation, OperationKind, RangeFilter,
-    RecordError, RecordKey, SchemaId, TransactionId, TypedField,
+    CommitHeader, CommitId, Dot, EqualityFilter, IrohRecord, Operation, OperationKind, RangeFilter,
+    RecordError, RecordKey, SchemaId, TransactionId, TypedField, VersionVector,
 };
 use iroh_db_security::{
     AuthorityError, CapabilityCertificate, ConsistencyMode, ControlTransition, DomainDescriptor,
@@ -190,6 +190,13 @@ pub(crate) struct DbInner {
 struct RecordAdapter {
     schema_id: SchemaId,
     merge: fn(Option<&[u8]>, &MaterializedRecord) -> Result<MaterializedRecord, DbError>,
+    canonicalize: fn(
+        &MaterializedRecord,
+        AuthorId,
+        u64,
+        &VersionVector,
+        &mut u32,
+    ) -> Result<MaterializedRecord, DbError>,
 }
 
 /// Result of feeding one authenticated immutable commit into the local apply kernel.
@@ -199,6 +206,13 @@ pub enum RemoteApply {
     Applied(CommitId),
     /// The exact commit was already accepted.
     Duplicate(CommitId),
+    /// Conflicting author-sequence branches were removed from accepted history.
+    Quarantined {
+        /// The author whose signing key produced conflicting commits.
+        author: AuthorId,
+        /// The first equivocated author-local sequence.
+        sequence: u64,
+    },
 }
 
 /// Application-facing label that groups device endpoints without changing protocol identity.
@@ -289,6 +303,7 @@ impl IrohDb {
                 RecordAdapter {
                     schema_id: schema.schema_id(),
                     merge: merge_materialized::<Record>,
+                    canonicalize: canonicalize_materialized::<Record>,
                 },
             );
         Collection {
@@ -667,6 +682,9 @@ impl IrohDb {
         if header.domain_id() != domain_id {
             return Err(DbError::UnauthorizedDevice);
         }
+        if let Some(outcome) = self.quarantined_remote_apply(header, commit_id)? {
+            return Ok(outcome);
+        }
         if self.inner.store.contains_commit(commit_id)? {
             return Ok(RemoteApply::Duplicate(commit_id));
         }
@@ -700,6 +718,9 @@ impl IrohDb {
             return Err(DbError::UnauthorizedDevice);
         }
         let body = open_commit(&envelope, &self.domain_key_for(header.epoch())?)?;
+        if let Some(existing) = self.inner.store.conflicting_author_commit(&envelope)? {
+            return self.quarantine_equivocation(envelope, existing).await;
+        }
         self.validate_consistency(header.author(), &body)?;
 
         let adapters = self
@@ -742,6 +763,110 @@ impl IrohDb {
         }
     }
 
+    fn quarantined_remote_apply(
+        &self,
+        header: &CommitHeader,
+        commit_id: CommitId,
+    ) -> Result<Option<RemoteApply>, DbError> {
+        let commit_quarantined = self.inner.store.is_commit_quarantined(commit_id)?;
+        let author_quarantined = self
+            .inner
+            .store
+            .author_quarantine(header.domain_id(), header.author())?
+            .is_some_and(|from_sequence| header.author_sequence() >= from_sequence);
+        Ok(
+            (commit_quarantined || author_quarantined).then_some(RemoteApply::Quarantined {
+                author: header.author(),
+                sequence: header.author_sequence(),
+            }),
+        )
+    }
+
+    async fn quarantine_equivocation(
+        &self,
+        evidence: CommitEnvelope,
+        existing: CommitId,
+    ) -> Result<RemoteApply, DbError> {
+        let author = evidence.header().author();
+        let sequence = evidence.header().author_sequence();
+        let commit_ids = self.inner.store.list_stored_commit_ids(self.domain_id())?;
+        let mut graph = BTreeMap::<CommitId, Vec<CommitId>>::new();
+        let mut headers = BTreeMap::<CommitId, (AuthorId, u64)>::new();
+        for commit_id in &commit_ids {
+            let envelope = self.inner.store.load_commit(*commit_id).await?;
+            graph.insert(*commit_id, envelope.header().dependencies().to_vec());
+            headers.insert(
+                *commit_id,
+                (
+                    envelope.header().author(),
+                    envelope.header().author_sequence(),
+                ),
+            );
+        }
+        let mut invalid = BTreeSet::from([existing]);
+        loop {
+            let mut changed = false;
+            for (commit_id, dependencies) in &graph {
+                if !invalid.contains(commit_id)
+                    && dependencies
+                        .iter()
+                        .any(|dependency| invalid.contains(dependency))
+                {
+                    changed |= invalid.insert(*commit_id);
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let accepted: Vec<_> = commit_ids
+            .into_iter()
+            .filter(|commit_id| !invalid.contains(commit_id))
+            .collect();
+        let adapters = self
+            .inner
+            .adapters
+            .read()
+            .expect("record adapter lock is not poisoned")
+            .clone();
+        let mutations = self.materialize_commit_ids(&accepted, &adapters).await?;
+        let accepted_set: BTreeSet<_> = accepted.iter().copied().collect();
+        let referenced: BTreeSet<_> = accepted
+            .iter()
+            .flat_map(|commit_id| graph[commit_id].iter().copied())
+            .filter(|dependency| accepted_set.contains(dependency))
+            .collect();
+        let frontier: Vec<_> = accepted
+            .iter()
+            .copied()
+            .filter(|commit_id| !referenced.contains(commit_id))
+            .collect();
+        let mut author_heads = BTreeMap::<AuthorId, (u64, CommitId)>::new();
+        for commit_id in &accepted {
+            let (commit_author, commit_sequence) = headers[commit_id];
+            author_heads
+                .entry(commit_author)
+                .and_modify(|current| {
+                    if commit_sequence > current.0 {
+                        *current = (commit_sequence, *commit_id);
+                    }
+                })
+                .or_insert((commit_sequence, *commit_id));
+        }
+        let author_heads: Vec<_> = author_heads
+            .into_iter()
+            .map(|(head_author, (head_sequence, commit_id))| {
+                (head_author, head_sequence, commit_id)
+            })
+            .collect();
+        let invalid: Vec<_> = invalid.into_iter().collect();
+        self.inner
+            .store
+            .quarantine_equivocation(&evidence, &invalid, &frontier, &author_heads, &mutations)
+            .await?;
+        Ok(RemoteApply::Quarantined { author, sequence })
+    }
+
     async fn converged_mutations(
         &self,
         incoming: &CommitEnvelope,
@@ -763,7 +888,11 @@ impl IrohDb {
             }
         }
 
-        let affected = validate_incoming_operations(incoming, incoming_body, adapters)?;
+        let dependency_context = self
+            .dependency_context(incoming.header().dependencies())
+            .await?;
+        let affected =
+            validate_incoming_operations(incoming, incoming_body, adapters, &dependency_context)?;
         let mut graph = BTreeMap::<CommitId, Vec<CommitId>>::new();
         let mut candidates =
             BTreeMap::<(CollectionId, Vec<u8>), Vec<(CommitId, MaterializedRecord)>>::new();
@@ -787,6 +916,44 @@ impl IrohDb {
         Ok(mutations)
     }
 
+    async fn dependency_context(
+        &self,
+        dependencies: &[CommitId],
+    ) -> Result<VersionVector, DbError> {
+        let mut context = VersionVector::new();
+        let mut pending = dependencies.to_vec();
+        let mut visited = BTreeSet::new();
+        while let Some(commit_id) = pending.pop() {
+            if !visited.insert(commit_id) {
+                continue;
+            }
+            match self.inner.store.load_commit(commit_id).await {
+                Ok(envelope) => {
+                    if envelope.header().domain_id() != self.domain_id() {
+                        return Err(DbError::InvalidRemoteCommit(
+                            "dependency belongs to another domain".into(),
+                        ));
+                    }
+                    context.observe(Dot::new(
+                        envelope.header().author(),
+                        envelope.header().author_sequence(),
+                        0,
+                    ));
+                    pending.extend_from_slice(envelope.header().dependencies());
+                }
+                Err(StoreError::MissingCommitBlob(_))
+                    if self.inner.store.contains_commit(commit_id)? =>
+                {
+                    for (author, sequence) in self.inner.store.author_sequences(self.domain_id())? {
+                        context.observe(Dot::new(author, sequence, 0));
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(context)
+    }
+
     pub(crate) async fn rebuild_mutations(&self) -> Result<Vec<MaterializedRecord>, DbError> {
         let domain = self.domain_id();
         if self.inner.store.has_snapshot_coverage(domain)? {
@@ -806,33 +973,26 @@ impl IrohDb {
             .read()
             .expect("record adapter lock is not poisoned")
             .clone();
+        self.materialize_commit_ids(&commit_ids, &adapters).await
+    }
+
+    async fn materialize_commit_ids(
+        &self,
+        commit_ids: &[CommitId],
+        adapters: &BTreeMap<CollectionId, RecordAdapter>,
+    ) -> Result<Vec<MaterializedRecord>, DbError> {
         let mut graph = BTreeMap::<CommitId, Vec<CommitId>>::new();
         let mut candidates = RecordCandidates::new();
-        for commit_id in commit_ids {
+        for &commit_id in commit_ids {
             let envelope = self.inner.store.load_commit(commit_id).await?;
             graph.insert(commit_id, envelope.header().dependencies().to_vec());
             let body = open_commit(&envelope, &self.domain_key_for(envelope.header().epoch())?)?;
-            for operation in body.operations() {
-                if !matches!(
-                    operation.kind(),
-                    OperationKind::FieldStateMerge | OperationKind::RecordDelete
-                ) {
-                    continue;
-                }
-                let mutation = MaterializedRecord::decode_canonical(operation.payload())?;
-                if mutation.schema().collection_id() != operation.collection_id()
-                    || mutation.record_id() != operation.record_id()
-                {
-                    return Err(DbError::InvalidSnapshot(
-                        "commit materialization target mismatch".into(),
-                    ));
-                }
-                let key = (operation.collection_id(), operation.record_id().to_vec());
-                candidates
-                    .entry(key)
-                    .or_default()
-                    .push((commit_id, mutation));
-            }
+            let dependency_context = self
+                .dependency_context(envelope.header().dependencies())
+                .await?;
+            let affected =
+                validate_incoming_operations(&envelope, &body, adapters, &dependency_context)?;
+            collect_affected_operations(commit_id, &body, &affected, &mut candidates)?;
         }
         let mut mutations = Vec::with_capacity(candidates.len());
         for (key, entries) in candidates {
@@ -899,6 +1059,7 @@ impl IrohDb {
         if prepared.is_empty() {
             return Err(DbError::EmptyTransaction);
         }
+        validate_prepared_targets(&prepared)?;
         let _writer = self.inner.writer.lock().await;
         let domain_id = self.domain_id();
         let active_epoch = self.inner.store.current_epoch(domain_id)?;
@@ -917,15 +1078,25 @@ impl IrohDb {
                 value.checked_add(1).ok_or(DbError::SequenceExhausted)
             })?;
         let dependencies = self.inner.store.frontier(domain_id)?;
+        let dependency_context = self.dependency_context(&dependencies).await?;
         let mut nonce = [0_u8; 24];
         let mut transaction_id = [0_u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| DbError::RandomnessUnavailable)?;
         getrandom::fill(&mut transaction_id).map_err(|_| DbError::RandomnessUnavailable)?;
 
-        let operations = prepared
-            .iter()
-            .map(|entry| entry.operation.clone())
-            .collect();
+        let adapters = self
+            .inner
+            .adapters
+            .read()
+            .expect("record adapter lock is not poisoned")
+            .clone();
+        let operations = canonical_operations(
+            &prepared,
+            &adapters,
+            signer.author(),
+            sequence,
+            &dependency_context,
+        )?;
         let schemas: Vec<SchemaId> = prepared.iter().map(|entry| entry.schema_id).collect();
         let body = CommitBody::new(TransactionId::from_bytes(transaction_id), operations)?;
         self.validate_consistency(signer.author(), &body)?;
@@ -962,10 +1133,9 @@ impl IrohDb {
             nonce,
         )?;
         let envelope = seal_commit(header, &body, &self.domain_key(), &signer)?;
-        let mutations: Vec<_> = prepared
-            .iter()
-            .map(|entry| entry.materialized.clone())
-            .collect();
+        let mutations = self
+            .converged_mutations(&envelope, &body, &adapters)
+            .await?;
         self.inner
             .store
             .persist_commit_with_records(&envelope, &mutations)
@@ -1629,10 +1799,61 @@ impl Transaction {
 }
 
 struct PreparedRecord {
-    operation: Operation,
     materialized: MaterializedRecord,
     schema_id: SchemaId,
     change: Change,
+}
+
+fn validate_prepared_targets(prepared: &[PreparedRecord]) -> Result<(), DbError> {
+    let mut targets = BTreeSet::new();
+    for entry in prepared {
+        let target = (entry.change.collection_id, entry.change.record_id.clone());
+        if !targets.insert(target) {
+            return Err(DbError::InvalidRemoteCommit(
+                "a commit mutates one record more than once".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_operations(
+    prepared: &[PreparedRecord],
+    adapters: &BTreeMap<CollectionId, RecordAdapter>,
+    author: AuthorId,
+    sequence: u64,
+    dependency_context: &VersionVector,
+) -> Result<Vec<Operation>, DbError> {
+    let mut next_operation = 0;
+    let mut operations = Vec::with_capacity(prepared.len());
+    for entry in prepared {
+        let mutation = if entry.materialized.state().is_some() {
+            let adapter = adapters
+                .get(&entry.change.collection_id)
+                .ok_or(DbError::UnknownRecordSchema(entry.change.collection_id))?;
+            (adapter.canonicalize)(
+                &entry.materialized,
+                author,
+                sequence,
+                dependency_context,
+                &mut next_operation,
+            )?
+        } else {
+            entry.materialized.clone()
+        };
+        operations.push(Operation::new(
+            mutation.schema().collection_id(),
+            mutation.record_id().to_vec(),
+            0,
+            if mutation.state().is_some() {
+                OperationKind::FieldStateMerge
+            } else {
+                OperationKind::RecordDelete
+            },
+            mutation.encode_canonical()?,
+        )?);
+    }
+    Ok(operations)
 }
 
 fn prepare_upsert<Record: IrohRecord>(record: &Record) -> Result<PreparedRecord, DbError> {
@@ -1647,15 +1868,7 @@ fn prepare_upsert<Record: IrohRecord>(record: &Record) -> Result<PreparedRecord,
     }
     let materialized =
         MaterializedRecord::upsert(schema.clone(), record_id.clone(), state, indexes)?;
-    let operation = Operation::new(
-        schema.collection_id(),
-        record_id.clone(),
-        0,
-        OperationKind::FieldStateMerge,
-        materialized.encode_canonical()?,
-    )?;
     Ok(PreparedRecord {
-        operation,
         materialized,
         schema_id: schema.schema_id(),
         change: Change {
@@ -1670,15 +1883,7 @@ fn prepare_delete<Record: IrohRecord>(id: &Record::Id) -> Result<PreparedRecord,
     let schema = Record::schema()?;
     let record_id = id.encode_key()?;
     let materialized = MaterializedRecord::delete(schema.clone(), record_id.clone())?;
-    let operation = Operation::new(
-        schema.collection_id(),
-        record_id.clone(),
-        0,
-        OperationKind::RecordDelete,
-        materialized.encode_canonical()?,
-    )?;
     Ok(PreparedRecord {
-        operation,
         materialized,
         schema_id: schema.schema_id(),
         change: Change {
@@ -1696,8 +1901,10 @@ fn validate_incoming_operations(
     envelope: &CommitEnvelope,
     body: &CommitBody,
     adapters: &BTreeMap<CollectionId, RecordAdapter>,
+    dependency_context: &VersionVector,
 ) -> Result<BTreeMap<RecordTarget, RecordAdapter>, DbError> {
     let mut affected = BTreeMap::new();
+    let mut next_operation = 0;
     for operation in body.operations() {
         if !matches!(
             operation.kind(),
@@ -1724,6 +1931,20 @@ fn validate_incoming_operations(
             .ok_or(DbError::UnknownRecordSchema(operation.collection_id()))?;
         if adapter.schema_id != mutation.schema().schema_id() {
             return Err(DbError::InvalidRemoteCommit("schema ID mismatch".into()));
+        }
+        if mutation.state().is_some() {
+            let canonical = (adapter.canonicalize)(
+                &mutation,
+                envelope.header().author(),
+                envelope.header().author_sequence(),
+                dependency_context,
+                &mut next_operation,
+            )?;
+            if canonical != mutation {
+                return Err(DbError::InvalidRemoteCommit(
+                    "record contains causal metadata not issued by its commit".into(),
+                ));
+            }
         }
         let key = (operation.collection_id(), operation.record_id().to_vec());
         if affected.insert(key, adapter).is_some() {
@@ -1843,6 +2064,45 @@ fn merge_materialized<Record: IrohRecord>(
         let existing = Record::decode_record(existing)?;
         record.merge_record(&existing)?;
     }
+    let mut indexes = Vec::new();
+    for field in schema.fields().iter().filter(|field| field.is_indexed()) {
+        for value in record.field_values(field.id())? {
+            indexes.push(IndexValue::new(field.id(), value));
+        }
+    }
+    MaterializedRecord::upsert(
+        schema,
+        incoming.record_id().to_vec(),
+        record.encode_record()?,
+        indexes,
+    )
+    .map_err(DbError::from)
+}
+
+fn canonicalize_materialized<Record: IrohRecord>(
+    incoming: &MaterializedRecord,
+    author: AuthorId,
+    sequence: u64,
+    context: &VersionVector,
+    next_operation: &mut u32,
+) -> Result<MaterializedRecord, DbError> {
+    let schema = Record::schema()?;
+    if schema.schema_id() != incoming.schema().schema_id() {
+        return Err(DbError::InvalidRemoteCommit(
+            "registered schema mismatch".into(),
+        ));
+    }
+    let Some(state) = incoming.state() else {
+        return MaterializedRecord::delete(schema, incoming.record_id().to_vec())
+            .map_err(DbError::from);
+    };
+    let mut record = Record::decode_record(state)?;
+    if record.record_id()? != incoming.record_id() {
+        return Err(DbError::InvalidRemoteCommit(
+            "encoded record ID mismatch".into(),
+        ));
+    }
+    record.canonicalize_causality(author, sequence, context, next_operation)?;
     let mut indexes = Vec::new();
     for field in schema.fields().iter().filter(|field| field.is_indexed()) {
         for value in record.field_values(field.id())? {

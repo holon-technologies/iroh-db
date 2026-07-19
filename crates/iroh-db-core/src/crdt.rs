@@ -26,6 +26,12 @@ pub enum CrdtError {
     /// An arithmetic operation exceeded its durable integer range.
     #[error("counter overflow")]
     CounterOverflow,
+    /// A commit attempted to allocate more operation identities than fit on the wire.
+    #[error("commit operation index exhausted")]
+    OperationIndexExhausted,
+    /// An ordered list contains a parent cycle or unreachable element.
+    #[error("ordered-list parent graph contains a cycle")]
+    CyclicList,
 }
 
 /// Deterministically combines state from another replica.
@@ -63,6 +69,16 @@ impl<T> Lww<T> {
     pub fn get(&self) -> Option<&T> {
         self.assignment.as_ref().map(|entry| &entry.value)
     }
+
+    /// Returns the database-issued identity of the visible assignment.
+    pub fn dot(&self) -> Option<Dot> {
+        self.assignment.as_ref().map(|entry| entry.dot)
+    }
+
+    /// Returns the dependency-derived context of the visible assignment.
+    pub fn context(&self) -> Option<&VersionVector> {
+        self.assignment.as_ref().map(|entry| &entry.context)
+    }
 }
 
 impl<T: Clone + Eq> Lww<T> {
@@ -81,6 +97,25 @@ impl<T: Clone + Eq> Lww<T> {
     /// Deterministically combines another replica's state.
     pub fn merge(&mut self, other: &Self) -> Result<(), CrdtError> {
         Merge::merge(self, other)
+    }
+
+    /// Reissues causal metadata from an authenticated commit while preserving the value.
+    pub fn canonicalize_for_commit(
+        &self,
+        author: AuthorId,
+        sequence: u64,
+        context: &VersionVector,
+        next_operation: &mut u32,
+    ) -> Result<Self, CrdtError> {
+        let mut canonical = Self::new();
+        if let Some(value) = self.get() {
+            canonical.assign(
+                value.clone(),
+                allocate_dot(author, sequence, next_operation)?,
+                context.clone(),
+            )?;
+        }
+        Ok(canonical)
     }
 }
 
@@ -195,6 +230,24 @@ impl<T: Clone + Ord> OrSet<T> {
     pub fn merge(&mut self, other: &Self) -> Result<(), CrdtError> {
         Merge::merge(self, other)
     }
+
+    /// Reissues live additions under commit-owned dots and drops superseded tombstones.
+    pub fn canonicalize_for_commit(
+        &self,
+        author: AuthorId,
+        sequence: u64,
+        _context: &VersionVector,
+        next_operation: &mut u32,
+    ) -> Result<Self, CrdtError> {
+        let mut canonical = Self::new();
+        for value in self.values() {
+            canonical.insert(
+                value.clone(),
+                allocate_dot(author, sequence, next_operation)?,
+            )?;
+        }
+        Ok(canonical)
+    }
 }
 
 impl<T: Ord> Default for OrSet<T> {
@@ -238,6 +291,19 @@ impl<T: Ord> GrowOnlySet<T> {
     /// Iterates over values in canonical order.
     pub fn values(&self) -> impl Iterator<Item = &T> {
         self.values.iter()
+    }
+}
+
+impl<T: Clone + Ord> GrowOnlySet<T> {
+    /// Copies value-only state; this CRDT carries no caller-controlled causal metadata.
+    pub fn canonicalize_for_commit(
+        &self,
+        _author: AuthorId,
+        _sequence: u64,
+        _context: &VersionVector,
+        _next_operation: &mut u32,
+    ) -> Result<Self, CrdtError> {
+        Ok(self.clone())
     }
 }
 
@@ -310,6 +376,31 @@ impl PnCounter {
     /// Deterministically combines another replica's state.
     pub fn merge(&mut self, other: &Self) -> Result<(), CrdtError> {
         Merge::merge(self, other)
+    }
+
+    /// Attributes the visible signed value solely to the authenticated commit author.
+    pub fn canonicalize_for_commit(
+        &self,
+        author: AuthorId,
+        _sequence: u64,
+        _context: &VersionVector,
+        _next_operation: &mut u32,
+    ) -> Result<Self, CrdtError> {
+        let value = self.value()?;
+        let mut canonical = Self::new();
+        if value >= 0 {
+            canonical.increment(
+                author,
+                u64::try_from(value).map_err(|_| CrdtError::CounterOverflow)?,
+            )?;
+        } else {
+            let magnitude = value.checked_abs().ok_or(CrdtError::CounterOverflow)?;
+            canonical.decrement(
+                author,
+                u64::try_from(magnitude).map_err(|_| CrdtError::CounterOverflow)?,
+            )?;
+        }
+        Ok(canonical)
     }
 }
 
@@ -415,6 +506,25 @@ impl<T: Clone + Eq> MultiValue<T> {
     pub fn merge(&mut self, other: &Self) -> Result<(), CrdtError> {
         Merge::merge(self, other)
     }
+
+    /// Reissues every visible alternative under commit-owned dots.
+    pub fn canonicalize_for_commit(
+        &self,
+        author: AuthorId,
+        sequence: u64,
+        context: &VersionVector,
+        next_operation: &mut u32,
+    ) -> Result<Self, CrdtError> {
+        let mut canonical = Self::new();
+        for value in self.values() {
+            canonical.assign(
+                value.clone(),
+                allocate_dot(author, sequence, next_operation)?,
+                context.clone(),
+            )?;
+        }
+        Ok(canonical)
+    }
 }
 
 impl<T> Default for MultiValue<T> {
@@ -491,6 +601,25 @@ impl<T: Clone + Eq> Immutable<T> {
     pub fn merge(&mut self, other: &Self) -> Result<(), CrdtError> {
         Merge::merge(self, other)
     }
+
+    /// Reissues every concurrent initial value under commit-owned dots.
+    pub fn canonicalize_for_commit(
+        &self,
+        author: AuthorId,
+        sequence: u64,
+        context: &VersionVector,
+        next_operation: &mut u32,
+    ) -> Result<Self, CrdtError> {
+        let mut canonical = Self::new();
+        for value in self.values() {
+            canonical.set(
+                value.clone(),
+                allocate_dot(author, sequence, next_operation)?,
+                context.clone(),
+            )?;
+        }
+        Ok(canonical)
+    }
 }
 
 impl<T> Default for Immutable<T> {
@@ -544,21 +673,25 @@ impl<T> OrderedList<T> {
     /// Iterates over visible values in replicated list order.
     pub fn values(&self) -> impl Iterator<Item = &T> {
         let mut values = Vec::with_capacity(self.elements.len());
-        self.collect_children(None, &mut values);
-        values.into_iter()
-    }
-
-    fn collect_children<'a>(&'a self, parent: Option<Dot>, output: &mut Vec<&'a T>) {
-        for (&dot, element) in self
+        let mut pending: Vec<_> = self
             .elements
             .iter()
-            .filter(|(_, element)| element.parent == parent)
-        {
+            .rev()
+            .filter_map(|(&dot, element)| element.parent.is_none().then_some(dot))
+            .collect();
+        while let Some(dot) = pending.pop() {
+            let element = &self.elements[&dot];
             if !element.removed {
-                output.push(&element.value);
+                values.push(&element.value);
             }
-            self.collect_children(Some(dot), output);
+            pending.extend(
+                self.elements
+                    .iter()
+                    .rev()
+                    .filter_map(|(&child, element)| (element.parent == Some(dot)).then_some(child)),
+            );
         }
+        values.into_iter()
     }
 }
 
@@ -607,6 +740,43 @@ impl<T: Clone + Eq> OrderedList<T> {
     pub fn merge(&mut self, other: &Self) -> Result<(), CrdtError> {
         Merge::merge(self, other)
     }
+
+    /// Rebuilds the visible sequence with commit-owned element identities.
+    pub fn canonicalize_for_commit(
+        &self,
+        author: AuthorId,
+        sequence: u64,
+        _context: &VersionVector,
+        next_operation: &mut u32,
+    ) -> Result<Self, CrdtError> {
+        self.validate_structure()?;
+        let mut canonical = Self::new();
+        let mut parent = None;
+        for value in self.values() {
+            let dot = allocate_dot(author, sequence, next_operation)?;
+            canonical.insert_after(parent, dot, value.clone())?;
+            parent = Some(dot);
+        }
+        Ok(canonical)
+    }
+
+    fn validate_structure(&self) -> Result<(), CrdtError> {
+        for &start in self.elements.keys() {
+            let mut path = BTreeSet::new();
+            let mut current = Some(start);
+            while let Some(dot) = current {
+                if !path.insert(dot) {
+                    return Err(CrdtError::CyclicList);
+                }
+                let element = self
+                    .elements
+                    .get(&dot)
+                    .ok_or(CrdtError::MissingPredecessor)?;
+                current = element.parent;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<T> Default for OrderedList<T> {
@@ -634,6 +804,19 @@ impl<T: Clone + Eq> Merge for OrderedList<T> {
         }) {
             return Err(CrdtError::MissingPredecessor);
         }
+        self.validate_structure()?;
         Ok(())
     }
+}
+
+fn allocate_dot(
+    author: AuthorId,
+    sequence: u64,
+    next_operation: &mut u32,
+) -> Result<Dot, CrdtError> {
+    let operation = *next_operation;
+    *next_operation = next_operation
+        .checked_add(1)
+        .ok_or(CrdtError::OperationIndexExhausted)?;
+    Ok(Dot::new(author, sequence, operation))
 }

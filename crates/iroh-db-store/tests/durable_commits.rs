@@ -70,6 +70,17 @@ fn commit(
     sequence: u64,
     dependencies: Vec<CommitId>,
 ) -> CommitEnvelope {
+    commit_variant(signer, key, domain, sequence, dependencies, 1)
+}
+
+fn commit_variant(
+    signer: &IrohSigner,
+    key: &DomainKey,
+    domain: DomainId,
+    sequence: u64,
+    dependencies: Vec<CommitId>,
+    variant: u8,
+) -> CommitEnvelope {
     let sequence_byte = u8::try_from(sequence).unwrap();
     let header = CommitHeader::new(
         domain,
@@ -79,10 +90,14 @@ fn commit(
         dependencies,
         CapabilityId::from_bytes(id(4)),
         vec![SchemaId::from_bytes(id(5))],
-        [sequence_byte + 1; 24],
+        [sequence_byte + variant; 24],
     )
     .unwrap();
-    let body = CommitBody::new(TransactionId::from_bytes([sequence_byte; 32]), Vec::new()).unwrap();
+    let body = CommitBody::new(
+        TransactionId::from_bytes([sequence_byte + variant; 32]),
+        Vec::new(),
+    )
+    .unwrap();
     seal_commit(header, &body, key, signer).unwrap()
 }
 
@@ -180,6 +195,91 @@ async fn blob_failure_or_sequence_gap_never_mutates_metadata() {
     );
     assert!(!store.contains_commit(gap.commit_id()).unwrap());
     assert_eq!(store.last_sequence(domain, signer.author()).unwrap(), None);
+}
+
+#[tokio::test]
+async fn next_author_sequence_must_extend_its_previous_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let blobs = Arc::new(MemoryBlobs::default());
+    let first_author = IrohSigner::from_secret_bytes(id(7));
+    let other_author = IrohSigner::from_secret_bytes(id(9));
+    let key = DomainKey::from_bytes(id(8));
+    let domain = DomainId::from_bytes(id(1));
+    let store = Store::open(directory.path(), blobs).unwrap();
+
+    let first = commit(&first_author, &key, domain, 0, Vec::new());
+    let unrelated = commit(&other_author, &key, domain, 0, Vec::new());
+    store.persist_commit(&first).await.unwrap();
+    store.persist_commit(&unrelated).await.unwrap();
+
+    let detached = commit(&first_author, &key, domain, 1, vec![unrelated.commit_id()]);
+    assert_eq!(
+        store.persist_commit(&detached).await,
+        Err(StoreError::AuthorChainMissing {
+            previous: first.commit_id(),
+        })
+    );
+    assert!(!store.contains_commit(detached.commit_id()).unwrap());
+    assert_eq!(
+        store.last_sequence(domain, first_author.author()).unwrap(),
+        Some(0)
+    );
+
+    let bridge = commit(
+        &other_author,
+        &key,
+        domain,
+        1,
+        vec![first.commit_id(), unrelated.commit_id()],
+    );
+    store.persist_commit(&bridge).await.unwrap();
+    let linked = commit(&first_author, &key, domain, 1, vec![bridge.commit_id()]);
+    assert_eq!(
+        store.persist_commit(&linked).await.unwrap(),
+        ApplyOutcome::Applied(linked.commit_id())
+    );
+}
+
+#[tokio::test]
+async fn distinct_commits_at_one_author_sequence_are_equivocation_evidence() {
+    let first_directory = tempfile::tempdir().unwrap();
+    let second_directory = tempfile::tempdir().unwrap();
+    let first_blobs = Arc::new(MemoryBlobs::default());
+    let second_blobs = Arc::new(MemoryBlobs::default());
+    let signer = IrohSigner::from_secret_bytes(id(7));
+    let key = DomainKey::from_bytes(id(8));
+    let domain = DomainId::from_bytes(id(1));
+    let left = commit_variant(&signer, &key, domain, 0, Vec::new(), 1);
+    let right = commit_variant(&signer, &key, domain, 0, Vec::new(), 2);
+    let (first_id, second_id) = if left.commit_id() < right.commit_id() {
+        (left.commit_id(), right.commit_id())
+    } else {
+        (right.commit_id(), left.commit_id())
+    };
+
+    let first_store = Store::open(first_directory.path(), first_blobs).unwrap();
+    first_store.persist_commit(&left).await.unwrap();
+    assert_eq!(
+        first_store.persist_commit(&right).await,
+        Err(StoreError::AuthorEquivocation {
+            author: signer.author(),
+            sequence: 0,
+            first: first_id,
+            second: second_id,
+        })
+    );
+
+    let second_store = Store::open(second_directory.path(), second_blobs).unwrap();
+    second_store.persist_commit(&right).await.unwrap();
+    assert_eq!(
+        second_store.persist_commit(&left).await,
+        Err(StoreError::AuthorEquivocation {
+            author: signer.author(),
+            sequence: 0,
+            first: first_id,
+            second: second_id,
+        })
+    );
 }
 
 #[tokio::test]

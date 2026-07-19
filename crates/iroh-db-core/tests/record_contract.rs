@@ -81,3 +81,32 @@ fn a_hand_written_record_has_a_stable_schema_key_and_canonical_codec() {
         Err(RecordError::TrailingData)
     );
 }
+
+#[test]
+fn field_causality_is_reissued_by_the_commit_allocator() {
+    let forged_author = AuthorId::from_bytes([7; 32]);
+    let commit_author = AuthorId::from_bytes([8; 32]);
+    let dependency_author = AuthorId::from_bytes([9; 32]);
+    let mut supplied = Lww::new();
+    let mut forged_context = VersionVector::new();
+    forged_context.observe(Dot::new(forged_author, u64::MAX, 0));
+    supplied
+        .assign(
+            "Teardrop".to_owned(),
+            Dot::new(forged_author, u64::MAX, u32::MAX),
+            forged_context,
+        )
+        .unwrap();
+    let mut dependency_context = VersionVector::new();
+    dependency_context.observe(Dot::new(dependency_author, 4, 0));
+    let mut next_operation = 11;
+
+    let canonical = supplied
+        .canonicalize_for_commit(commit_author, 3, &dependency_context, &mut next_operation)
+        .unwrap();
+
+    assert_eq!(canonical.get(), Some(&"Teardrop".to_owned()));
+    assert_eq!(canonical.dot(), Some(Dot::new(commit_author, 3, 11)));
+    assert_eq!(canonical.context(), Some(&dependency_context));
+    assert_eq!(next_operation, 12);
+}

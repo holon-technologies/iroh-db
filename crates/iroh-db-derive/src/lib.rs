@@ -222,6 +222,20 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         }
     });
 
+    let causal_normalizers = infos.iter().filter(|field| !field.is_id).map(|field| {
+        let ident = &field.ident;
+        let ty = &field.ty;
+        quote! {
+            self.#ident = <#ty as #core::FieldState>::canonicalize_for_commit(
+                &self.#ident,
+                author,
+                sequence,
+                context,
+                next_operation,
+            )?;
+        }
+    });
+
     Ok(quote! {
         impl #core::IrohRecord for #name {
             type Id = #id_ty;
@@ -262,6 +276,17 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                     return Err(#core::RecordError::MergeUnavailable);
                 }
                 #(#mergers)*
+                Ok(())
+            }
+
+            fn canonicalize_causality(
+                &mut self,
+                author: #core::AuthorId,
+                sequence: u64,
+                context: &#core::VersionVector,
+                next_operation: &mut u32,
+            ) -> ::core::result::Result<(), #core::RecordError> {
+                #(#causal_normalizers)*
                 Ok(())
             }
         }

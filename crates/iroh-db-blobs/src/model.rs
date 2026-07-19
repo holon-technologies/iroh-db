@@ -74,6 +74,16 @@ impl FieldState for BlobRef {
             Err(iroh_db_core::CrdtError::ImmutableAlreadySet.into())
         }
     }
+
+    fn canonicalize_for_commit(
+        &self,
+        _author: iroh_db_core::AuthorId,
+        _sequence: u64,
+        _context: &iroh_db_core::VersionVector,
+        _next_operation: &mut u32,
+    ) -> Result<Self, RecordError> {
+        Ok(*self)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]

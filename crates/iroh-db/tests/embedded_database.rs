@@ -62,10 +62,10 @@ async fn typed_put_get_query_subscription_transaction_and_reopen() {
     };
     assert_eq!(batch.changes().len(), 1);
     assert_eq!(batch.changes()[0].kind(), ChangeKind::Upserted);
-    assert_eq!(
-        tracks.get(&TrackId("one".into())).await.unwrap(),
-        Some(teardrop.clone())
-    );
+    let stored_teardrop = tracks.get(&TrackId("one".into())).await.unwrap().unwrap();
+    assert_eq!(stored_teardrop.id, teardrop.id);
+    assert_eq!(stored_teardrop.title.get(), teardrop.title.get());
+    assert_eq!(stored_teardrop.artist.get(), teardrop.artist.get());
 
     let results = tracks
         .query()
@@ -73,7 +73,7 @@ async fn typed_put_get_query_subscription_transaction_and_reopen() {
         .fetch()
         .await
         .unwrap();
-    assert_eq!(results, vec![teardrop]);
+    assert_eq!(results, vec![stored_teardrop]);
 
     let mut transaction = db.transaction();
     transaction
@@ -122,6 +122,52 @@ async fn typed_put_get_query_subscription_transaction_and_reopen() {
     assert_eq!(bytes, b"seekable encrypted audio");
     drop(reopened_stream);
     reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_transaction_rejects_multiple_mutations_of_one_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = IrohDb::open(directory.path()).await.unwrap();
+    let tracks = db.collection::<Track>();
+    let root_before = db.state_root().unwrap();
+
+    let mut transaction = db.transaction();
+    transaction.put(track("same", "First", "One")).unwrap();
+    transaction.put(track("same", "Second", "Two")).unwrap();
+
+    assert!(matches!(
+        transaction.commit().await,
+        Err(DbError::InvalidRemoteCommit(message))
+            if message == "a commit mutates one record more than once"
+    ));
+    assert_eq!(db.state_root().unwrap(), root_before);
+    assert!(tracks.get(&TrackId("same".into())).await.unwrap().is_none());
+    assert!(db.commit_envelopes().await.unwrap().is_empty());
+
+    drop(tracks);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn local_put_reissues_causal_metadata_from_the_signed_commit() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = IrohDb::open(directory.path()).await.unwrap();
+    let tracks = db.collection::<Track>();
+    let supplied = track("owned", "Canonical", "Database");
+    assert_ne!(supplied.title.dot().unwrap().author(), db.author_id());
+
+    tracks.put(supplied).await.unwrap();
+    let stored = tracks.get(&TrackId("owned".into())).await.unwrap().unwrap();
+
+    assert_eq!(stored.title.get().map(String::as_str), Some("Canonical"));
+    assert_eq!(stored.title.dot().unwrap().author(), db.author_id());
+    assert_eq!(stored.title.dot().unwrap().sequence(), 0);
+    assert_eq!(stored.artist.dot().unwrap().author(), db.author_id());
+    assert_eq!(stored.artist.dot().unwrap().sequence(), 0);
+    assert_ne!(stored.title.dot(), stored.artist.dot());
+
+    drop(tracks);
+    db.close().await.unwrap();
 }
 
 #[tokio::test]
