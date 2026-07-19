@@ -9,6 +9,7 @@ use crate::{
 };
 
 const AUTHORITY_VERSION: u16 = 1;
+const CONTROL_VERSION: u16 = 2;
 const MAX_DELEGATION_DEPTH: u8 = 8;
 const MAX_CONTROL_COMMITS: usize = 65_536;
 const MAX_CONTROL_REVOKED: usize = 1_024;
@@ -473,6 +474,7 @@ pub struct ControlTransition {
     cut: Vec<CommitId>,
     revoked_subjects: Vec<AuthorId>,
     writer: AuthorId,
+    controller: AuthorId,
     key_distribution_digest: [u8; 32],
     author: AuthorId,
     author_capability: CapabilityId,
@@ -490,6 +492,7 @@ impl ControlTransition {
         cut: Vec<CommitId>,
         mut revoked_subjects: Vec<AuthorId>,
         writer: AuthorId,
+        controller: AuthorId,
         key_distribution_digest: [u8; 32],
         author_capability: CapabilityId,
         nonce: [u8; 32],
@@ -508,6 +511,7 @@ impl ControlTransition {
             cut,
             revoked_subjects,
             writer,
+            controller,
             key_distribution_digest,
             author: signer.author(),
             author_capability,
@@ -542,6 +546,10 @@ impl ControlTransition {
     }
     pub const fn writer(&self) -> AuthorId {
         self.writer
+    }
+    /// Returns the endpoint designated to author the next control transition.
+    pub const fn controller(&self) -> AuthorId {
+        self.controller
     }
     pub const fn key_distribution_digest(&self) -> [u8; 32] {
         self.key_distribution_digest
@@ -584,7 +592,7 @@ impl ControlTransition {
         }
         let wire: ControlWire = decode_exact(bytes)?;
         let content: ControlContent = decode_exact(&wire.content)?;
-        if content.version != AUTHORITY_VERSION {
+        if content.version != CONTROL_VERSION {
             return Err(AuthorityError::UnsupportedVersion(content.version));
         }
         let control = Self {
@@ -596,6 +604,7 @@ impl ControlTransition {
             cut: content.cut,
             revoked_subjects: content.revoked_subjects,
             writer: content.writer,
+            controller: content.controller,
             key_distribution_digest: content.key_distribution_digest,
             author: content.author,
             author_capability: content.author_capability,
@@ -625,7 +634,7 @@ impl ControlTransition {
 
     fn signing_bytes(&self) -> Result<Vec<u8>, AuthorityError> {
         minicbor::to_vec(ControlContent {
-            version: AUTHORITY_VERSION,
+            version: CONTROL_VERSION,
             domain_id: self.domain_id,
             sequence: self.sequence,
             predecessor: self.predecessor,
@@ -634,6 +643,7 @@ impl ControlTransition {
             cut: self.cut.clone(),
             revoked_subjects: self.revoked_subjects.clone(),
             writer: self.writer,
+            controller: self.controller,
             key_distribution_digest: self.key_distribution_digest,
             author: self.author,
             author_capability: self.author_capability,
@@ -762,6 +772,8 @@ struct ControlContent {
     author_capability: CapabilityId,
     #[n(12)]
     nonce: [u8; 32],
+    #[n(13)]
+    controller: AuthorId,
 }
 
 #[derive(minicbor::Encode, minicbor::Decode)]

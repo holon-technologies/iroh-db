@@ -22,7 +22,7 @@ use iroh_db_store::{
     MaterializedRecord, Store, StoreError,
 };
 use tokio::io::AsyncRead;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, RwLock as AsyncRwLock, broadcast};
 
 const CHANGE_CAPACITY: usize = 1_024;
 const MAX_RECONCILE_COMMITS: usize = 65_536;
@@ -183,6 +183,7 @@ pub(crate) struct DbInner {
     pub(crate) blobs: Arc<IrohBlobStore>,
     pub(crate) credentials: LocalCredentials,
     pub(crate) writer: Mutex<()>,
+    pub(crate) control_gate: AsyncRwLock<()>,
     changes: RwLock<BTreeMap<iroh_db_core::DomainId, broadcast::Sender<ChangeBatch>>>,
     adapters: RwLock<BTreeMap<CollectionId, RecordAdapter>>,
 }
@@ -309,6 +310,7 @@ impl IrohDb {
                 .map_err(StoreError::from)?,
         );
         let store = Store::open(root, blobs.clone())?;
+        reconcile_domain_epochs(&credentials, &store)?;
         store.trust_author(credentials.domain_id(), credentials.signer().author())?;
         let domain = credentials.domain_seed();
         credentials.store_domain(&domain)?;
@@ -321,6 +323,7 @@ impl IrohDb {
                 blobs,
                 credentials,
                 writer: Mutex::new(()),
+                control_gate: AsyncRwLock::new(()),
                 changes: RwLock::new(domain_changes),
                 adapters: RwLock::new(BTreeMap::new()),
             }),
@@ -435,6 +438,21 @@ impl IrohDb {
         &self,
         revoked_subjects: &[AuthorId],
     ) -> Result<(Self, ControlTransition), DbError> {
+        let controller = self.inner.store.current_controller(self.domain_id())?;
+        self.rotate_epoch_with_controller(revoked_subjects, controller)
+    }
+
+    /// Advances the epoch and designates the endpoint that must sign the following transition.
+    pub fn rotate_epoch_with_controller(
+        &self,
+        revoked_subjects: &[AuthorId],
+        next_controller: AuthorId,
+    ) -> Result<(Self, ControlTransition), DbError> {
+        let _control_writer = self
+            .inner
+            .control_gate
+            .try_write()
+            .map_err(|_| DbError::Operation("control plane is busy".into()))?;
         let active_epoch = self.inner.store.current_epoch(self.domain_id())?;
         if self.epoch() != active_epoch {
             return Err(DbError::StaleEpoch {
@@ -447,6 +465,9 @@ impl IrohDb {
             .store
             .active_capability(self.domain_id(), self.author_id())?
             .ok_or(DbError::UnauthorizedDevice)?;
+        if self.inner.store.current_controller(self.domain_id())? != self.author_id() {
+            return Err(DbError::UnauthorizedDevice);
+        }
         let head = self.inner.store.control_head(self.domain_id())?;
         let sequence = head.as_ref().map_or(Ok(1), |value| {
             value
@@ -471,16 +492,18 @@ impl IrohDb {
             self.inner.store.frontier(self.domain_id())?,
             revoked_subjects.to_vec(),
             writer,
+            next_controller,
             next_seed.distribution_digest(),
             author_capability,
             nonce,
             &self.inner.credentials.signer(),
         )?;
-        self.inner.credentials.replace_domain(&next_seed)?;
+        self.inner.store.observe_control(&control)?;
+        self.inner.credentials.stage_domain(&next_seed)?;
         if let Err(error) = self.inner.store.apply_control(&control) {
-            let _ = self.inner.credentials.activate_domain(&self.domain);
             return Err(DbError::Store(error));
         }
+        self.inner.credentials.activate_domain(&next_seed)?;
         Ok((self.domain(self.domain_id())?, control))
     }
 
@@ -490,6 +513,11 @@ impl IrohDb {
         control: &ControlTransition,
         next_seed: &DomainSeed,
     ) -> Result<Self, DbError> {
+        let _control_writer = self
+            .inner
+            .control_gate
+            .try_write()
+            .map_err(|_| DbError::Operation("control plane is busy".into()))?;
         if control.domain_id() != self.domain_id()
             || next_seed.domain_id() != self.domain_id()
             || next_seed.epoch() != control.new_epoch()
@@ -498,11 +526,12 @@ impl IrohDb {
         {
             return Err(DbError::UnauthorizedDevice);
         }
-        self.inner.credentials.replace_domain(next_seed)?;
+        self.inner.store.observe_control(control)?;
+        self.inner.credentials.stage_domain(next_seed)?;
         if let Err(error) = self.inner.store.apply_control(control) {
-            let _ = self.inner.credentials.activate_domain(&self.domain);
             return Err(DbError::Store(error));
         }
+        self.inner.credentials.activate_domain(next_seed)?;
         self.domain(self.domain_id())
     }
 
@@ -516,6 +545,13 @@ impl IrohDb {
         valid_from_epoch: u64,
         valid_through_epoch: Option<u64>,
     ) -> Result<CapabilityCertificate, DbError> {
+        let active_epoch = self.inner.store.current_epoch(self.domain_id())?;
+        if self.epoch() != active_epoch {
+            return Err(DbError::StaleEpoch {
+                handle: self.epoch(),
+                active: active_epoch,
+            });
+        }
         let issuer_id = self
             .inner
             .store
@@ -526,7 +562,7 @@ impl IrohDb {
             self.author_id(),
             issuer_id,
             Permission::Invite,
-            self.epoch(),
+            active_epoch,
         )? {
             return Err(DbError::UnauthorizedDevice);
         }
@@ -646,6 +682,16 @@ impl IrohDb {
     pub fn import_invitation(&self, invitation: &Invitation) -> Result<Self, DbError> {
         if invitation.subject() != self.author_id() {
             return Err(DbError::UnauthorizedDevice);
+        }
+        if self
+            .inner
+            .store
+            .domain_descriptor(invitation.descriptor().domain_id())?
+            .is_some()
+        {
+            self.inner
+                .store
+                .current_epoch(invitation.descriptor().domain_id())?;
         }
         let chain = invitation.capability_chain();
         let root = chain.first().ok_or(DbError::UnauthorizedDevice)?;
@@ -2259,6 +2305,44 @@ fn canonicalize_materialized<Record: IrohRecord>(
     .map_err(DbError::from)
 }
 
+fn reconcile_domain_epochs(credentials: &LocalCredentials, store: &Store) -> Result<(), DbError> {
+    for domain_id in credentials.domains()? {
+        if store.domain_descriptor(domain_id)?.is_none() {
+            continue;
+        }
+        let active_epoch = match store.current_epoch(domain_id) {
+            Ok(epoch) => epoch,
+            Err(StoreError::ControlFork { .. }) => continue,
+            Err(error) => return Err(DbError::Store(error)),
+        };
+        let current = credentials.load_domain(domain_id)?;
+        if current.epoch() == active_epoch {
+            continue;
+        }
+        let distance = current.epoch().abs_diff(active_epoch);
+        if distance != 1 {
+            return Err(DbError::Operation(format!(
+                "domain {domain_id} key epoch differs from control by {distance}"
+            )));
+        }
+        let authoritative = credentials.load_domain_epoch(domain_id, active_epoch)?;
+        if active_epoch > 0 {
+            let head = store.control_head(domain_id)?.ok_or_else(|| {
+                DbError::Operation("active epoch has no control transition".into())
+            })?;
+            if head.new_epoch() != active_epoch
+                || head.key_distribution_digest() != authoritative.distribution_digest()
+            {
+                return Err(DbError::Operation(
+                    "staged epoch key does not match the active control transition".into(),
+                ));
+            }
+        }
+        credentials.activate_domain(&authoritative)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn private_capability(domain_id: iroh_db_core::DomainId) -> CapabilityId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"iroh-db/private-capability/v1");
@@ -2269,4 +2353,59 @@ pub(crate) fn private_capability(domain_id: iroh_db_core::DomainId) -> Capabilit
 #[allow(clippy::needless_pass_by_value)]
 fn blob_metadata_error(error: impl std::fmt::Display) -> BlobStoreError {
     BlobStoreError::new(error.to_string())
+}
+
+#[cfg(test)]
+mod control_recovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn open_activates_the_staged_key_selected_by_durable_control() {
+        let directory = tempfile::tempdir().unwrap();
+        let device = IrohDb::open(directory.path()).await.unwrap();
+        let domain = device.create_domain(ConsistencyMode::MultiWriter).unwrap();
+        let domain_id = domain.domain_id();
+        let old_seed = domain.domain_seed();
+        let (next, _) = domain.rotate_epoch(&[]).unwrap();
+        assert_eq!(next.domain_seed().epoch(), 1);
+
+        device.inner.credentials.activate_domain(&old_seed).unwrap();
+        assert_eq!(
+            device
+                .inner
+                .credentials
+                .load_domain(domain_id)
+                .unwrap()
+                .epoch(),
+            0
+        );
+        drop(domain);
+        drop(next);
+        device.close().await.unwrap();
+
+        let reopened = IrohDb::open(directory.path()).await.unwrap();
+        let recovered = reopened.domain(domain_id).unwrap();
+        assert_eq!(recovered.domain_seed().epoch(), 1);
+        drop(recovered);
+        reopened.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn control_mutation_fails_while_a_disclosure_read_permit_is_held() {
+        let directory = tempfile::tempdir().unwrap();
+        let device = IrohDb::open(directory.path()).await.unwrap();
+        let domain = device.create_domain(ConsistencyMode::MultiWriter).unwrap();
+        let disclosure = device.inner.control_gate.read().await;
+        assert!(matches!(
+            domain.rotate_epoch(&[]),
+            Err(DbError::Operation(message)) if message == "control plane is busy"
+        ));
+        assert!(domain.domain_descriptor().unwrap().is_some());
+        drop(disclosure);
+        let (rotated, _) = domain.rotate_epoch(&[]).unwrap();
+        assert_eq!(rotated.domain_seed().epoch(), 1);
+        drop(domain);
+        drop(rotated);
+        device.close().await.unwrap();
+    }
 }

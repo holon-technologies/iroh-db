@@ -8,6 +8,15 @@ fn permissions(values: &[Permission]) -> PermissionSet {
     PermissionSet::from_permissions(values)
 }
 
+#[derive(minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+struct TestControlWire {
+    #[n(0)]
+    content: Vec<u8>,
+    #[n(1)]
+    signature: [u8; 64],
+}
+
 #[test]
 fn descriptor_and_root_capability_are_signed_canonical_authority() {
     let owner = IrohSigner::from_secret_bytes([7; 32]);
@@ -125,6 +134,7 @@ fn control_transition_is_canonical_signed_bounded_and_tamper_evident() {
         vec![CommitId::from_bytes([1; 32]), CommitId::from_bytes([2; 32])],
         vec![AuthorId::from_bytes([3; 32])],
         owner.author(),
+        owner.author(),
         [24; 32],
         root.id().unwrap(),
         [25; 32],
@@ -133,10 +143,43 @@ fn control_transition_is_canonical_signed_bounded_and_tamper_evident() {
     .unwrap();
     let encoded = transition.encode_canonical().unwrap();
     assert_eq!(
+        transition.id().unwrap(),
+        [
+            150, 62, 99, 116, 144, 238, 95, 227, 50, 59, 212, 92, 188, 47, 245, 194, 165, 122, 35,
+            81, 192, 133, 241, 224, 183, 188, 218, 20, 86, 70, 128, 53,
+        ]
+    );
+    assert_eq!(
         ControlTransition::decode_canonical(&encoded).unwrap(),
         transition
     );
     transition.verify().unwrap();
+    assert_eq!(transition.controller(), owner.author());
+    let controller_variant = ControlTransition::issue(
+        domain,
+        1,
+        None,
+        0,
+        vec![CommitId::from_bytes([1; 32]), CommitId::from_bytes([2; 32])],
+        vec![AuthorId::from_bytes([3; 32])],
+        owner.author(),
+        AuthorId::from_bytes([26; 32]),
+        [24; 32],
+        root.id().unwrap(),
+        [25; 32],
+        &owner,
+    )
+    .unwrap();
+    let mut original_wire: TestControlWire = minicbor::decode(&encoded).unwrap();
+    let variant_wire: TestControlWire =
+        minicbor::decode(&controller_variant.encode_canonical().unwrap()).unwrap();
+    original_wire.content = variant_wire.content;
+    let controller_tampered = minicbor::to_vec(original_wire).unwrap();
+    assert!(ControlTransition::decode_canonical(&controller_tampered).is_err());
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    assert!(ControlTransition::decode_canonical(&trailing).is_err());
+    assert!(ControlTransition::decode_canonical(&encoded[..encoded.len() - 1]).is_err());
     let mut tampered = encoded;
     *tampered.last_mut().unwrap() ^= 1;
     assert!(ControlTransition::decode_canonical(&tampered).is_err());

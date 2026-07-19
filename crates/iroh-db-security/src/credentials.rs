@@ -214,6 +214,29 @@ impl LocalCredentials {
         write_owner_only_replace(&directory.join(format!("{}.v1", seed.domain_id)), &bytes)
     }
 
+    /// Durably archives the next epoch key without changing the active catalog entry.
+    #[doc(hidden)]
+    pub fn stage_domain(&self, seed: &DomainSeed) -> Result<(), SecurityError> {
+        let current = self.load_domain(seed.domain_id)?;
+        if seed.epoch == current.epoch
+            && seed.domain_key.as_bytes() == current.domain_key.as_bytes()
+        {
+            return Ok(());
+        }
+        if seed.epoch
+            != current
+                .epoch
+                .checked_add(1)
+                .ok_or(SecurityError::InvalidKeyProviderData)?
+        {
+            return Err(SecurityError::InvalidKeyProviderData);
+        }
+        let directory = self.root.join("domains");
+        std::fs::create_dir_all(&directory).map_err(io_error)?;
+        let master = load_or_create_master(&self.root.join(MASTER_FILE))?;
+        store_epoch_archive(&directory, seed, &master)
+    }
+
     /// Selects a retained epoch as active, including rotation rollback after metadata failure.
     #[doc(hidden)]
     pub fn activate_domain(&self, seed: &DomainSeed) -> Result<(), SecurityError> {
@@ -494,7 +517,7 @@ fn store_epoch_archive(
         }
         return Err(SecurityError::InvalidKeyProviderData);
     }
-    write_owner_only(&path, &encode_domain_seed(seed, master)?)
+    write_owner_only_replace(&path, &encode_domain_seed(seed, master)?)
 }
 
 fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), SecurityError> {

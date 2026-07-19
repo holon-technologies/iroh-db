@@ -197,7 +197,7 @@ Canonical state equality is tested by applying every permutation of generated va
 
 ## 10. Domain Consistency and Control Plane
 
-Each domain has an immutable genesis descriptor and a linear control chain. Data commits form a DAG; membership, key epochs, consistency-mode changes, snapshot-authority changes, and writer transfer are single-successor control commits authorized by an admin. Competing control successors resolve by the greatest valid control dot, and the losing branch has no authority. This deliberately gives the security control plane deterministic serialization without globally ordering application data.
+Each domain has an immutable genesis descriptor and a linear control chain. Data commits form a DAG; membership, key epochs, consistency-mode changes, snapshot-authority changes, and writer transfer are single-successor control commits signed by the designated controller under an active admin/revoke capability. The genesis owner is the first controller and a transition may designate its successor. Competing successors are controller equivocation: replicas retain both immutable objects and freeze the domain fail-closed rather than selecting by arrival order or reorganizing keys and accepted encrypted writes. This gives the security control plane deterministic serialization without globally ordering application data.
 
 - **MultiWriter**: any active capability with `WRITE` may author data commits.
 - **SingleWriter**: only the endpoint named by the active control state may author data commits. Transfer is a control commit.

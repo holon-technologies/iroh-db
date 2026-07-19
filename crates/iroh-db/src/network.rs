@@ -73,8 +73,19 @@ impl SyncNode {
 
     /// Makes one signed invitation available to its endpoint-bound subject.
     pub fn offer_invitation(&self, invitation: &Invitation) -> Result<(), DbError> {
+        let _control_reader = self
+            .core
+            .db
+            .inner
+            .control_gate
+            .try_read()
+            .map_err(|_| DbError::Operation("control plane is busy".into()))?;
+        self.core.require_local_permission(Permission::Invite)?;
         if invitation.descriptor().domain_id() != self.core.domain_id() {
             return Err(protocol_error("invitation targets another domain"));
+        }
+        if invitation.domain_seed().epoch() != self.core.db.epoch() {
+            return Err(DbError::UnauthorizedDevice);
         }
         let payload = invitation.encode_canonical()?;
         self.core
@@ -498,13 +509,26 @@ impl SyncCore {
         .await?;
         match recv_frame(recv).await? {
             SyncFrame::InvitationRequest => {
+                let control_reader = self.db.inner.control_gate.read().await;
+                self.require_local_permission(Permission::Invite)?;
                 let payload = self
                     .pending_invitations
+                    .read()
+                    .map_err(|_| protocol_error("invitation registry is unavailable"))?
+                    .get(&peer)
+                    .cloned()
+                    .ok_or(DbError::UnauthorizedDevice)?;
+                let invitation = Invitation::decode_canonical(&payload)?;
+                if invitation.domain_seed().epoch() != self.db.epoch() {
+                    return Err(DbError::UnauthorizedDevice);
+                }
+                self.pending_invitations
                     .write()
                     .map_err(|_| protocol_error("invitation registry is unavailable"))?
-                    .remove(&peer)
-                    .ok_or(DbError::UnauthorizedDevice)?;
-                return send_frame(send, &SyncFrame::Invitation { payload }).await;
+                    .remove(&peer);
+                let result = send_frame(send, &SyncFrame::Invitation { payload }).await;
+                drop(control_reader);
+                return result;
             }
             SyncFrame::DomainRequest { domain_id, proof }
                 if self.peer_has_permission(peer, Permission::Read)

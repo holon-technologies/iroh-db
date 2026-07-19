@@ -3,6 +3,19 @@ use iroh_db::{
     VersionVector,
 };
 
+fn copy_directory(source: &std::path::Path, destination: &std::path::Path) {
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+            copy_directory(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, IrohRecord)]
 #[iroh_db(collection = "rotation-notes", version = 1)]
 struct Note {
@@ -157,4 +170,144 @@ async fn rotation_converges_remaining_member_and_surfaces_revoked_offline_write(
     owner_device.close().await.unwrap();
     member_device.close().await.unwrap();
     revoked_device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cloned_controller_equivocation_freezes_facade_writes() {
+    let original_dir = tempfile::tempdir().unwrap();
+    let left_dir = tempfile::tempdir().unwrap();
+    let right_dir = tempfile::tempdir().unwrap();
+    let invitee_dir = tempfile::tempdir().unwrap();
+    let original_device = IrohDb::open(original_dir.path()).await.unwrap();
+    let invitee_device = IrohDb::open(invitee_dir.path()).await.unwrap();
+    let original = original_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let pending_invitation = original
+        .invite(
+            invitee_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let domain_id = original.domain_id();
+    drop(original);
+    original_device.close().await.unwrap();
+    copy_directory(original_dir.path(), left_dir.path());
+    copy_directory(original_dir.path(), right_dir.path());
+
+    let left_device = IrohDb::open(left_dir.path()).await.unwrap();
+    let right_device = IrohDb::open(right_dir.path()).await.unwrap();
+    let left = left_device.domain(domain_id).unwrap();
+    let right = right_device.domain(domain_id).unwrap();
+    let queued_node = left.start_sync().await.unwrap();
+    queued_node.offer_invitation(&pending_invitation).unwrap();
+    let (left_epoch_one, left_control) = left.rotate_epoch(&[]).unwrap();
+    let (right_epoch_one, right_control) = right.rotate_epoch(&[]).unwrap();
+    let left_seed = left_epoch_one.domain_seed();
+    let right_seed = right_epoch_one.domain_seed();
+
+    assert!(matches!(
+        left_epoch_one.apply_epoch_rotation(&right_control, &right_seed),
+        Err(DbError::Store(_))
+    ));
+    assert!(matches!(
+        right_epoch_one.apply_epoch_rotation(&left_control, &left_seed),
+        Err(DbError::Store(_))
+    ));
+    assert!(matches!(
+        left_epoch_one
+            .collection::<Note>()
+            .put(note("blocked", "forked", left_epoch_one.author_id()))
+            .await,
+        Err(DbError::Store(_))
+    ));
+    assert!(matches!(
+        right_epoch_one
+            .collection::<Note>()
+            .put(note("blocked", "forked", right_epoch_one.author_id()))
+            .await,
+        Err(DbError::Store(_))
+    ));
+    assert!(matches!(
+        left_epoch_one.issue_capability(
+            AuthorId::from_bytes([77; 32]),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            1,
+            None,
+        ),
+        Err(DbError::Store(_))
+    ));
+    let frozen_node = left_epoch_one.start_sync().await.unwrap();
+    assert!(matches!(
+        frozen_node.offer_invitation(&pending_invitation),
+        Err(DbError::Store(_))
+    ));
+    let requester_node = invitee_device.start_sync().await.unwrap();
+    assert!(
+        requester_node
+            .request_invitation(queued_node.addr())
+            .await
+            .is_err()
+    );
+    requester_node.shutdown().await.unwrap();
+    queued_node.shutdown().await.unwrap();
+    frozen_node.shutdown().await.unwrap();
+
+    drop(left);
+    drop(right);
+    drop(left_epoch_one);
+    drop(right_epoch_one);
+    left_device.close().await.unwrap();
+    right_device.close().await.unwrap();
+    invitee_device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn controller_transfer_authorizes_only_the_successor() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let successor_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let successor_device = IrohDb::open(successor_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = owner
+        .invite(
+            successor_device.author_id(),
+            PermissionSet::from_permissions(&[
+                Permission::Read,
+                Permission::Write,
+                Permission::Revoke,
+                Permission::FetchBlobs,
+                Permission::Admin,
+            ]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let successor = successor_device.import_invitation(&invitation).unwrap();
+    let (owner_epoch_one, transfer) = owner
+        .rotate_epoch_with_controller(&[], successor.author_id())
+        .unwrap();
+    let successor_epoch_one = successor
+        .apply_epoch_rotation(&transfer, &owner_epoch_one.domain_seed())
+        .unwrap();
+
+    assert!(matches!(
+        owner_epoch_one.rotate_epoch(&[]),
+        Err(DbError::UnauthorizedDevice)
+    ));
+    let (successor_epoch_two, _) = successor_epoch_one.rotate_epoch(&[]).unwrap();
+    assert_eq!(successor_epoch_two.domain_seed().epoch(), 2);
+
+    drop(owner);
+    drop(successor);
+    drop(owner_epoch_one);
+    drop(successor_epoch_one);
+    drop(successor_epoch_two);
+    owner_device.close().await.unwrap();
+    successor_device.close().await.unwrap();
 }

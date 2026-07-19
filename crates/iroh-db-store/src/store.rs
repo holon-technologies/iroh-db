@@ -1,7 +1,7 @@
 use std::{
     fs::{File, OpenOptions},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use fs2::FileExt as _;
@@ -14,7 +14,7 @@ use redb::{Database, ReadableDatabase as _, ReadableTable as _, TableDefinition}
 
 use crate::{BlobStore, BlobStoreError, IndexValue, MaterializedRecord, StoredRecord};
 
-const FORMAT_CONTENTS: &str = "iroh-db 1.0\n";
+const FORMAT_CONTENTS: &str = "iroh-db 2.0\n";
 const COMMIT_METADATA: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("commit_metadata_v1");
 const SNAPSHOT_COVERAGE: TableDefinition<'static, &[u8], &[u8]> =
@@ -48,6 +48,12 @@ const REVOKED_CAPABILITIES: TableDefinition<'static, &[u8], u64> =
     TableDefinition::new("revoked_capabilities_v1");
 const CONTROL_HEADS: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("control_heads_v1");
+const CONTROL_OBJECTS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("control_objects_v1");
+const CONTROL_SLOTS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("control_slots_v1");
+const CONTROL_FORKS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("control_forks_v1");
 const DEVICE_GROUPS: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("device_groups_v1");
 const CONSUMED_INVITATIONS: TableDefinition<'static, &[u8], u8> =
@@ -172,6 +178,18 @@ pub enum StoreError {
     /// A signed domain authority object failed validation or conflicted with durable state.
     #[error("domain authority metadata is invalid: {0}")]
     InvalidAuthority(String),
+    /// The designated controller signed two different successors for one control slot.
+    #[error(
+        "domain {domain} is frozen by conflicting control transitions {first:?} and {second:?}"
+    )]
+    ControlFork {
+        /// Security domain whose controller equivocated.
+        domain: DomainId,
+        /// Lexicographically first transition ID.
+        first: [u8; 32],
+        /// Lexicographically second transition ID.
+        second: [u8; 32],
+    },
 }
 
 /// Transactional metadata paired with an immutable content-addressed blob repository.
@@ -183,6 +201,7 @@ pub struct Store {
 struct StoreInner {
     database: Database,
     blobs: Arc<dyn BlobStore>,
+    control_writer: Mutex<()>,
     _lock: File,
 }
 
@@ -220,6 +239,7 @@ impl Store {
             inner: Arc::new(StoreInner {
                 database,
                 blobs,
+                control_writer: Mutex::new(()),
                 _lock: lock,
             }),
         })
@@ -1243,6 +1263,7 @@ impl Store {
         permission: Permission,
         epoch: u64,
     ) -> Result<bool, StoreError> {
+        self.ensure_control_not_forked(domain_id)?;
         if self.active_capability(domain_id, subject)? != Some(capability_id) {
             return Ok(false);
         }
@@ -1270,6 +1291,7 @@ impl Store {
         &self,
         domain_id: DomainId,
     ) -> Result<Option<ControlTransition>, StoreError> {
+        self.ensure_control_not_forked(domain_id)?;
         let read = self.inner.database.begin_read().map_err(database_error)?;
         let heads = read.open_table(CONTROL_HEADS).map_err(database_error)?;
         heads
@@ -1283,13 +1305,26 @@ impl Store {
 
     /// Returns the epoch authorized by the durable control chain.
     pub fn current_epoch(&self, domain_id: DomainId) -> Result<u64, StoreError> {
+        self.ensure_control_not_forked(domain_id)?;
         Ok(self
             .control_head(domain_id)?
             .map_or(0, |head| head.new_epoch()))
     }
 
+    /// Returns the endpoint exclusively authorized to sign the next control transition.
+    pub fn current_controller(&self, domain_id: DomainId) -> Result<AuthorId, StoreError> {
+        self.ensure_control_not_forked(domain_id)?;
+        if let Some(head) = self.control_head(domain_id)? {
+            return Ok(head.controller());
+        }
+        self.domain_descriptor(domain_id)?
+            .map(|descriptor| descriptor.owner())
+            .ok_or_else(|| StoreError::InvalidAuthority("domain descriptor is missing".into()))
+    }
+
     /// Returns the currently designated single writer.
     pub fn current_writer(&self, domain_id: DomainId) -> Result<Option<AuthorId>, StoreError> {
+        self.ensure_control_not_forked(domain_id)?;
         if let Some(head) = self.control_head(domain_id)? {
             return Ok(Some(head.writer()));
         }
@@ -1298,10 +1333,35 @@ impl Store {
             .map(|descriptor| descriptor.owner()))
     }
 
-    /// Atomically advances authority, records the causal cut, and revokes endpoint access.
-    pub fn apply_control(&self, control: &ControlTransition) -> Result<(), StoreError> {
+    /// Verifies and retains a control object before separately delivered key material is activated.
+    pub fn observe_control(&self, control: &ControlTransition) -> Result<(), StoreError> {
+        let _control_writer = self.inner.control_writer.lock().map_err(|_| {
+            StoreError::InvalidAuthority("control writer lock is unavailable".into())
+        })?;
         control.verify().map_err(authority_error)?;
+        self.ensure_control_not_forked(control.domain_id())?;
         let current = self.control_head(control.domain_id())?;
+        let control_id = control.id().map_err(authority_error)?;
+        if current
+            .as_ref()
+            .map(ControlTransition::id)
+            .transpose()
+            .map_err(authority_error)?
+            .is_some_and(|current_id| current_id == control_id)
+        {
+            return Ok(());
+        }
+        if self.control_slot_is_observed(control, control_id)? {
+            return Ok(());
+        }
+        if let Some(head) = current.as_ref()
+            && control.sequence() == head.sequence()
+            && control.predecessor() == head.predecessor()
+            && control.previous_epoch() == head.previous_epoch()
+        {
+            self.validate_control_sibling(control, head)?;
+            return self.freeze_control_fork(head, control);
+        }
         let (sequence, predecessor, epoch) = if let Some(head) = current.as_ref() {
             (
                 head.sequence().checked_add(1).ok_or_else(|| {
@@ -1313,29 +1373,77 @@ impl Store {
         } else {
             (1, None, 0)
         };
-        let can_control = self.authorize_capability(
-            control.domain_id(),
-            control.author(),
-            control.author_capability(),
-            Permission::Revoke,
-            epoch,
-        )? || self.authorize_capability(
-            control.domain_id(),
-            control.author(),
-            control.author_capability(),
-            Permission::Admin,
-            epoch,
-        )?;
         if control.sequence() != sequence
             || control.predecessor() != predecessor
             || control.previous_epoch() != epoch
             || self.frontier(control.domain_id())? != control.cut()
-            || !can_control
         {
             return Err(StoreError::InvalidAuthority(
                 "control transition does not extend the active head".into(),
             ));
         }
+        self.validate_control_authority(
+            control,
+            self.current_controller(control.domain_id())?,
+            epoch,
+        )?;
+        let write = self.inner.database.begin_write().map_err(database_error)?;
+        insert_control_observation(&write, control, control_id)?;
+        write.commit().map_err(database_error)
+    }
+
+    /// Atomically advances authority, records the causal cut, and revokes endpoint access.
+    pub fn apply_control(&self, control: &ControlTransition) -> Result<(), StoreError> {
+        let _control_writer = self.inner.control_writer.lock().map_err(|_| {
+            StoreError::InvalidAuthority("control writer lock is unavailable".into())
+        })?;
+        control.verify().map_err(authority_error)?;
+        self.ensure_control_not_forked(control.domain_id())?;
+        let current = self.control_head(control.domain_id())?;
+        let control_id = control.id().map_err(authority_error)?;
+        if current
+            .as_ref()
+            .map(ControlTransition::id)
+            .transpose()
+            .map_err(authority_error)?
+            .is_some_and(|current_id| current_id == control_id)
+        {
+            return Ok(());
+        }
+        self.control_slot_is_observed(control, control_id)?;
+        if let Some(head) = current.as_ref()
+            && control.sequence() == head.sequence()
+            && control.predecessor() == head.predecessor()
+            && control.previous_epoch() == head.previous_epoch()
+        {
+            self.validate_control_sibling(control, head)?;
+            return self.freeze_control_fork(head, control);
+        }
+        let (sequence, predecessor, epoch) = if let Some(head) = current.as_ref() {
+            (
+                head.sequence().checked_add(1).ok_or_else(|| {
+                    StoreError::InvalidAuthority("control sequence exhausted".into())
+                })?,
+                Some(head.id().map_err(authority_error)?),
+                head.new_epoch(),
+            )
+        } else {
+            (1, None, 0)
+        };
+        if control.sequence() != sequence
+            || control.predecessor() != predecessor
+            || control.previous_epoch() != epoch
+            || self.frontier(control.domain_id())? != control.cut()
+        {
+            return Err(StoreError::InvalidAuthority(
+                "control transition does not extend the active head".into(),
+            ));
+        }
+        self.validate_control_authority(
+            control,
+            self.current_controller(control.domain_id())?,
+            epoch,
+        )?;
         if control.revoked_subjects().contains(&control.author()) {
             return Err(StoreError::InvalidAuthority(
                 "control author cannot revoke itself".into(),
@@ -1344,6 +1452,7 @@ impl Store {
         let bytes = control.encode_canonical().map_err(authority_error)?;
         let write = self.inner.database.begin_write().map_err(database_error)?;
         {
+            insert_control_observation(&write, control, control_id)?;
             let mut heads = write.open_table(CONTROL_HEADS).map_err(database_error)?;
             heads
                 .insert(control.domain_id().as_bytes().as_slice(), bytes.as_slice())
@@ -1379,6 +1488,191 @@ impl Store {
                 .map_err(database_error)?;
         }
         write.commit().map_err(database_error)
+    }
+
+    fn validate_control_authority(
+        &self,
+        control: &ControlTransition,
+        expected_controller: AuthorId,
+        epoch: u64,
+    ) -> Result<(), StoreError> {
+        let can_control = self.authorize_capability(
+            control.domain_id(),
+            control.author(),
+            control.author_capability(),
+            Permission::Revoke,
+            epoch,
+        )? || self.authorize_capability(
+            control.domain_id(),
+            control.author(),
+            control.author_capability(),
+            Permission::Admin,
+            epoch,
+        )?;
+        let next_can_admin = if let Some(capability_id) =
+            self.active_capability(control.domain_id(), control.controller())?
+        {
+            self.authorize_capability(
+                control.domain_id(),
+                control.controller(),
+                capability_id,
+                Permission::Admin,
+                control.new_epoch(),
+            )?
+        } else {
+            false
+        };
+        if control.author() != expected_controller
+            || !can_control
+            || !next_can_admin
+            || control.revoked_subjects().contains(&control.controller())
+        {
+            return Err(StoreError::InvalidAuthority(
+                "control transition lacks designated controller authority".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_control_sibling(
+        &self,
+        conflicting: &ControlTransition,
+        accepted: &ControlTransition,
+    ) -> Result<(), StoreError> {
+        if conflicting.author() != self.controller_before(accepted)? {
+            return Err(StoreError::InvalidAuthority(
+                "control sibling was not signed by the predecessor controller".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn controller_before(&self, control: &ControlTransition) -> Result<AuthorId, StoreError> {
+        let Some(predecessor) = control.predecessor() else {
+            return self
+                .domain_descriptor(control.domain_id())?
+                .map(|descriptor| descriptor.owner())
+                .ok_or_else(|| {
+                    StoreError::InvalidAuthority("domain descriptor is missing".into())
+                });
+        };
+        self.control_object(control.domain_id(), predecessor)?
+            .map(|value| value.controller())
+            .ok_or_else(|| {
+                StoreError::InvalidAuthority("control predecessor object is missing".into())
+            })
+    }
+
+    fn control_object(
+        &self,
+        domain_id: DomainId,
+        control_id: [u8; 32],
+    ) -> Result<Option<ControlTransition>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let objects = read.open_table(CONTROL_OBJECTS).map_err(database_error)?;
+        let key = control_object_key(domain_id, control_id);
+        objects
+            .get(key.as_slice())
+            .map_err(database_error)?
+            .map(|value| {
+                ControlTransition::decode_canonical(value.value()).map_err(authority_error)
+            })
+            .transpose()
+    }
+
+    fn control_slot(&self, control: &ControlTransition) -> Result<Option<[u8; 32]>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let slots = read.open_table(CONTROL_SLOTS).map_err(database_error)?;
+        slots
+            .get(control_slot_key(control).as_slice())
+            .map_err(database_error)?
+            .map(|value| {
+                value.value().try_into().map_err(|_| {
+                    StoreError::CorruptDerivedMetadata("control slot ID is invalid".into())
+                })
+            })
+            .transpose()
+    }
+
+    fn control_slot_is_observed(
+        &self,
+        control: &ControlTransition,
+        control_id: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        let Some(observed_id) = self.control_slot(control)? else {
+            return Ok(false);
+        };
+        if observed_id == control_id {
+            return Ok(true);
+        }
+        let observed = self
+            .control_object(control.domain_id(), observed_id)?
+            .ok_or_else(|| {
+                StoreError::CorruptDerivedMetadata("observed control slot object is missing".into())
+            })?;
+        self.validate_control_sibling(control, &observed)?;
+        self.freeze_control_fork(&observed, control)?;
+        Ok(false)
+    }
+
+    fn freeze_control_fork(
+        &self,
+        accepted: &ControlTransition,
+        conflicting: &ControlTransition,
+    ) -> Result<(), StoreError> {
+        let domain = accepted.domain_id();
+        let accepted_id = accepted.id().map_err(authority_error)?;
+        let conflicting_id = conflicting.id().map_err(authority_error)?;
+        let (first, second) = if accepted_id < conflicting_id {
+            (accepted_id, conflicting_id)
+        } else {
+            (conflicting_id, accepted_id)
+        };
+        let bytes = conflicting.encode_canonical().map_err(authority_error)?;
+        let mut evidence = [0_u8; 64];
+        evidence[..32].copy_from_slice(&first);
+        evidence[32..].copy_from_slice(&second);
+        let write = self.inner.database.begin_write().map_err(database_error)?;
+        write
+            .open_table(CONTROL_OBJECTS)
+            .map_err(database_error)?
+            .insert(
+                control_object_key(domain, conflicting_id).as_slice(),
+                bytes.as_slice(),
+            )
+            .map_err(database_error)?;
+        write
+            .open_table(CONTROL_FORKS)
+            .map_err(database_error)?
+            .insert(domain.as_bytes().as_slice(), evidence.as_slice())
+            .map_err(database_error)?;
+        write.commit().map_err(database_error)?;
+        Err(StoreError::ControlFork {
+            domain,
+            first,
+            second,
+        })
+    }
+
+    fn ensure_control_not_forked(&self, domain: DomainId) -> Result<(), StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let forks = read.open_table(CONTROL_FORKS).map_err(database_error)?;
+        let Some(value) = forks
+            .get(domain.as_bytes().as_slice())
+            .map_err(database_error)?
+        else {
+            return Ok(());
+        };
+        let evidence: [u8; 64] = value.value().try_into().map_err(|_| {
+            StoreError::CorruptDerivedMetadata("control fork evidence is invalid".into())
+        })?;
+        let first = evidence[..32].try_into().expect("exact evidence length");
+        let second = evidence[32..].try_into().expect("exact evidence length");
+        Err(StoreError::ControlFork {
+            domain,
+            first,
+            second,
+        })
     }
 
     /// Adds a device to the local domain authorization set.
@@ -1599,6 +1893,9 @@ fn initialize_tables(database: &Database) -> Result<(), StoreError> {
         .open_table(REVOKED_CAPABILITIES)
         .map_err(database_error)?;
     write.open_table(CONTROL_HEADS).map_err(database_error)?;
+    write.open_table(CONTROL_OBJECTS).map_err(database_error)?;
+    write.open_table(CONTROL_SLOTS).map_err(database_error)?;
+    write.open_table(CONTROL_FORKS).map_err(database_error)?;
     write.open_table(DEVICE_GROUPS).map_err(database_error)?;
     write
         .open_table(CONSUMED_INVITATIONS)
@@ -1618,6 +1915,47 @@ fn active_capability_key(domain_id: DomainId, subject: AuthorId) -> [u8; 64] {
     key[..32].copy_from_slice(domain_id.as_bytes());
     key[32..].copy_from_slice(subject.as_bytes());
     key
+}
+
+fn control_object_key(domain_id: DomainId, control_id: [u8; 32]) -> [u8; 64] {
+    let mut key = [0_u8; 64];
+    key[..32].copy_from_slice(domain_id.as_bytes());
+    key[32..].copy_from_slice(&control_id);
+    key
+}
+
+fn control_slot_key(control: &ControlTransition) -> [u8; 81] {
+    let mut key = [0_u8; 81];
+    key[..32].copy_from_slice(control.domain_id().as_bytes());
+    key[32..40].copy_from_slice(&control.sequence().to_be_bytes());
+    if let Some(predecessor) = control.predecessor() {
+        key[40] = 1;
+        key[41..73].copy_from_slice(&predecessor);
+    }
+    key[73..].copy_from_slice(&control.previous_epoch().to_be_bytes());
+    key
+}
+
+fn insert_control_observation(
+    write: &redb::WriteTransaction,
+    control: &ControlTransition,
+    control_id: [u8; 32],
+) -> Result<(), StoreError> {
+    let bytes = control.encode_canonical().map_err(authority_error)?;
+    write
+        .open_table(CONTROL_OBJECTS)
+        .map_err(database_error)?
+        .insert(
+            control_object_key(control.domain_id(), control_id).as_slice(),
+            bytes.as_slice(),
+        )
+        .map_err(database_error)?;
+    write
+        .open_table(CONTROL_SLOTS)
+        .map_err(database_error)?
+        .insert(control_slot_key(control).as_slice(), control_id.as_slice())
+        .map_err(database_error)?;
+    Ok(())
 }
 
 fn device_group_key(domain_id: DomainId, label: &str) -> Vec<u8> {

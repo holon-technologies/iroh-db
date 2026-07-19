@@ -2,9 +2,13 @@
 
 The current release is pre-1.0 but its durable and wire formats are explicitly versioned.
 
-- Store format: `iroh-db 1.0` in `FORMAT`; unknown formats fail closed.
+- Store format: `iroh-db 2.0` in `FORMAT`; unknown formats fail closed. The
+  pre-release 1.0 development format is intentionally rejected rather than
+  reinterpreted in place.
 - Sync ALPN: `/iroh-db/sync/1`; frames carry a protocol version and strict canonical CBOR.
 - Commit, snapshot, manifest, gossip, authority, invitation, control, key-vault, and backup objects each carry independent versions or magic values.
+- Control transitions use control format v2, which signs the designated
+  successor controller. Pre-release v1 control objects are rejected.
 - Canonical golden fixtures and trailing/truncation/malformed tests prevent silent encoder drift.
 - Built-in CRDT semantics are permanent for a stored schema. Applications must assign stable collection names, field IDs, and schema versions.
 - The greenfield `0.1.0` causal-kernel hardening rejects earlier development commits whose CRDT dots, contexts, or counter authors were supplied by application state. No released database is migrated; development stores created before ADR 0001 must be recreated.
