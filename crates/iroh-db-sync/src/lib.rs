@@ -12,10 +12,14 @@ pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
 pub const MAX_REFERENCES: usize = 4_096;
 /// Maximum aggregate immutable references accepted during one reconciliation round.
 pub const MAX_SESSION_REFERENCES: usize = 65_536;
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const GOSSIP_VERSION: u16 = 1;
 /// Maximum encoded gossip announcement size.
 pub const MAX_GOSSIP_HINT: usize = 512;
+/// Maximum capability objects carried by one authenticated authority message.
+pub const MAX_CAPABILITY_CHAIN: usize = 9;
+/// Maximum canonical capability-certificate size.
+pub const MAX_CAPABILITY_BYTES: usize = 4_096;
 
 /// One signed, content-free commit availability hint sent through iroh-gossip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,8 +134,30 @@ pub enum SyncFrame {
     DomainRequest {
         /// Requested security domain.
         domain_id: DomainId,
+        /// Historical epoch selected for the nonce-bound proof.
+        epoch: u64,
         /// Nonce-bound capability/key proof.
         proof: [u8; 32],
+        /// Root-to-leaf capability evidence for the authenticated endpoint.
+        capability_chain: Vec<Vec<u8>>,
+    },
+    /// Advertises the durable authority position before data reconciliation.
+    AuthorityState {
+        /// Active domain epoch.
+        epoch: u64,
+        /// Accepted control sequence, equal to the epoch for format v2.
+        sequence: u64,
+        /// Canonical control-head ID, absent at genesis.
+        head: Option<[u8; 32]>,
+    },
+    /// Delivers one signed successor and digest-bound key over authenticated QUIC.
+    ControlGrant {
+        /// Canonical signed [`iroh_db_security::ControlTransition`] bytes.
+        transition: Vec<u8>,
+        /// Symmetric key for the transition's new epoch.
+        epoch_key: [u8; 32],
+        /// Capability evidence required to validate transition authority.
+        capability_chain: Vec<Vec<u8>>,
     },
     /// Advertises a bounded local commit frontier or accepted set.
     Frontier {
@@ -250,6 +276,12 @@ pub enum SyncFrameError {
     /// An invitation payload exceeded its 64 KiB bound.
     #[error("invitation payload is too large: {0}")]
     InvitationTooLarge(usize),
+    /// An authority message exceeded the maximum capability-chain depth.
+    #[error("authority message contains too many capability objects: {0}")]
+    TooManyAuthorityObjects(usize),
+    /// One canonical capability object exceeded its hard bound.
+    #[error("authority object is too large: {0}")]
+    AuthorityObjectTooLarge(usize),
 }
 
 #[derive(minicbor::Encode, minicbor::Decode)]
@@ -297,6 +329,16 @@ struct WireFrame {
     error_code: Option<u16>,
     #[n(8)]
     payload: Option<Vec<u8>>,
+    #[n(9)]
+    epoch: Option<u64>,
+    #[n(10)]
+    sequence: Option<u64>,
+    #[n(11)]
+    head: Option<minicbor::bytes::ByteArray<32>>,
+    #[n(12)]
+    payloads: Vec<Vec<u8>>,
+    #[n(13)]
+    epoch_key: Option<minicbor::bytes::ByteArray<32>>,
 }
 
 impl From<&SyncFrame> for WireFrame {
@@ -311,6 +353,11 @@ impl From<&SyncFrame> for WireFrame {
             commit: None,
             error_code: None,
             payload: None,
+            epoch: None,
+            sequence: None,
+            head: None,
+            payloads: Vec::new(),
+            epoch_key: None,
         };
         match frame {
             SyncFrame::Hello { nonce, max_frame } => {
@@ -318,10 +365,17 @@ impl From<&SyncFrame> for WireFrame {
                 wire.nonce_or_proof = Some((*nonce).into());
                 wire.max_frame = Some(*max_frame);
             }
-            SyncFrame::DomainRequest { domain_id, proof } => {
+            SyncFrame::DomainRequest {
+                domain_id,
+                epoch,
+                proof,
+                capability_chain,
+            } => {
                 wire.kind = 1;
                 wire.domain_id = Some(*domain_id);
                 wire.nonce_or_proof = Some((*proof).into());
+                wire.epoch = Some(*epoch);
+                wire.payloads.clone_from(capability_chain);
             }
             SyncFrame::Frontier { commits } => {
                 wire.kind = 2;
@@ -349,6 +403,26 @@ impl From<&SyncFrame> for WireFrame {
                 wire.kind = 9;
                 wire.payload = Some(payload.clone());
             }
+            SyncFrame::AuthorityState {
+                epoch,
+                sequence,
+                head,
+            } => {
+                wire.kind = 10;
+                wire.epoch = Some(*epoch);
+                wire.sequence = Some(*sequence);
+                wire.head = head.map(Into::into);
+            }
+            SyncFrame::ControlGrant {
+                transition,
+                epoch_key,
+                capability_chain,
+            } => {
+                wire.kind = 11;
+                wire.payload = Some(transition.clone());
+                wire.epoch_key = Some((*epoch_key).into());
+                wire.payloads.clone_from(capability_chain);
+            }
         }
         wire
     }
@@ -360,6 +434,11 @@ impl TryFrom<WireFrame> for SyncFrame {
     fn try_from(wire: WireFrame) -> Result<Self, SyncFrameError> {
         if wire.version != PROTOCOL_VERSION {
             return Err(SyncFrameError::UnsupportedVersion(wire.version));
+        }
+        if wire.kind >= 10 {
+            let frame = decode_authority_frame(wire)?;
+            validate(&frame)?;
+            return Ok(frame);
         }
         let empty_refs = wire.commits.is_empty();
         let frame = match wire.kind {
@@ -378,11 +457,16 @@ impl TryFrom<WireFrame> for SyncFrame {
                 && empty_refs
                 && wire.commit.is_none()
                 && wire.error_code.is_none()
-                && wire.payload.is_none() =>
+                && wire.payload.is_none()
+                && wire.sequence.is_none()
+                && wire.head.is_none()
+                && wire.epoch_key.is_none() =>
             {
                 Self::DomainRequest {
                     domain_id: wire.domain_id.ok_or(SyncFrameError::InvalidShape)?,
+                    epoch: wire.epoch.ok_or(SyncFrameError::InvalidShape)?,
                     proof: fixed_proof(wire.nonce_or_proof)?,
+                    capability_chain: wire.payloads,
                 }
             }
             2 if unused_scalar_fields(&wire) => Self::Frontier {
@@ -428,6 +512,43 @@ impl TryFrom<WireFrame> for SyncFrame {
     }
 }
 
+fn decode_authority_frame(wire: WireFrame) -> Result<SyncFrame, SyncFrameError> {
+    let common_shape = wire.domain_id.is_none()
+        && wire.nonce_or_proof.is_none()
+        && wire.commits.is_empty()
+        && wire.max_frame.is_none()
+        && wire.commit.is_none()
+        && wire.error_code.is_none();
+    match wire.kind {
+        10 if common_shape
+            && wire.payload.is_none()
+            && wire.payloads.is_empty()
+            && wire.epoch_key.is_none() =>
+        {
+            Ok(SyncFrame::AuthorityState {
+                epoch: wire.epoch.ok_or(SyncFrameError::InvalidShape)?,
+                sequence: wire.sequence.ok_or(SyncFrameError::InvalidShape)?,
+                head: wire.head.map(Into::into),
+            })
+        }
+        11 if common_shape
+            && wire.epoch.is_none()
+            && wire.sequence.is_none()
+            && wire.head.is_none() =>
+        {
+            Ok(SyncFrame::ControlGrant {
+                transition: wire.payload.ok_or(SyncFrameError::InvalidShape)?,
+                epoch_key: wire
+                    .epoch_key
+                    .map(Into::into)
+                    .ok_or(SyncFrameError::InvalidShape)?,
+                capability_chain: wire.payloads,
+            })
+        }
+        _ => Err(SyncFrameError::InvalidShape),
+    }
+}
+
 fn unused_scalar_fields(wire: &WireFrame) -> bool {
     wire.domain_id.is_none()
         && wire.nonce_or_proof.is_none()
@@ -435,6 +556,11 @@ fn unused_scalar_fields(wire: &WireFrame) -> bool {
         && wire.commit.is_none()
         && wire.error_code.is_none()
         && wire.payload.is_none()
+        && wire.epoch.is_none()
+        && wire.sequence.is_none()
+        && wire.head.is_none()
+        && wire.payloads.is_empty()
+        && wire.epoch_key.is_none()
 }
 
 fn unused_scalar_fields_except_payload(wire: &WireFrame) -> bool {
@@ -443,6 +569,11 @@ fn unused_scalar_fields_except_payload(wire: &WireFrame) -> bool {
         && wire.max_frame.is_none()
         && wire.commit.is_none()
         && wire.error_code.is_none()
+        && wire.epoch.is_none()
+        && wire.sequence.is_none()
+        && wire.head.is_none()
+        && wire.payloads.is_empty()
+        && wire.epoch_key.is_none()
 }
 
 fn fixed_proof(value: Option<minicbor::bytes::ByteArray<32>>) -> Result<[u8; 32], SyncFrameError> {
@@ -456,14 +587,36 @@ fn validate(frame: &SyncFrame) -> Result<(), SyncFrameError> {
         {
             Err(SyncFrameError::FrameTooLarge(*max_frame as usize))
         }
+        SyncFrame::AuthorityState {
+            epoch, sequence, ..
+        } if epoch != sequence => Err(SyncFrameError::InvalidShape),
         SyncFrame::Frontier { commits }
         | SyncFrame::Need { commits }
         | SyncFrame::Refs { commits } => validate_references(commits),
         SyncFrame::Invitation { payload } if payload.len() > 64 * 1024 => {
             Err(SyncFrameError::InvitationTooLarge(payload.len()))
         }
+        SyncFrame::DomainRequest {
+            capability_chain, ..
+        }
+        | SyncFrame::ControlGrant {
+            capability_chain, ..
+        } => validate_capability_chain(capability_chain),
         _ => Ok(()),
     }
+}
+
+fn validate_capability_chain(chain: &[Vec<u8>]) -> Result<(), SyncFrameError> {
+    if chain.len() > MAX_CAPABILITY_CHAIN {
+        return Err(SyncFrameError::TooManyAuthorityObjects(chain.len()));
+    }
+    if let Some(object) = chain
+        .iter()
+        .find(|object| object.len() > MAX_CAPABILITY_BYTES)
+    {
+        return Err(SyncFrameError::AuthorityObjectTooLarge(object.len()));
+    }
+    Ok(())
 }
 
 fn validate_references(commits: &[CommitId]) -> Result<(), SyncFrameError> {

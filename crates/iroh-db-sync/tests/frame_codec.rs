@@ -11,9 +11,9 @@ fn hello_has_stable_canonical_bytes() {
     assert_eq!(
         hex::encode(&bytes),
         concat!(
-            "860100f65820",
+            "8d0200f65820",
             "0000000000000000000000000000000000000000000000000000000000000000",
-            "801a00100000"
+            "801a00100000f6f6f6f6f6f680"
         )
     );
     assert_eq!(SyncFrame::decode_canonical(&bytes).unwrap(), frame);
@@ -23,7 +23,9 @@ fn hello_has_stable_canonical_bytes() {
 fn frames_reject_trailing_oversized_and_excessive_refs() {
     let frame = SyncFrame::DomainRequest {
         domain_id: DomainId::from_bytes([1; 32]),
+        epoch: 0,
         proof: [2; 32],
+        capability_chain: Vec::new(),
     };
     let mut trailing = frame.encode_canonical().unwrap();
     trailing.push(0);
@@ -52,5 +54,46 @@ fn frontier_difference_is_sorted_unique_and_bounded() {
     assert_eq!(
         missing_commits(&[one, three], &[three, two, one, two]).unwrap(),
         vec![two]
+    );
+}
+
+#[test]
+fn authority_frames_are_strict_bounded_and_canonical() {
+    let state = SyncFrame::AuthorityState {
+        epoch: 7,
+        sequence: 7,
+        head: Some([9; 32]),
+    };
+    let state_bytes = state.encode_canonical().unwrap();
+    assert_eq!(SyncFrame::decode_canonical(&state_bytes).unwrap(), state);
+
+    let request = SyncFrame::DomainRequest {
+        domain_id: DomainId::from_bytes([1; 32]),
+        epoch: 6,
+        proof: [2; 32],
+        capability_chain: vec![vec![3; 64]],
+    };
+    let request_bytes = request.encode_canonical().unwrap();
+    assert_eq!(
+        SyncFrame::decode_canonical(&request_bytes).unwrap(),
+        request
+    );
+
+    let grant = SyncFrame::ControlGrant {
+        transition: vec![4; 128],
+        epoch_key: [5; 32],
+        capability_chain: vec![vec![6; 256]],
+    };
+    let grant_bytes = grant.encode_canonical().unwrap();
+    assert_eq!(SyncFrame::decode_canonical(&grant_bytes).unwrap(), grant);
+
+    assert!(
+        SyncFrame::ControlGrant {
+            transition: vec![0; MAX_CONTROL_FRAME],
+            epoch_key: [0; 32],
+            capability_chain: Vec::new(),
+        }
+        .encode_canonical()
+        .is_err()
     );
 }

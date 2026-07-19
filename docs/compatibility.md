@@ -5,7 +5,10 @@ The current release is pre-1.0 but its durable and wire formats are explicitly v
 - Store format: `iroh-db 2.0` in `FORMAT`; unknown formats fail closed. The
   pre-release 1.0 development format is intentionally rejected rather than
   reinterpreted in place.
-- Sync ALPN: `/iroh-db/sync/1`; frames carry a protocol version and strict canonical CBOR.
+- Sync ALPN: `/iroh-db/sync/2`; authority reconciliation precedes commit-tail
+  exchange. It is intentionally incompatible with the pre-release
+  `/iroh-db/sync/1` frame sequence, which cannot authenticate a lagging member
+  after rotation. Frames carry a protocol version and strict canonical CBOR.
 - Commit, snapshot, manifest, gossip, authority, invitation, control, key-vault, and backup objects each carry independent versions or magic values.
 - Control transitions use control format v2, which signs the designated
   successor controller. Pre-release v1 control objects are rejected.

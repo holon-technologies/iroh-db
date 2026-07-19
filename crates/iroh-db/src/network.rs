@@ -16,7 +16,7 @@ use iroh_blobs::provider::events::{
 };
 use iroh_db_blobs::{BlobEngine, BlobRef, BlobStream, FetchMetrics, FetchOptions};
 use iroh_db_core::{AuthorId, BlobHash, CommitEnvelope, CommitId, DomainId};
-use iroh_db_security::{Invitation, Permission, verify_gossip_signature};
+use iroh_db_security::{ControlTransition, Invitation, Permission, verify_gossip_signature};
 use iroh_db_sync::{
     GossipHint, MAX_CONTROL_FRAME, MAX_REFERENCES, MAX_SESSION_REFERENCES, SyncFrame,
     missing_commits,
@@ -31,7 +31,7 @@ use n0_future::StreamExt as _;
 use crate::{DbError, IrohDb, Snapshot};
 
 /// The sole iroh-db control-plane ALPN.
-pub const SYNC_ALPN: &[u8] = b"/iroh-db/sync/1";
+pub const SYNC_ALPN: &[u8] = b"/iroh-db/sync/2";
 
 /// Result counters for one complete bidirectional reconciliation round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,18 +445,34 @@ impl SyncCore {
         else {
             return Err(protocol_error("expected hello"));
         };
+        send_frame(send, &self.authority_state()?).await?;
+        let SyncFrame::AuthorityState {
+            epoch: remote_epoch,
+            ..
+        } = recv_frame(recv).await?
+        else {
+            return Err(protocol_error("expected authority state"));
+        };
+        let proof_epoch = self.db.epoch().min(remote_epoch);
         send_frame(
             send,
             &SyncFrame::DomainRequest {
                 domain_id: self.domain_id(),
-                proof: self.proof(local_nonce, remote_nonce, self.db.author_id())?,
+                epoch: proof_epoch,
+                proof: self.proof(local_nonce, remote_nonce, self.db.author_id(), proof_epoch)?,
+                capability_chain: self.local_capability_chain()?,
             },
         )
         .await?;
         match recv_frame(recv).await? {
-            SyncFrame::DomainRequest { domain_id, proof }
-                if domain_id == self.domain_id()
-                    && proof == self.proof(local_nonce, remote_nonce, peer)? =>
+            SyncFrame::DomainRequest {
+                domain_id,
+                epoch,
+                proof,
+                ..
+            } if domain_id == self.domain_id()
+                && epoch == proof_epoch
+                && proof == self.proof(local_nonce, remote_nonce, peer, proof_epoch)? =>
             {
                 Ok(())
             }
@@ -507,40 +523,57 @@ impl SyncCore {
             },
         )
         .await?;
-        match recv_frame(recv).await? {
-            SyncFrame::InvitationRequest => {
-                let control_reader = self.db.inner.control_gate.read().await;
-                self.require_local_permission(Permission::Invite)?;
-                let payload = self
-                    .pending_invitations
-                    .read()
-                    .map_err(|_| protocol_error("invitation registry is unavailable"))?
-                    .get(&peer)
-                    .cloned()
-                    .ok_or(DbError::UnauthorizedDevice)?;
-                let invitation = Invitation::decode_canonical(&payload)?;
-                if invitation.domain_seed().epoch() != self.db.epoch() {
-                    return Err(DbError::UnauthorizedDevice);
-                }
-                self.pending_invitations
-                    .write()
-                    .map_err(|_| protocol_error("invitation registry is unavailable"))?
-                    .remove(&peer);
-                let result = send_frame(send, &SyncFrame::Invitation { payload }).await;
-                drop(control_reader);
-                return result;
+        let next = recv_frame(recv).await?;
+        if next == SyncFrame::InvitationRequest {
+            let control_reader = self.db.inner.control_gate.read().await;
+            self.require_local_permission(Permission::Invite)?;
+            let payload = self
+                .pending_invitations
+                .read()
+                .map_err(|_| protocol_error("invitation registry is unavailable"))?
+                .get(&peer)
+                .cloned()
+                .ok_or(DbError::UnauthorizedDevice)?;
+            let invitation = Invitation::decode_canonical(&payload)?;
+            if invitation.domain_seed().epoch() != self.db.epoch() {
+                return Err(DbError::UnauthorizedDevice);
             }
-            SyncFrame::DomainRequest { domain_id, proof }
-                if self.peer_has_permission(peer, Permission::Read)
-                    && domain_id == self.domain_id()
-                    && proof == self.proof(remote_nonce, local_nonce, peer)? => {}
+            self.pending_invitations
+                .write()
+                .map_err(|_| protocol_error("invitation registry is unavailable"))?
+                .remove(&peer);
+            let result = send_frame(send, &SyncFrame::Invitation { payload }).await;
+            drop(control_reader);
+            return result;
+        }
+        let SyncFrame::AuthorityState {
+            epoch: remote_epoch,
+            ..
+        } = next
+        else {
+            return Err(protocol_error("expected authority state"));
+        };
+        send_frame(send, &self.authority_state()?).await?;
+        let proof_epoch = self.db.epoch().min(remote_epoch);
+        match recv_frame(recv).await? {
+            SyncFrame::DomainRequest {
+                domain_id,
+                epoch,
+                proof,
+                ..
+            } if self.peer_has_permission(peer, Permission::Read)
+                && domain_id == self.domain_id()
+                && epoch == proof_epoch
+                && proof == self.proof(remote_nonce, local_nonce, peer, proof_epoch)? => {}
             _ => return Err(DbError::UnauthorizedDevice),
         }
         send_frame(
             send,
             &SyncFrame::DomainRequest {
                 domain_id: self.domain_id(),
-                proof: self.proof(remote_nonce, local_nonce, self.db.author_id())?,
+                epoch: proof_epoch,
+                proof: self.proof(remote_nonce, local_nonce, self.db.author_id(), proof_epoch)?,
+                capability_chain: self.local_capability_chain()?,
             },
         )
         .await?;
@@ -701,18 +734,45 @@ impl SyncCore {
         initiator_nonce: [u8; 32],
         responder_nonce: [u8; 32],
         claimant: AuthorId,
+        epoch: u64,
     ) -> Result<[u8; 32], DbError> {
         let key = self
             .db
+            .inner
+            .credentials
+            .load_domain_epoch(self.domain_id(), epoch)?
             .domain_key()
             .derive_subkey(self.domain_id().as_bytes(), b"iroh-db/sync-domain-proof/v1")?;
         let mut message = Vec::with_capacity(128);
         message.extend_from_slice(b"iroh-db/sync-domain-proof/v1");
         message.extend_from_slice(self.domain_id().as_bytes());
+        message.extend_from_slice(&epoch.to_be_bytes());
         message.extend_from_slice(&initiator_nonce);
         message.extend_from_slice(&responder_nonce);
         message.extend_from_slice(claimant.as_bytes());
         Ok(*blake3::keyed_hash(&key, &message).as_bytes())
+    }
+
+    fn authority_state(&self) -> Result<SyncFrame, DbError> {
+        let head = self.db.inner.store.control_head(self.domain_id())?;
+        Ok(SyncFrame::AuthorityState {
+            epoch: self.db.inner.store.current_epoch(self.domain_id())?,
+            sequence: head.as_ref().map_or(0, ControlTransition::sequence),
+            head: head.as_ref().map(ControlTransition::id).transpose()?,
+        })
+    }
+
+    fn local_capability_chain(&self) -> Result<Vec<Vec<u8>>, DbError> {
+        let Some(capability) = self.db.active_capability()? else {
+            return Ok(Vec::new());
+        };
+        self.db
+            .inner
+            .store
+            .capability_chain(capability.id()?)?
+            .iter()
+            .map(|capability| capability.encode_canonical().map_err(DbError::from))
+            .collect()
     }
 
     fn commit_ids(&self) -> Result<Vec<CommitId>, DbError> {
