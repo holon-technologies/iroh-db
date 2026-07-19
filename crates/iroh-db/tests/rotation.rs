@@ -98,6 +98,22 @@ async fn rotation_converges_remaining_member_and_surfaces_revoked_offline_write(
             None,
         )
         .unwrap();
+    assert_eq!(
+        epoch_one_invitation
+            .capability_chain()
+            .last()
+            .unwrap()
+            .issued_control_sequence(),
+        1
+    );
+    assert_eq!(
+        epoch_one_invitation
+            .capability_chain()
+            .last()
+            .unwrap()
+            .issued_control_head(),
+        Some(control.id().unwrap())
+    );
     let member_epoch_one = member
         .apply_epoch_rotation(&control, &epoch_one_invitation.domain_seed())
         .unwrap()

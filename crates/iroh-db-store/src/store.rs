@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{File, OpenOptions},
     path::Path,
     sync::{Arc, Mutex},
@@ -14,7 +15,7 @@ use redb::{Database, ReadableDatabase as _, ReadableTable as _, TableDefinition}
 
 use crate::{BlobStore, BlobStoreError, IndexValue, MaterializedRecord, StoredRecord};
 
-const FORMAT_CONTENTS: &str = "iroh-db 2.0\n";
+const FORMAT_CONTENTS: &str = "iroh-db 3.0\n";
 const COMMIT_METADATA: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("commit_metadata_v1");
 const SNAPSHOT_COVERAGE: TableDefinition<'static, &[u8], &[u8]> =
@@ -46,6 +47,8 @@ const ACTIVE_CAPABILITIES: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("active_capabilities_v1");
 const REVOKED_CAPABILITIES: TableDefinition<'static, &[u8], u64> =
     TableDefinition::new("revoked_capabilities_v1");
+const SUBJECT_REVOCATIONS: TableDefinition<'static, &[u8], u64> =
+    TableDefinition::new("subject_revocations_v1");
 const CONTROL_HEADS: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("control_heads_v1");
 const CONTROL_OBJECTS: TableDefinition<'static, &[u8], &[u8]> =
@@ -1245,23 +1248,11 @@ impl Store {
             }
             validated.push((capability.clone(), capability_id, bytes));
         }
-        let read = self.inner.database.begin_read().map_err(database_error)?;
-        let revoked = read
-            .open_table(REVOKED_CAPABILITIES)
-            .map_err(database_error)?;
-        for (_, capability_id, _) in &validated {
-            if revoked
-                .get(capability_id.as_bytes().as_slice())
-                .map_err(database_error)?
-                .is_some()
-            {
-                return Err(StoreError::InvalidAuthority(
-                    "capability chain contains revoked evidence".into(),
-                ));
-            }
+        if !self.capability_anchors_are_current(descriptor.domain_id(), chain)? {
+            return Err(StoreError::InvalidAuthority(
+                "capability chain is revoked or has an invalid control anchor".into(),
+            ));
         }
-        drop(revoked);
-        drop(read);
 
         let descriptor_bytes = descriptor.encode_canonical().map_err(authority_error)?;
         let (leaf, leaf_id, _) = validated
@@ -1306,16 +1297,15 @@ impl Store {
         let issuer_id = capability.issuer_capability().ok_or_else(|| {
             StoreError::InvalidAuthority("delegated capability lacks issuer".into())
         })?;
-        let issuer = self
-            .capability(issuer_id)?
-            .ok_or_else(|| StoreError::InvalidAuthority("capability issuer is missing".into()))?;
-        capability
-            .validate_delegation(&issuer)
-            .map_err(authority_error)?;
         let capability_id = capability.id().map_err(authority_error)?;
-        let bytes = capability.encode_canonical().map_err(authority_error)?;
+        let mut chain = self.capability_chain(issuer_id)?;
+        chain.push(capability.clone());
+        let validated = self.validate_capability_chain_for_install(&chain, Some(capability_id))?;
         let write = self.inner.database.begin_write().map_err(database_error)?;
-        insert_capability_tables(&write, capability, capability_id, &bytes)?;
+        for (_, id, bytes) in &validated {
+            insert_capability_record(&write, *id, bytes)?;
+        }
+        set_active_capability(&write, capability, capability_id)?;
         write.commit().map_err(database_error)?;
         Ok(capability_id)
     }
@@ -1441,18 +1431,15 @@ impl Store {
         if self.active_capability(domain_id, subject)? != Some(capability_id) {
             return Ok(false);
         }
-        let read = self.inner.database.begin_read().map_err(database_error)?;
-        let revoked = read
-            .open_table(REVOKED_CAPABILITIES)
-            .map_err(database_error)?;
-        if revoked
-            .get(capability_id.as_bytes().as_slice())
-            .map_err(database_error)?
-            .is_some()
-        {
+        let chain = match self.capability_chain(capability_id) {
+            Ok(chain) => chain,
+            Err(StoreError::InvalidAuthority(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if !self.capability_anchors_are_current(domain_id, &chain)? {
             return Ok(false);
         }
-        let Some(capability) = self.capability(capability_id)? else {
+        let Some(capability) = chain.last() else {
             return Ok(false);
         };
         Ok(capability.domain_id() == domain_id
@@ -1535,6 +1522,60 @@ impl Store {
         Ok(self
             .control_head(domain_id)?
             .map_or(0, |head| head.new_epoch()))
+    }
+
+    /// Returns the accepted domain-control sequence, or zero at genesis.
+    pub fn current_control_sequence(&self, domain_id: DomainId) -> Result<u64, StoreError> {
+        Ok(self
+            .control_head(domain_id)?
+            .as_ref()
+            .map_or(0, ControlTransition::sequence))
+    }
+
+    /// Checks the rebuildable subject-revocation index against signed control.
+    pub fn subject_revocations_consistent(&self, domain_id: DomainId) -> Result<bool, StoreError> {
+        let expected = self.expected_subject_revocations(domain_id)?;
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let table = read
+            .open_table(SUBJECT_REVOCATIONS)
+            .map_err(database_error)?;
+        let mut actual = BTreeMap::new();
+        for entry in table.iter().map_err(database_error)? {
+            let (key, value) = entry.map_err(database_error)?;
+            let key = key.value();
+            if key.len() != 64 || !key.starts_with(domain_id.as_bytes()) {
+                continue;
+            }
+            let subject = AuthorId::from_bytes(key[32..].try_into().map_err(|_| {
+                StoreError::CorruptDerivedMetadata("subject revocation endpoint is invalid".into())
+            })?);
+            actual.insert(subject, value.value());
+        }
+        Ok(actual == expected)
+    }
+
+    /// Atomically rebuilds subject revocations from the accepted signed chain.
+    pub fn repair_subject_revocations(&self, domain_id: DomainId) -> Result<(), StoreError> {
+        let _control_writer = self.inner.control_writer.lock().map_err(|_| {
+            StoreError::InvalidAuthority("control writer lock is unavailable".into())
+        })?;
+        let expected = self.expected_subject_revocations(domain_id)?;
+        let write = self.inner.database.begin_write().map_err(database_error)?;
+        {
+            let mut table = write
+                .open_table(SUBJECT_REVOCATIONS)
+                .map_err(database_error)?;
+            table
+                .retain(|key, _| !key.starts_with(domain_id.as_bytes()))
+                .map_err(database_error)?;
+            for (subject, sequence) in expected {
+                let key = subject_revocation_key(domain_id, subject);
+                table
+                    .insert(key.as_slice(), sequence)
+                    .map_err(database_error)?;
+            }
+        }
+        write.commit().map_err(database_error)
     }
 
     /// Returns the endpoint exclusively authorized to sign the next control transition.
@@ -1683,14 +1724,15 @@ impl Store {
                 Some(control.controller_capability()),
             )?
         };
-        let candidate_successor = validated_successor
-            .last()
-            .map(|(capability, _, _)| capability);
+        let candidate_successor_chain = validated_successor
+            .iter()
+            .map(|(capability, _, _)| capability.clone())
+            .collect::<Vec<_>>();
         self.validate_control_authority(
             control,
             self.current_controller(control.domain_id())?,
             epoch,
-            candidate_successor,
+            (!candidate_successor_chain.is_empty()).then_some(candidate_successor_chain.as_slice()),
         )?;
         if control.revoked_subjects().contains(&control.author()) {
             return Err(StoreError::InvalidAuthority(
@@ -1721,7 +1763,7 @@ impl Store {
         control: &ControlTransition,
         expected_controller: AuthorId,
         epoch: u64,
-        candidate_successor: Option<&CapabilityCertificate>,
+        candidate_successor_chain: Option<&[CapabilityCertificate]>,
     ) -> Result<(), StoreError> {
         let can_control = self.authorize_capability(
             control.domain_id(),
@@ -1736,40 +1778,27 @@ impl Store {
             Permission::Admin,
             epoch,
         )?;
-        let next_capability = if let Some(candidate) = candidate_successor {
-            if candidate.id().map_err(authority_error)? != control.controller_capability() {
-                return Err(StoreError::InvalidAuthority(
-                    "successor capability does not match signed control".into(),
-                ));
-            }
-            Some(candidate.clone())
+        let next_chain = if let Some(candidate) = candidate_successor_chain {
+            candidate.to_vec()
         } else {
-            self.capability(control.controller_capability())?
+            self.capability_chain(control.controller_capability())?
         };
-        let next_revoked = {
-            let read = self.inner.database.begin_read().map_err(database_error)?;
-            let revoked = read
-                .open_table(REVOKED_CAPABILITIES)
-                .map_err(database_error)?;
-            revoked
-                .get(control.controller_capability().as_bytes().as_slice())
-                .map_err(database_error)?
-                .is_some()
-        };
-        let next_can_admin = next_capability.is_some_and(|capability| {
-            capability.domain_id() == control.domain_id()
-                && capability.subject() == control.controller()
-                && capability.permits(Permission::Admin, control.new_epoch())
-        }) && !next_revoked
-            && (candidate_successor.is_some()
-                || self
-                    .capability_chain(control.controller_capability())
-                    .is_ok());
-        if control.author() != expected_controller
-            || !can_control
-            || !next_can_admin
-            || control.revoked_subjects().contains(&control.controller())
-        {
+        let next_capability = next_chain.last().ok_or_else(|| {
+            StoreError::InvalidAuthority("successor capability chain is empty".into())
+        })?;
+        let next_can_admin = next_capability.id().map_err(authority_error)?
+            == control.controller_capability()
+            && self.capability_anchors_are_current(control.domain_id(), &next_chain)?
+            && !next_chain
+                .iter()
+                .any(|capability| control.revoked_subjects().contains(&capability.subject()))
+            && {
+                let capability = next_capability;
+                capability.domain_id() == control.domain_id()
+                    && capability.subject() == control.controller()
+                    && capability.permits(Permission::Admin, control.new_epoch())
+            };
+        if control.author() != expected_controller || !can_control || !next_can_admin {
             return Err(StoreError::InvalidAuthority(
                 "control transition lacks designated controller authority".into(),
             ));
@@ -1835,30 +1864,107 @@ impl Store {
             ));
         }
         if replace_leaf.is_none()
-            && self
-                .active_capability(leaf.domain_id(), leaf.subject())?
-                .is_some_and(|active| active != *leaf_id)
+            && let Some(active) = self.active_capability(leaf.domain_id(), leaf.subject())?
+            && active != *leaf_id
         {
+            let current = self.capability(active)?.ok_or_else(|| {
+                StoreError::CorruptDerivedMetadata("active capability record is missing".into())
+            })?;
+            if leaf.issued_control_sequence() <= current.issued_control_sequence() {
+                return Err(StoreError::InvalidAuthority(
+                    "capability chain would replace an active leaf without advancing control"
+                        .into(),
+                ));
+            }
+        }
+        let capabilities = validated
+            .iter()
+            .map(|(capability, _, _)| capability.clone())
+            .collect::<Vec<_>>();
+        if !self.capability_anchors_are_current(root.domain_id(), &capabilities)? {
             return Err(StoreError::InvalidAuthority(
-                "capability chain would replace an active leaf".into(),
+                "capability chain is revoked or has an invalid control anchor".into(),
             ));
         }
+        Ok(validated)
+    }
+
+    fn capability_anchors_are_current(
+        &self,
+        domain_id: DomainId,
+        chain: &[CapabilityCertificate],
+    ) -> Result<bool, StoreError> {
+        let controls = self.accepted_control_chain(domain_id)?;
+        let expected_revocations = self.expected_subject_revocations(domain_id)?;
         let read = self.inner.database.begin_read().map_err(database_error)?;
         let revoked = read
             .open_table(REVOKED_CAPABILITIES)
             .map_err(database_error)?;
-        for (_, capability_id, _) in &validated {
+        let subject_revocations = read
+            .open_table(SUBJECT_REVOCATIONS)
+            .map_err(database_error)?;
+        for capability in chain {
+            if capability.domain_id() != domain_id {
+                return Ok(false);
+            }
+            let anchor_is_accepted = if capability.issued_control_sequence() == 0 {
+                capability.issued_control_head().is_none()
+            } else {
+                let Ok(index) = usize::try_from(capability.issued_control_sequence() - 1) else {
+                    return Ok(false);
+                };
+                controls
+                    .get(index)
+                    .map(ControlTransition::id)
+                    .transpose()
+                    .map_err(authority_error)?
+                    == capability.issued_control_head()
+            };
+            if !anchor_is_accepted {
+                return Ok(false);
+            }
+            let capability_id = capability.id().map_err(authority_error)?;
             if revoked
                 .get(capability_id.as_bytes().as_slice())
                 .map_err(database_error)?
                 .is_some()
             {
-                return Err(StoreError::InvalidAuthority(
-                    "capability chain contains revoked evidence".into(),
+                return Ok(false);
+            }
+            let subject_key = subject_revocation_key(domain_id, capability.subject());
+            let stored_revocation = subject_revocations
+                .get(subject_key.as_slice())
+                .map_err(database_error)?
+                .map(|sequence| sequence.value());
+            let expected_revocation = expected_revocations.get(&capability.subject()).copied();
+            if stored_revocation != expected_revocation {
+                return Err(StoreError::CorruptDerivedMetadata(
+                    "subject revocation index differs from signed control".into(),
                 ));
             }
+            if expected_revocation
+                .is_some_and(|sequence| sequence > capability.issued_control_sequence())
+            {
+                return Ok(false);
+            }
         }
-        Ok(validated)
+        Ok(true)
+    }
+
+    fn expected_subject_revocations(
+        &self,
+        domain_id: DomainId,
+    ) -> Result<BTreeMap<AuthorId, u64>, StoreError> {
+        let mut revocations = BTreeMap::<AuthorId, u64>::new();
+        for control in self.accepted_control_chain(domain_id)? {
+            for subject in control.revoked_subjects() {
+                revocations
+                    .entry(*subject)
+                    .and_modify(|sequence| *sequence = (*sequence).max(control.sequence()))
+                    .or_insert(control.sequence());
+            }
+        }
+        Ok(revocations)
     }
 
     fn validate_control_sibling(
@@ -2219,6 +2325,9 @@ fn initialize_tables(database: &Database) -> Result<(), StoreError> {
     write
         .open_table(REVOKED_CAPABILITIES)
         .map_err(database_error)?;
+    write
+        .open_table(SUBJECT_REVOCATIONS)
+        .map_err(database_error)?;
     write.open_table(CONTROL_HEADS).map_err(database_error)?;
     write.open_table(CONTROL_OBJECTS).map_err(database_error)?;
     write.open_table(CONTROL_SLOTS).map_err(database_error)?;
@@ -2242,6 +2351,10 @@ fn active_capability_key(domain_id: DomainId, subject: AuthorId) -> [u8; 64] {
     key[..32].copy_from_slice(domain_id.as_bytes());
     key[32..].copy_from_slice(subject.as_bytes());
     key
+}
+
+fn subject_revocation_key(domain_id: DomainId, subject: AuthorId) -> [u8; 64] {
+    active_capability_key(domain_id, subject)
 }
 
 fn control_object_key(domain_id: DomainId, control_id: [u8; 32]) -> [u8; 64] {
@@ -2290,6 +2403,12 @@ fn apply_control_revocations(
     control: &ControlTransition,
 ) -> Result<(), StoreError> {
     for subject in control.revoked_subjects() {
+        let subject_key = subject_revocation_key(control.domain_id(), *subject);
+        write
+            .open_table(SUBJECT_REVOCATIONS)
+            .map_err(database_error)?
+            .insert(subject_key.as_slice(), control.sequence())
+            .map_err(database_error)?;
         let active_key = active_capability_key(control.domain_id(), *subject);
         let capability_id = {
             let mut active = write

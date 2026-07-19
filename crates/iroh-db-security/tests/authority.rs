@@ -91,6 +91,46 @@ fn delegation_can_only_narrow_rights_epoch_and_depth() {
 }
 
 #[test]
+fn delegation_control_anchor_can_only_move_forward() {
+    let owner = IrohSigner::from_secret_bytes([31; 32]);
+    let delegate = IrohSigner::from_secret_bytes([32; 32]);
+    let child = IrohSigner::from_secret_bytes([33; 32]);
+    let domain = DomainId::from_bytes([34; 32]);
+    let root =
+        CapabilityCertificate::issue_root(domain, PermissionSet::all(), &owner, [35; 32]).unwrap();
+    let anchored = root
+        .delegate_at_control(
+            &owner,
+            delegate.author(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::Invite]),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            3,
+            Some([38; 32]),
+            3,
+            None,
+            [36; 32],
+        )
+        .unwrap();
+    assert_eq!(anchored.issued_control_sequence(), 3);
+    assert_eq!(anchored.issued_control_head(), Some([38; 32]));
+    assert!(
+        anchored
+            .delegate_at_control(
+                &delegate,
+                child.author(),
+                PermissionSet::from_permissions(&[Permission::Read]),
+                PermissionSet::empty(),
+                2,
+                Some([39; 32]),
+                3,
+                None,
+                [37; 32],
+            )
+            .is_err()
+    );
+}
+
+#[test]
 fn tampering_wrong_issuer_and_unknown_permission_bits_fail_closed() {
     let owner = IrohSigner::from_secret_bytes([11; 32]);
     let impostor = IrohSigner::from_secret_bytes([12; 32]);
@@ -146,8 +186,8 @@ fn control_transition_is_canonical_signed_bounded_and_tamper_evident() {
     assert_eq!(
         transition.id().unwrap(),
         [
-            7, 75, 217, 42, 248, 215, 60, 242, 184, 80, 67, 52, 93, 60, 106, 202, 247, 141, 44, 25,
-            143, 194, 206, 43, 119, 45, 44, 54, 32, 246, 243, 80,
+            208, 4, 103, 233, 82, 240, 160, 52, 144, 64, 156, 3, 17, 41, 159, 85, 36, 214, 129, 30,
+            203, 9, 189, 85, 163, 225, 154, 76, 162, 209, 194, 3,
         ]
     );
     assert_eq!(

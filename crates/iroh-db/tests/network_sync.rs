@@ -263,6 +263,56 @@ async fn sync_automatically_installs_a_non_revoked_members_next_epoch() {
 }
 
 #[tokio::test]
+async fn lagging_peer_reconciles_before_accepting_an_ahead_active_capability() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let member_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let member_device = IrohDb::open(member_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = owner
+        .invite(
+            member_device.author_id(),
+            PermissionSet::from_permissions(&[
+                Permission::Read,
+                Permission::Write,
+                Permission::FetchBlobs,
+            ]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let member = member_device.import_invitation(&invitation).unwrap();
+    let owner_node = owner.start_sync().await.unwrap();
+    let member_node = member.start_sync().await.unwrap();
+    member_node.sync_with(owner_node.addr()).await.unwrap();
+
+    let (rotated_owner, _) = owner.rotate_epoch(&[]).unwrap();
+    let refreshed_owner = rotated_owner
+        .issue_capability(
+            rotated_owner.author_id(),
+            PermissionSet::all(),
+            PermissionSet::all(),
+            1,
+            None,
+        )
+        .unwrap();
+    assert_eq!(refreshed_owner.issued_control_sequence(), 1);
+
+    member_node.sync_with(owner_node.addr()).await.unwrap();
+    assert_eq!(member.domain_seed().epoch(), 1);
+
+    owner_node.shutdown().await.unwrap();
+    member_node.shutdown().await.unwrap();
+    drop(owner);
+    drop(rotated_owner);
+    drop(member);
+    owner_device.close().await.unwrap();
+    member_device.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn sync_catches_up_multiple_epochs_at_their_causal_cuts() {
     let owner_dir = tempfile::tempdir().unwrap();
     let member_dir = tempfile::tempdir().unwrap();

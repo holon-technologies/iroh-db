@@ -110,6 +110,15 @@ impl IrohDb {
 
     /// Verifies content hashes, signatures, encryption, dependency presence, and rebuild equality.
     pub async fn verify(&self) -> Result<VerificationReport, DbError> {
+        if !self
+            .inner
+            .store
+            .subject_revocations_consistent(self.domain_id())?
+        {
+            return Err(DbError::Operation(
+                "subject revocation index differs from signed control".into(),
+            ));
+        }
         let commit_ids = self.inner.store.list_stored_commit_ids(self.domain_id())?;
         for commit_id in &commit_ids {
             let envelope = self.inner.store.load_commit(*commit_id).await?;
@@ -150,6 +159,9 @@ impl IrohDb {
         let rebuilt = self.rebuild_mutations().await?;
         self.inner
             .store
+            .repair_subject_revocations(self.domain_id())?;
+        self.inner
+            .store
             .replace_materialized(self.domain_id(), &rebuilt)?;
         self.verify().await
     }
@@ -157,6 +169,9 @@ impl IrohDb {
     /// Rewrites existing materialized/index tables atomically when application record types are absent.
     pub async fn repair_indexes(&self) -> Result<VerificationReport, DbError> {
         let exported = self.inner.store.export_materialized(self.domain_id())?;
+        self.inner
+            .store
+            .repair_subject_revocations(self.domain_id())?;
         self.inner
             .store
             .replace_materialized(self.domain_id(), &exported)?;

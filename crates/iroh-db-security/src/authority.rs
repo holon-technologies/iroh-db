@@ -8,7 +8,8 @@ use crate::{
     },
 };
 
-const AUTHORITY_VERSION: u16 = 1;
+const DESCRIPTOR_VERSION: u16 = 1;
+const CAPABILITY_VERSION: u16 = 2;
 const CONTROL_VERSION: u16 = 3;
 const MAX_DELEGATION_DEPTH: u8 = 8;
 const MAX_CONTROL_COMMITS: usize = 65_536;
@@ -146,7 +147,7 @@ impl DomainDescriptor {
     pub fn decode_canonical(bytes: &[u8]) -> Result<Self, AuthorityError> {
         let wire: DescriptorWire = decode_exact(bytes)?;
         let content: DescriptorContent = decode_exact(&wire.content)?;
-        if content.version != AUTHORITY_VERSION {
+        if content.version != DESCRIPTOR_VERSION {
             return Err(AuthorityError::UnsupportedVersion(content.version));
         }
         let descriptor = Self {
@@ -165,7 +166,7 @@ impl DomainDescriptor {
 
     fn signing_bytes(&self) -> Result<Vec<u8>, AuthorityError> {
         minicbor::to_vec(DescriptorContent {
-            version: AUTHORITY_VERSION,
+            version: DESCRIPTOR_VERSION,
             domain_id: self.domain_id,
             mode: self.mode,
             owner: self.owner,
@@ -184,6 +185,7 @@ pub struct CapabilityCertificate {
     permissions: PermissionSet,
     delegation_permissions: PermissionSet,
     issued_control_sequence: u64,
+    issued_control_head: Option<[u8; 32]>,
     valid_from_epoch: u64,
     valid_through_epoch: Option<u64>,
     depth: u8,
@@ -206,6 +208,7 @@ impl CapabilityCertificate {
             permissions,
             permissions,
             0,
+            None,
             0,
             None,
             0,
@@ -221,6 +224,33 @@ impl CapabilityCertificate {
         subject: AuthorId,
         permissions: PermissionSet,
         delegation_permissions: PermissionSet,
+        valid_from_epoch: u64,
+        valid_through_epoch: Option<u64>,
+        nonce: [u8; 32],
+    ) -> Result<Self, AuthorityError> {
+        self.delegate_at_control(
+            issuer,
+            subject,
+            permissions,
+            delegation_permissions,
+            self.issued_control_sequence,
+            self.issued_control_head,
+            valid_from_epoch,
+            valid_through_epoch,
+            nonce,
+        )
+    }
+
+    /// Delegates authority anchored to an exact accepted domain-control head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delegate_at_control(
+        &self,
+        issuer: &IrohSigner,
+        subject: AuthorId,
+        permissions: PermissionSet,
+        delegation_permissions: PermissionSet,
+        issued_control_sequence: u64,
+        issued_control_head: Option<[u8; 32]>,
         valid_from_epoch: u64,
         valid_through_epoch: Option<u64>,
         nonce: [u8; 32],
@@ -241,6 +271,14 @@ impl CapabilityCertificate {
         {
             return Err(AuthorityError::EpochEscalation);
         }
+        if issued_control_sequence < self.issued_control_sequence {
+            return Err(AuthorityError::ControlSequenceRegression);
+        }
+        if issued_control_sequence == self.issued_control_sequence
+            && issued_control_head != self.issued_control_head
+        {
+            return Err(AuthorityError::ControlHeadMismatch);
+        }
         let depth = self
             .depth
             .checked_add(1)
@@ -251,7 +289,8 @@ impl CapabilityCertificate {
             Some(self.id()?),
             permissions,
             delegation_permissions,
-            self.issued_control_sequence,
+            issued_control_sequence,
+            issued_control_head,
             valid_from_epoch,
             valid_through_epoch,
             depth,
@@ -282,6 +321,10 @@ impl CapabilityCertificate {
 
     pub const fn issued_control_sequence(&self) -> u64 {
         self.issued_control_sequence
+    }
+
+    pub const fn issued_control_head(&self) -> Option<[u8; 32]> {
+        self.issued_control_head
     }
 
     pub const fn valid_from_epoch(&self) -> u64 {
@@ -345,6 +388,14 @@ impl CapabilityCertificate {
         {
             return Err(AuthorityError::EpochEscalation);
         }
+        if self.issued_control_sequence < issuer.issued_control_sequence {
+            return Err(AuthorityError::ControlSequenceRegression);
+        }
+        if self.issued_control_sequence == issuer.issued_control_sequence
+            && self.issued_control_head != issuer.issued_control_head
+        {
+            return Err(AuthorityError::ControlHeadMismatch);
+        }
         Ok(())
     }
 
@@ -366,7 +417,7 @@ impl CapabilityCertificate {
         }
         let wire: CapabilityWire = decode_exact(bytes)?;
         let content: CapabilityContent = decode_exact(&wire.content)?;
-        if content.version != AUTHORITY_VERSION {
+        if content.version != CAPABILITY_VERSION {
             return Err(AuthorityError::UnsupportedVersion(content.version));
         }
         let capability = Self {
@@ -376,6 +427,7 @@ impl CapabilityCertificate {
             permissions: PermissionSet::from_bits(content.permissions)?,
             delegation_permissions: PermissionSet::from_bits(content.delegation_permissions)?,
             issued_control_sequence: content.issued_control_sequence,
+            issued_control_head: content.issued_control_head,
             valid_from_epoch: content.valid_from_epoch,
             valid_through_epoch: content.valid_through_epoch,
             depth: content.depth,
@@ -399,6 +451,7 @@ impl CapabilityCertificate {
         permissions: PermissionSet,
         delegation_permissions: PermissionSet,
         issued_control_sequence: u64,
+        issued_control_head: Option<[u8; 32]>,
         valid_from_epoch: u64,
         valid_through_epoch: Option<u64>,
         depth: u8,
@@ -412,6 +465,7 @@ impl CapabilityCertificate {
             permissions,
             delegation_permissions,
             issued_control_sequence,
+            issued_control_head,
             valid_from_epoch,
             valid_through_epoch,
             depth,
@@ -434,6 +488,9 @@ impl CapabilityCertificate {
         {
             return Err(AuthorityError::EpochEscalation);
         }
+        if (self.issued_control_sequence == 0) != self.issued_control_head.is_none() {
+            return Err(AuthorityError::ControlHeadMismatch);
+        }
         if self.depth == 0 {
             if self.issuer_capability.is_some() || self.issuer_endpoint != self.subject {
                 return Err(AuthorityError::WrongIssuer);
@@ -446,7 +503,7 @@ impl CapabilityCertificate {
 
     fn signing_bytes(&self) -> Result<Vec<u8>, AuthorityError> {
         minicbor::to_vec(CapabilityContent {
-            version: AUTHORITY_VERSION,
+            version: CAPABILITY_VERSION,
             domain_id: self.domain_id,
             subject: self.subject,
             issuer_capability: self.issuer_capability,
@@ -458,6 +515,7 @@ impl CapabilityCertificate {
             depth: self.depth,
             nonce: self.nonce,
             issuer_endpoint: self.issuer_endpoint,
+            issued_control_head: self.issued_control_head,
         })
         .map_err(codec_error)
     }
@@ -676,6 +734,10 @@ pub enum AuthorityError {
     PermissionEscalation,
     #[error("capability delegation expands epoch scope")]
     EpochEscalation,
+    #[error("capability control-sequence anchor moves backward")]
+    ControlSequenceRegression,
+    #[error("capability control-head anchor is inconsistent")]
+    ControlHeadMismatch,
     #[error("capability issuer or chain link is invalid")]
     WrongIssuer,
     #[error("capability delegation exceeds depth eight")]
@@ -741,6 +803,8 @@ struct CapabilityContent {
     nonce: [u8; 32],
     #[n(11)]
     issuer_endpoint: AuthorId,
+    #[n(12)]
+    issued_control_head: Option<[u8; 32]>,
 }
 
 #[derive(minicbor::Encode, minicbor::Decode)]

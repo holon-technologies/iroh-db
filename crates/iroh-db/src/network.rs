@@ -328,6 +328,11 @@ struct AuthorityPosition {
     head: Option<[u8; 32]>,
 }
 
+struct HandshakeState {
+    remote_authority: AuthorityPosition,
+    remote_capability_chain: Vec<Vec<u8>>,
+}
+
 #[derive(Clone)]
 struct SyncProtocol {
     core: SyncCore,
@@ -405,7 +410,8 @@ impl SyncCore {
             .map_err(network_error)?;
         let (mut send, mut recv) = connection.open_bi().await.map_err(network_error)?;
 
-        let mut remote_authority = self.outbound_handshake(peer, &mut send, &mut recv).await?;
+        let handshake = self.outbound_handshake(peer, &mut send, &mut recv).await?;
+        let mut remote_authority = handshake.remote_authority;
         let mut report = SyncReport {
             received: 0,
             sent: 0,
@@ -445,8 +451,14 @@ impl SyncCore {
                 send_frame(&mut send, &SyncFrame::Done).await?;
             }
         }
-        self.reconcile_authority_head(remote_authority, &mut send, &mut recv)
-            .await?;
+        self.finalize_peer_authority(
+            peer,
+            remote_authority,
+            &handshake.remote_capability_chain,
+            &mut send,
+            &mut recv,
+        )
+        .await?;
         let round = self
             .outbound_commit_round(
                 peer,
@@ -497,7 +509,7 @@ impl SyncCore {
         peer: AuthorId,
         send: &mut SendStream,
         recv: &mut RecvStream,
-    ) -> Result<AuthorityPosition, DbError> {
+    ) -> Result<HandshakeState, DbError> {
         self.require_local_permission(Permission::Read)?;
         let local_nonce = random_nonce()?;
         send_frame(
@@ -547,10 +559,13 @@ impl SyncCore {
             {
                 self.authenticate_peer_capability(peer, &capability_chain)
                     .await?;
-                Ok(AuthorityPosition {
-                    epoch: remote_epoch,
-                    sequence,
-                    head,
+                Ok(HandshakeState {
+                    remote_authority: AuthorityPosition {
+                        epoch: remote_epoch,
+                        sequence,
+                        head,
+                    },
+                    remote_capability_chain: capability_chain,
                 })
             }
             _ => Err(DbError::UnauthorizedDevice),
@@ -677,9 +692,23 @@ impl SyncCore {
                 send_frame(send, &SyncFrame::Done).await?;
             }
         }
-        self.reconcile_authority_head(remote_authority, send, recv)
+        self.finalize_peer_authority(peer, remote_authority, &capability_chain, send, recv)
             .await?;
         self.serve_commit_round(peer, send, recv, blobs_connection, self.db.epoch())
+            .await
+    }
+
+    async fn finalize_peer_authority(
+        &self,
+        peer: AuthorId,
+        remote_authority: AuthorityPosition,
+        capability_chain: &[Vec<u8>],
+        send: &mut SendStream,
+        recv: &mut RecvStream,
+    ) -> Result<(), DbError> {
+        self.reconcile_authority_head(remote_authority, send, recv)
+            .await?;
+        self.authenticate_peer_capability(peer, capability_chain)
             .await
     }
 
@@ -797,16 +826,6 @@ impl SyncCore {
         let Some(descriptor) = self.db.inner.store.domain_descriptor(self.domain_id())? else {
             return self.require_trusted(peer);
         };
-        if self
-            .db
-            .inner
-            .store
-            .accepted_control_chain(self.domain_id())?
-            .iter()
-            .any(|control| control.revoked_subjects().contains(&peer))
-        {
-            return Err(DbError::UnauthorizedDevice);
-        }
         let chain = encoded_chain
             .iter()
             .map(|bytes| CapabilityCertificate::decode_canonical(bytes).map_err(DbError::from))
@@ -822,16 +841,75 @@ impl SyncCore {
             pair[1].validate_delegation(&pair[0])?;
         }
         let leaf = chain.last().ok_or(DbError::UnauthorizedDevice)?;
-        if leaf.subject() != peer
-            || !leaf.permits(Permission::Read, self.db.epoch())
-            || !leaf.permits(Permission::FetchBlobs, self.db.epoch())
+        if leaf.subject() != peer {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        let current_sequence = self
+            .db
+            .inner
+            .store
+            .current_control_sequence(self.domain_id())?;
+        let anchor_is_ahead = chain
+            .iter()
+            .any(|capability| capability.issued_control_sequence() > current_sequence);
+        if !anchor_is_ahead
+            && (!leaf.permits(Permission::Read, self.db.epoch())
+                || !leaf.permits(Permission::FetchBlobs, self.db.epoch()))
         {
             return Err(DbError::UnauthorizedDevice);
         }
-        self.db
-            .inner
-            .store
-            .install_capability_chain_atomic(&chain)?;
+        let leaf_id = match self.db.inner.store.install_capability_chain_atomic(&chain) {
+            Ok(leaf_id) => leaf_id,
+            Err(iroh_db_store::StoreError::InvalidAuthority(_)) if anchor_is_ahead => {
+                let Some(active) = self
+                    .db
+                    .inner
+                    .store
+                    .active_capability(self.domain_id(), peer)?
+                else {
+                    return Err(DbError::UnauthorizedDevice);
+                };
+                if !self
+                    .db
+                    .inner
+                    .store
+                    .is_author_trusted(self.domain_id(), peer)?
+                    || !self.db.inner.store.authorize_capability(
+                        self.domain_id(),
+                        peer,
+                        active,
+                        Permission::Read,
+                        self.db.epoch(),
+                    )?
+                    || !self.db.inner.store.authorize_capability(
+                        self.domain_id(),
+                        peer,
+                        active,
+                        Permission::FetchBlobs,
+                        self.db.epoch(),
+                    )?
+                {
+                    return Err(DbError::UnauthorizedDevice);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(DbError::Store(error)),
+        };
+        if !self.db.inner.store.authorize_capability(
+            self.domain_id(),
+            peer,
+            leaf_id,
+            Permission::Read,
+            self.db.epoch(),
+        )? || !self.db.inner.store.authorize_capability(
+            self.domain_id(),
+            peer,
+            leaf_id,
+            Permission::FetchBlobs,
+            self.db.epoch(),
+        )? {
+            return Err(DbError::UnauthorizedDevice);
+        }
         self.db.inner.store.trust_author(self.domain_id(), peer)?;
         Ok(())
     }

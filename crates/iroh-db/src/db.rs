@@ -639,13 +639,21 @@ impl IrohDb {
             .store
             .capability(issuer_id)?
             .ok_or(DbError::UnauthorizedDevice)?;
+        let control_head = self.inner.store.control_head(self.domain_id())?;
+        let control_sequence = control_head.as_ref().map_or(0, ControlTransition::sequence);
+        let control_head_id = control_head
+            .as_ref()
+            .map(ControlTransition::id)
+            .transpose()?;
         let mut nonce = [0_u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| DbError::RandomnessUnavailable)?;
-        let capability = issuer.delegate(
+        let capability = issuer.delegate_at_control(
             &self.inner.credentials.signer(),
             subject,
             permissions,
             delegation_permissions,
+            control_sequence,
+            control_head_id,
             valid_from_epoch,
             valid_through_epoch,
             nonce,

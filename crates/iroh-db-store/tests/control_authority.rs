@@ -11,6 +11,7 @@ use iroh_db_security::{
     Permission, PermissionSet,
 };
 use iroh_db_store::{BlobStore, BlobStoreError, Store, StoreError};
+use redb::TableDefinition;
 
 #[derive(Default)]
 struct MemoryBlobs(Mutex<BTreeMap<BlobHash, Vec<u8>>>);
@@ -165,6 +166,53 @@ fn successor_capability_and_control_advance_atomically() {
 }
 
 #[test]
+fn control_cannot_revoke_a_successor_capability_ancestor() {
+    let fixture = AuthorityFixture::new();
+    let directory = tempfile::tempdir().unwrap();
+    let store = fixture.bootstrap(directory.path());
+    let invalid = ControlTransition::issue(
+        fixture.domain,
+        1,
+        None,
+        0,
+        Vec::new(),
+        vec![fixture.owner.author()],
+        fixture.owner.author(),
+        fixture.delegate.author(),
+        fixture.delegate_capability.id().unwrap(),
+        [105; 32],
+        fixture.root.id().unwrap(),
+        [106; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+    assert!(matches!(
+        store.observe_control(&invalid),
+        Err(StoreError::InvalidAuthority(_))
+    ));
+    assert!(store.control_head(fixture.domain).unwrap().is_none());
+
+    let corrected = ControlTransition::issue(
+        fixture.domain,
+        1,
+        None,
+        0,
+        Vec::new(),
+        Vec::new(),
+        fixture.owner.author(),
+        fixture.delegate.author(),
+        fixture.delegate_capability.id().unwrap(),
+        [107; 32],
+        fixture.root.id().unwrap(),
+        [108; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+    store.apply_control(&corrected).unwrap();
+    assert_eq!(store.control_head(fixture.domain).unwrap(), Some(corrected));
+}
+
+#[test]
 fn rejected_control_bundle_leaves_capability_and_head_unchanged() {
     let fixture = AuthorityFixture::new();
     let directory = tempfile::tempdir().unwrap();
@@ -276,6 +324,334 @@ fn invitation_authority_import_is_atomic_and_activates_only_root_and_leaf() {
     assert!(
         valid_store
             .is_author_trusted(fixture.domain, fixture.delegate.author())
+            .unwrap()
+    );
+}
+
+#[test]
+fn revoking_an_issuer_invalidates_its_active_descendants() {
+    let fixture = AuthorityFixture::new();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    store
+        .bootstrap_domain(&fixture.descriptor, &fixture.root)
+        .unwrap();
+    let issuer = IrohSigner::from_secret_bytes([91; 32]);
+    let child = IrohSigner::from_secret_bytes([92; 32]);
+    let issuer_capability = fixture
+        .root
+        .delegate(
+            &fixture.owner,
+            issuer.author(),
+            PermissionSet::from_permissions(&[
+                Permission::Read,
+                Permission::Write,
+                Permission::Invite,
+            ]),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::Write]),
+            0,
+            None,
+            [93; 32],
+        )
+        .unwrap();
+    let child_capability = issuer_capability
+        .delegate(
+            &issuer,
+            child.author(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::Write]),
+            PermissionSet::empty(),
+            0,
+            None,
+            [94; 32],
+        )
+        .unwrap();
+    store.install_capability(&issuer_capability).unwrap();
+    store.install_capability(&child_capability).unwrap();
+    assert!(
+        store
+            .authorize_capability(
+                fixture.domain,
+                child.author(),
+                child_capability.id().unwrap(),
+                Permission::Write,
+                0,
+            )
+            .unwrap()
+    );
+    let revocation = ControlTransition::issue(
+        fixture.domain,
+        1,
+        None,
+        0,
+        Vec::new(),
+        vec![issuer.author()],
+        fixture.owner.author(),
+        fixture.owner.author(),
+        fixture.root.id().unwrap(),
+        [95; 32],
+        fixture.root.id().unwrap(),
+        [96; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+    store.apply_control(&revocation).unwrap();
+
+    assert!(
+        !store
+            .authorize_capability(
+                fixture.domain,
+                child.author(),
+                child_capability.id().unwrap(),
+                Permission::Write,
+                1,
+            )
+            .unwrap()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn subject_revocation_blocks_historical_replay_but_allows_fresh_anchor() {
+    let fixture = AuthorityFixture::new();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    store
+        .bootstrap_domain(&fixture.descriptor, &fixture.root)
+        .unwrap();
+    let subject = IrohSigner::from_secret_bytes([97; 32]);
+    let historical_child = IrohSigner::from_secret_bytes([111; 32]);
+    let permissions = PermissionSet::from_permissions(&[Permission::Read, Permission::Write]);
+    let historical = fixture
+        .root
+        .delegate(
+            &fixture.owner,
+            subject.author(),
+            permissions,
+            PermissionSet::from_permissions(&[Permission::Read]),
+            0,
+            None,
+            [98; 32],
+        )
+        .unwrap();
+    let historical_descendant = historical
+        .delegate(
+            &subject,
+            historical_child.author(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            0,
+            None,
+            [112; 32],
+        )
+        .unwrap();
+    let selected = fixture
+        .root
+        .delegate(
+            &fixture.owner,
+            subject.author(),
+            permissions,
+            PermissionSet::empty(),
+            0,
+            None,
+            [99; 32],
+        )
+        .unwrap();
+    let preissued_future = fixture
+        .root
+        .delegate_at_control(
+            &fixture.owner,
+            subject.author(),
+            permissions,
+            PermissionSet::empty(),
+            1,
+            Some([104; 32]),
+            1,
+            None,
+            [105; 32],
+        )
+        .unwrap();
+    store.install_capability(&selected).unwrap();
+    assert!(
+        store
+            .install_capability_chain_atomic(&[fixture.root.clone(), historical.clone()])
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .active_capability(fixture.domain, subject.author())
+            .unwrap(),
+        Some(selected.id().unwrap())
+    );
+    store
+        .install_capability_chain_atomic(&[
+            fixture.root.clone(),
+            historical.clone(),
+            historical_descendant,
+        ])
+        .unwrap();
+    let revocation = ControlTransition::issue(
+        fixture.domain,
+        1,
+        None,
+        0,
+        Vec::new(),
+        vec![subject.author()],
+        fixture.owner.author(),
+        fixture.owner.author(),
+        fixture.root.id().unwrap(),
+        [100; 32],
+        fixture.root.id().unwrap(),
+        [101; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+    store.apply_control(&revocation).unwrap();
+
+    assert!(
+        store
+            .install_capability_chain_atomic(&[fixture.root.clone(), historical])
+            .is_err()
+    );
+    assert!(
+        store
+            .install_capability_chain_atomic(&[fixture.root.clone(), preissued_future])
+            .is_err()
+    );
+    let fresh = fixture
+        .root
+        .delegate_at_control(
+            &fixture.owner,
+            subject.author(),
+            permissions,
+            PermissionSet::empty(),
+            1,
+            Some(revocation.id().unwrap()),
+            1,
+            None,
+            [102; 32],
+        )
+        .unwrap();
+    store
+        .install_capability_chain_atomic(&[fixture.root.clone(), fresh.clone()])
+        .unwrap();
+    assert!(
+        store
+            .authorize_capability(
+                fixture.domain,
+                subject.author(),
+                fresh.id().unwrap(),
+                Permission::Write,
+                1,
+            )
+            .unwrap()
+    );
+    let future = fixture
+        .root
+        .delegate_at_control(
+            &fixture.owner,
+            subject.author(),
+            permissions,
+            PermissionSet::empty(),
+            2,
+            Some([109; 32]),
+            1,
+            None,
+            [110; 32],
+        )
+        .unwrap();
+    assert!(
+        store
+            .install_capability_chain_atomic(&[fixture.root.clone(), future])
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .active_capability(fixture.domain, subject.author())
+            .unwrap(),
+        Some(fresh.id().unwrap())
+    );
+}
+
+#[test]
+fn corrupt_subject_revocation_index_fails_closed_and_repairs_from_control() {
+    const SUBJECT_REVOCATIONS: TableDefinition<'static, &[u8], u64> =
+        TableDefinition::new("subject_revocations_v1");
+    let fixture = AuthorityFixture::new();
+    let directory = tempfile::tempdir().unwrap();
+    let store = fixture.bootstrap(directory.path());
+    let historical = fixture
+        .root
+        .delegate(
+            &fixture.owner,
+            fixture.delegate.author(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            0,
+            None,
+            [106; 32],
+        )
+        .unwrap();
+    let revocation = ControlTransition::issue(
+        fixture.domain,
+        1,
+        None,
+        0,
+        Vec::new(),
+        vec![fixture.delegate.author()],
+        fixture.owner.author(),
+        fixture.owner.author(),
+        fixture.root.id().unwrap(),
+        [104; 32],
+        fixture.root.id().unwrap(),
+        [105; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+    store.apply_control(&revocation).unwrap();
+    assert!(
+        store
+            .subject_revocations_consistent(fixture.domain)
+            .unwrap()
+    );
+    drop(store);
+
+    let database = redb::Database::create(directory.path().join("meta.redb")).unwrap();
+    let write = database.begin_write().unwrap();
+    {
+        let mut table = write.open_table(SUBJECT_REVOCATIONS).unwrap();
+        let mut key = [0_u8; 64];
+        key[..32].copy_from_slice(fixture.domain.as_bytes());
+        key[32..].copy_from_slice(fixture.delegate.author().as_bytes());
+        table.remove(key.as_slice()).unwrap();
+    }
+    write.commit().unwrap();
+    drop(database);
+
+    let reopened = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    assert!(
+        !reopened
+            .subject_revocations_consistent(fixture.domain)
+            .unwrap()
+    );
+    assert!(matches!(
+        reopened.install_capability_chain_atomic(&[fixture.root.clone(), historical]),
+        Err(StoreError::CorruptDerivedMetadata(_))
+    ));
+    reopened.repair_subject_revocations(fixture.domain).unwrap();
+    assert!(
+        reopened
+            .subject_revocations_consistent(fixture.domain)
+            .unwrap()
+    );
+    assert!(
+        !reopened
+            .authorize_capability(
+                fixture.domain,
+                fixture.delegate.author(),
+                fixture.delegate_capability.id().unwrap(),
+                Permission::Read,
+                1,
+            )
             .unwrap()
     );
 }
