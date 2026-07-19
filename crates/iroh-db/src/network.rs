@@ -1287,7 +1287,7 @@ impl SyncCore {
                         self.db
                             .inner
                             .store
-                            .contains_commit(*dependency)
+                            .contains_commit(self.domain_id(), *dependency)
                             .unwrap_or(false)
                             || !pending.contains_key(dependency)
                     })

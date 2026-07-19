@@ -228,6 +228,62 @@ fn equivocation_commit(
     seal_commit(header, &body, &seed.domain_key(), &credentials.signer()).unwrap()
 }
 
+fn post_snapshot_equivocation_commit(
+    seed: &DomainSeed,
+    credentials: &LocalCredentials,
+    dependency: iroh_db::CommitId,
+    dependency_author: AuthorId,
+    text: &str,
+    variant: u8,
+) -> iroh_db::CommitEnvelope {
+    let author = credentials.signer().author();
+    let mut causal_text = Lww::new();
+    let mut context = VersionVector::new();
+    context.observe(Dot::new(dependency_author, 0, 0));
+    causal_text
+        .assign(text.into(), Dot::new(author, 0, 0), context)
+        .unwrap();
+    let canonical = Note {
+        id: "equivocated-after-snapshot".into(),
+        text: causal_text,
+    };
+    let schema = Note::schema().unwrap();
+    let record_id = canonical.record_id().unwrap();
+    let mutation = MaterializedRecord::upsert(
+        schema.clone(),
+        record_id.clone(),
+        canonical.encode_record().unwrap(),
+        canonical
+            .field_values(Note::text.field_id())
+            .unwrap()
+            .into_iter()
+            .map(|value| IndexValue::new(Note::text.field_id(), value))
+            .collect(),
+    )
+    .unwrap();
+    let operation = Operation::new(
+        schema.collection_id(),
+        record_id,
+        0,
+        OperationKind::FieldStateMerge,
+        mutation.encode_canonical().unwrap(),
+    )
+    .unwrap();
+    let body = CommitBody::new(TransactionId::from_bytes([variant; 32]), vec![operation]).unwrap();
+    let header = CommitHeader::new(
+        seed.domain_id(),
+        seed.epoch(),
+        author,
+        0,
+        vec![dependency],
+        CapabilityId::from_bytes([4; 32]),
+        vec![schema.schema_id()],
+        [variant; 24],
+    )
+    .unwrap();
+    seal_commit(header, &body, &seed.domain_key(), &credentials.signer()).unwrap()
+}
+
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn replicas_quarantine_equivocation_independently_of_receipt_order() {
@@ -335,6 +391,188 @@ async fn replicas_quarantine_equivocation_independently_of_receipt_order() {
     writer.close().await.unwrap();
     first.close().await.unwrap();
     second.close().await.unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn post_snapshot_equivocation_quarantine_preserves_baseline_state() {
+    let seed = DomainSeed::generate().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let reverse_receiver_dir = tempfile::tempdir().unwrap();
+    let writer_dir = tempfile::tempdir().unwrap();
+    let source = IrohDb::create_in_domain(source_dir.path(), &seed)
+        .await
+        .unwrap();
+    let receiver = IrohDb::create_in_domain(receiver_dir.path(), &seed)
+        .await
+        .unwrap();
+    let reverse_receiver = IrohDb::create_in_domain(reverse_receiver_dir.path(), &seed)
+        .await
+        .unwrap();
+    let writer = IrohDb::create_in_domain(writer_dir.path(), &seed)
+        .await
+        .unwrap();
+    source.trust_device(receiver.author_id()).unwrap();
+    source.trust_device(reverse_receiver.author_id()).unwrap();
+    receiver.trust_device(source.author_id()).unwrap();
+    receiver.trust_device(writer.author_id()).unwrap();
+    reverse_receiver.trust_device(source.author_id()).unwrap();
+    reverse_receiver.trust_device(writer.author_id()).unwrap();
+    let source_notes = source.collection::<Note>();
+    let receiver_notes = receiver.collection::<Note>();
+    let reverse_receiver_notes = reverse_receiver.collection::<Note>();
+    source_notes
+        .put(note("snapshot-base", "preserved", source.author_id()))
+        .await
+        .unwrap();
+    let base = source.commit_envelopes().await.unwrap().pop().unwrap();
+    let base_id = base.commit_id();
+    let snapshot = source.snapshot().await.unwrap();
+    let source_node = source.start_sync().await.unwrap();
+    let receiver_node = receiver.start_sync().await.unwrap();
+    let reverse_receiver_node = reverse_receiver.start_sync().await.unwrap();
+    receiver_node
+        .bootstrap_from(source_node.addr(), snapshot)
+        .await
+        .unwrap();
+    reverse_receiver_node
+        .bootstrap_from(source_node.addr(), snapshot)
+        .await
+        .unwrap();
+    let baseline_root = receiver.state_root().unwrap();
+    assert_eq!(reverse_receiver.state_root().unwrap(), baseline_root);
+    source_node.shutdown().await.unwrap();
+    receiver_node.shutdown().await.unwrap();
+    reverse_receiver_node.shutdown().await.unwrap();
+
+    let credentials = LocalCredentials::load_or_create(writer_dir.path().join("keys")).unwrap();
+    let left = post_snapshot_equivocation_commit(
+        &seed,
+        &credentials,
+        base_id,
+        source.author_id(),
+        "left",
+        21,
+    );
+    let right = post_snapshot_equivocation_commit(
+        &seed,
+        &credentials,
+        base_id,
+        source.author_id(),
+        "right",
+        22,
+    );
+    assert!(matches!(
+        receiver
+            .accept_remote_commit(writer.author_id(), left.clone())
+            .await
+            .unwrap(),
+        RemoteApply::Applied(_)
+    ));
+    assert!(matches!(
+        receiver
+            .accept_remote_commit(writer.author_id(), right.clone())
+            .await
+            .unwrap(),
+        RemoteApply::Quarantined { author, sequence: 0 } if author == writer.author_id()
+    ));
+    assert!(matches!(
+        reverse_receiver
+            .accept_remote_commit(writer.author_id(), right.clone())
+            .await
+            .unwrap(),
+        RemoteApply::Applied(_)
+    ));
+    assert!(matches!(
+        reverse_receiver
+            .accept_remote_commit(writer.author_id(), left.clone())
+            .await
+            .unwrap(),
+        RemoteApply::Quarantined { author, sequence: 0 } if author == writer.author_id()
+    ));
+
+    assert_eq!(receiver.state_root().unwrap(), baseline_root);
+    assert_eq!(reverse_receiver.state_root().unwrap(), baseline_root);
+    assert!(
+        receiver_notes
+            .get(&"snapshot-base".to_owned())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reverse_receiver_notes
+            .get(&"snapshot-base".to_owned())
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    source_notes
+        .put(note(
+            "post-quarantine",
+            "sequence-floor",
+            source.author_id(),
+        ))
+        .await
+        .unwrap();
+    let tail = source
+        .commit_envelopes()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|commit| commit.header().author_sequence() == 1)
+        .unwrap();
+    assert!(matches!(
+        receiver
+            .accept_remote_commit(source.author_id(), tail.clone())
+            .await
+            .unwrap(),
+        RemoteApply::Applied(_)
+    ));
+    assert!(matches!(
+        reverse_receiver
+            .accept_remote_commit(source.author_id(), tail)
+            .await
+            .unwrap(),
+        RemoteApply::Applied(_)
+    ));
+    let expected_root = source.state_root().unwrap();
+    assert_eq!(receiver.state_root().unwrap(), expected_root);
+    assert_eq!(reverse_receiver.state_root().unwrap(), expected_root);
+    drop(source_notes);
+    drop(receiver_notes);
+    drop(reverse_receiver_notes);
+    writer.close().await.unwrap();
+    source.close().await.unwrap();
+    receiver.close().await.unwrap();
+    reverse_receiver.close().await.unwrap();
+
+    for directory in [&receiver_dir, &reverse_receiver_dir] {
+        let reopened_device = IrohDb::open(directory.path()).await.unwrap();
+        let reopened = reopened_device.domain(seed.domain_id()).unwrap();
+        let notes = reopened.collection::<Note>();
+        assert!(reopened.verify().await.unwrap().derived_consistent());
+        assert_eq!(reopened.state_root().unwrap(), expected_root);
+        assert!(
+            notes
+                .get(&"snapshot-base".to_owned())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            notes
+                .get(&"post-quarantine".to_owned())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(notes);
+        drop(reopened);
+        reopened_device.close().await.unwrap();
+    }
 }
 
 #[tokio::test]

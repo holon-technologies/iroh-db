@@ -1,7 +1,14 @@
 use iroh_db::{
-    AuthorId, BackupOptions, Dot, IrohDb, IrohRecord, Lww, VersionVector, backup_closed,
-    restore_backup,
+    AuthorId, BackupOptions, ConsistencyMode, DomainId, Dot, IrohDb, IrohRecord, Lww, Permission,
+    PermissionSet, VersionVector, backup_closed, restore_backup,
 };
+use redb::{ReadableTable as _, TableDefinition};
+
+const RECORDS: TableDefinition<'static, &[u8], &[u8]> = TableDefinition::new("records_v1");
+const SNAPSHOT_COVERAGE: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("snapshot_coverage_v1");
+const SNAPSHOT_BASELINES: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("snapshot_baselines_v1");
 
 #[derive(Debug, Clone, PartialEq, Eq, IrohRecord)]
 #[iroh_db(collection = "operations-notes", version = 1)]
@@ -24,6 +31,66 @@ fn note(author: AuthorId) -> Note {
         id: "backup".into(),
         text,
     }
+}
+
+fn corrupt_first_record(path: &std::path::Path) {
+    let database = redb::Database::create(path.join("meta.redb")).unwrap();
+    let write = database.begin_write().unwrap();
+    {
+        let mut records = write.open_table(RECORDS).unwrap();
+        let key = records
+            .iter()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .0
+            .value()
+            .to_vec();
+        let corrupted = Note {
+            id: "base".into(),
+            text: note(AuthorId::from_bytes([199; 32])).text,
+        }
+        .encode_record()
+        .unwrap();
+        records
+            .insert(key.as_slice(), corrupted.as_slice())
+            .unwrap();
+    }
+    write.commit().unwrap();
+}
+
+fn mutate_snapshot_metadata(path: &std::path::Path, domain_id: DomainId, remove_baseline: bool) {
+    let database = redb::Database::create(path.join("meta.redb")).unwrap();
+    let write = database.begin_write().unwrap();
+    if remove_baseline {
+        write
+            .open_table(SNAPSHOT_COVERAGE)
+            .unwrap()
+            .remove([201; 32].as_slice())
+            .unwrap();
+        write
+            .open_table(SNAPSHOT_BASELINES)
+            .unwrap()
+            .remove(domain_id.as_bytes().as_slice())
+            .unwrap();
+    } else {
+        write
+            .open_table(SNAPSHOT_COVERAGE)
+            .unwrap()
+            .insert([201; 32].as_slice(), domain_id.as_bytes().as_slice())
+            .unwrap();
+    }
+    write.commit().unwrap();
+}
+
+async fn assert_snapshot_verification_fails(path: &std::path::Path, domain_id: DomainId) {
+    let device = IrohDb::open(path).await.unwrap();
+    let domain = device.domain(domain_id).unwrap();
+    domain.collection::<Note>();
+    assert!(domain.verify().await.is_err());
+    drop(domain);
+    device.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -76,4 +143,91 @@ fn restore_rejects_tampered_backup_before_creating_destination() {
     std::fs::write(backup.join("payload"), b"tampered").unwrap();
     assert!(restore_backup(&backup, &restored).is_err());
     assert!(!restored.exists());
+}
+
+#[tokio::test]
+async fn verify_and_repair_reconstruct_snapshot_baseline_plus_tail() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_device = IrohDb::open(source_dir.path()).await.unwrap();
+    let target_device = IrohDb::open(target_dir.path()).await.unwrap();
+    let source = source_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = source
+        .invite(
+            target_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::FetchBlobs]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let target = target_device.import_invitation(&invitation).unwrap();
+    let domain_id = invitation.descriptor().domain_id();
+    let source_notes = source.collection::<Note>();
+    let target_notes = target.collection::<Note>();
+    source_notes
+        .put(Note {
+            id: "base".into(),
+            text: note(source.author_id()).text,
+        })
+        .await
+        .unwrap();
+    let snapshot = source.snapshot().await.unwrap();
+    let source_node = source.start_sync().await.unwrap();
+    let target_node = target.start_sync().await.unwrap();
+    target_node
+        .bootstrap_from(source_node.addr(), snapshot)
+        .await
+        .unwrap();
+    source_notes
+        .put(Note {
+            id: "tail".into(),
+            text: note(source.author_id()).text,
+        })
+        .await
+        .unwrap();
+    target_node.sync_with(source_node.addr()).await.unwrap();
+    let expected_root = source.state_root().unwrap();
+    source_node.shutdown().await.unwrap();
+    target_node.shutdown().await.unwrap();
+    drop(source_notes);
+    drop(target_notes);
+    drop(source);
+    drop(target);
+    source_device.close().await.unwrap();
+    target_device.close().await.unwrap();
+
+    corrupt_first_record(target_dir.path());
+
+    let reopened_device = IrohDb::open(target_dir.path()).await.unwrap();
+    let reopened = reopened_device.domain(domain_id).unwrap();
+    let reopened_notes = reopened.collection::<Note>();
+    let verification = reopened.verify().await.unwrap();
+    assert!(!verification.derived_consistent());
+    let repaired = reopened.repair().await.unwrap();
+    assert!(repaired.derived_consistent());
+    assert_eq!(repaired.state_root(), expected_root);
+    assert!(
+        reopened_notes
+            .get(&"base".to_owned())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        reopened_notes
+            .get(&"tail".to_owned())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    drop(reopened_notes);
+    drop(reopened);
+    reopened_device.close().await.unwrap();
+
+    mutate_snapshot_metadata(target_dir.path(), domain_id, false);
+    assert_snapshot_verification_fails(target_dir.path(), domain_id).await;
+    mutate_snapshot_metadata(target_dir.path(), domain_id, true);
+    assert_snapshot_verification_fails(target_dir.path(), domain_id).await;
 }

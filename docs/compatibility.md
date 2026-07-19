@@ -2,10 +2,12 @@
 
 The current release is pre-1.0 but its durable and wire formats are explicitly versioned.
 
-- Store format: `iroh-db 4.0` in `FORMAT`; unknown formats fail closed. The
-  pre-release 1.0 through 3.0 development formats are intentionally rejected
-  rather than reinterpreted in place. Format 4 adds signed authority-checkpoint
-  baselines for current-state bootstrap after rotation.
+- Store format: `iroh-db 5.0` in `FORMAT`; unknown formats fail closed. The
+  pre-release 1.0 through 4.0 development formats are intentionally rejected
+  rather than reinterpreted in place. Format 5 retains both signed
+  authority-checkpoint evidence and a canonical reference to the authenticated
+  snapshot baseline, allowing snapshot-plus-tail verification, repair, and
+  quarantine recovery after restart.
 - Sync ALPN: `/iroh-db/sync/2`; authority reconciliation precedes commit-tail
   exchange. It is intentionally incompatible with the pre-release
   `/iroh-db/sync/1` frame sequence, which cannot authenticate a lagging member

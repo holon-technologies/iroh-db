@@ -9,3 +9,4 @@ All notable changes are documented here. The project follows semantic versioning
 - Signed capability domains, invitations, epoch rotation/revocation, device groups, and projection sharing.
 - Lazy multi-provider encrypted blob streaming with seek, retry, prefetch, and transfer counters.
 - Verification, repair, checksummed backup/restore, operational metrics, CLI, CI, fuzz targets, and churn/soak harnesses.
+- Durable authenticated snapshot baselines make verification, repair, and equivocation quarantine reconstruct snapshot-plus-tail state without trusting mutable materialized tables.

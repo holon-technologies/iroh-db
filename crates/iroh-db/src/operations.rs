@@ -110,6 +110,12 @@ impl IrohDb {
 
     /// Verifies content hashes, signatures, encryption, dependency presence, and rebuild equality.
     pub async fn verify(&self) -> Result<VerificationReport, DbError> {
+        let _control_reader = self.inner.control_gate.read().await;
+        let _writer = self.inner.writer.lock().await;
+        self.verify_unlocked().await
+    }
+
+    async fn verify_unlocked(&self) -> Result<VerificationReport, DbError> {
         if !self
             .inner
             .store
@@ -141,7 +147,11 @@ impl IrohDb {
                 .domain_key();
             open_commit(&envelope, &key)?;
             for dependency in envelope.header().dependencies() {
-                if !self.inner.store.contains_commit(*dependency)? {
+                if !self
+                    .inner
+                    .store
+                    .contains_commit(self.domain_id(), *dependency)?
+                {
                     return Err(DbError::Operation(format!(
                         "commit dependency is absent: {dependency}"
                     )));
@@ -150,11 +160,7 @@ impl IrohDb {
         }
         let orphans = self.inner.store.scan_commit_orphans().await?;
         let current = canonical_records(self.inner.store.export_materialized(self.domain_id())?)?;
-        let derived_consistent = if self.inner.store.has_snapshot_coverage(self.domain_id())? {
-            true
-        } else {
-            canonical_records(self.rebuild_mutations().await?)? == current
-        };
+        let derived_consistent = canonical_records(self.rebuild_mutations().await?)? == current;
         Ok(VerificationReport {
             commits: commit_ids.len(),
             orphan_commits: orphans.len(),
@@ -165,6 +171,8 @@ impl IrohDb {
 
     /// Rebuilds typed materialized state in memory and swaps it in one metadata transaction.
     pub async fn repair(&self) -> Result<VerificationReport, DbError> {
+        let _control_reader = self.inner.control_gate.read().await;
+        let _writer = self.inner.writer.lock().await;
         let rebuilt = self.rebuild_mutations().await?;
         self.inner
             .store
@@ -172,11 +180,13 @@ impl IrohDb {
         self.inner
             .store
             .replace_materialized(self.domain_id(), &rebuilt)?;
-        self.verify().await
+        self.verify_unlocked().await
     }
 
     /// Rewrites existing materialized/index tables atomically when application record types are absent.
     pub async fn repair_indexes(&self) -> Result<VerificationReport, DbError> {
+        let _control_reader = self.inner.control_gate.read().await;
+        let _writer = self.inner.writer.lock().await;
         let exported = self.inner.store.export_materialized(self.domain_id())?;
         self.inner
             .store
@@ -184,7 +194,7 @@ impl IrohDb {
         self.inner
             .store
             .replace_materialized(self.domain_id(), &exported)?;
-        self.verify().await
+        self.verify_unlocked().await
     }
 }
 

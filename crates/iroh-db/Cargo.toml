@@ -28,6 +28,7 @@ thiserror.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+redb.workspace = true
 tempfile = "3.27.0"
 
 [lints]

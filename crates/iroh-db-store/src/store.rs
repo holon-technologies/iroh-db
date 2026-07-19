@@ -18,11 +18,16 @@ use redb::{Database, ReadableDatabase as _, ReadableTable as _, TableDefinition}
 
 use crate::{BlobStore, BlobStoreError, IndexValue, MaterializedRecord, StoredRecord};
 
-const FORMAT_CONTENTS: &str = "iroh-db 4.0\n";
+const FORMAT_CONTENTS: &str = "iroh-db 5.0\n";
+const SNAPSHOT_BASELINE_VERSION: u16 = 1;
+const MAX_SNAPSHOT_BASELINE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_BASELINE_ENTRIES: usize = 65_536;
 const COMMIT_METADATA: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("commit_metadata_v1");
 const SNAPSHOT_COVERAGE: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("snapshot_coverage_v1");
+const SNAPSHOT_BASELINES: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("snapshot_baselines_v1");
 const BLOB_OWNERSHIP: TableDefinition<'static, &[u8], u8> =
     TableDefinition::new("blob_ownership_v1");
 const AUTHOR_SEQUENCES: TableDefinition<'static, &[u8], u64> =
@@ -200,6 +205,109 @@ pub enum StoreError {
     },
 }
 
+/// Canonical durable reference to the immutable signed snapshot used as a history baseline.
+#[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
+#[cbor(array)]
+pub struct SnapshotBaseline {
+    #[n(0)]
+    version: u16,
+    #[n(1)]
+    domain_id: DomainId,
+    #[n(2)]
+    epoch: u64,
+    #[n(3)]
+    manifest_hash: BlobHash,
+    #[n(4)]
+    state_root: [u8; 32],
+    #[n(5)]
+    frontier: Vec<CommitId>,
+    #[n(6)]
+    author_sequences: Vec<(AuthorId, u64)>,
+}
+
+impl SnapshotBaseline {
+    pub fn new(
+        domain_id: DomainId,
+        epoch: u64,
+        manifest_hash: BlobHash,
+        state_root: [u8; 32],
+        frontier: Vec<CommitId>,
+        author_sequences: Vec<(AuthorId, u64)>,
+    ) -> Result<Self, StoreError> {
+        let baseline = Self {
+            version: SNAPSHOT_BASELINE_VERSION,
+            domain_id,
+            epoch,
+            manifest_hash,
+            state_root,
+            frontier,
+            author_sequences,
+        };
+        baseline.validate()?;
+        Ok(baseline)
+    }
+
+    pub const fn domain_id(&self) -> DomainId {
+        self.domain_id
+    }
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub const fn manifest_hash(&self) -> BlobHash {
+        self.manifest_hash
+    }
+    pub const fn state_root(&self) -> [u8; 32] {
+        self.state_root
+    }
+    pub fn frontier(&self) -> &[CommitId] {
+        &self.frontier
+    }
+    pub fn author_sequences(&self) -> &[(AuthorId, u64)] {
+        &self.author_sequences
+    }
+
+    fn encode_canonical(&self) -> Result<Vec<u8>, StoreError> {
+        minicbor::to_vec(self).map_err(|error| StoreError::Database(error.to_string()))
+    }
+
+    fn decode_canonical(bytes: &[u8]) -> Result<Self, StoreError> {
+        if bytes.len() > MAX_SNAPSHOT_BASELINE_BYTES {
+            return Err(StoreError::CorruptDerivedMetadata(
+                "snapshot baseline exceeds encoded size limit".into(),
+            ));
+        }
+        let mut decoder = minicbor::Decoder::new(bytes);
+        let baseline: Self = decoder.decode().map_err(|error| {
+            StoreError::CorruptDerivedMetadata(format!("snapshot baseline: {error}"))
+        })?;
+        baseline.validate()?;
+        if decoder.position() != bytes.len() || baseline.encode_canonical()? != bytes {
+            return Err(StoreError::CorruptDerivedMetadata(
+                "snapshot baseline is not canonical".into(),
+            ));
+        }
+        Ok(baseline)
+    }
+
+    fn validate(&self) -> Result<(), StoreError> {
+        if self.version != SNAPSHOT_BASELINE_VERSION
+            || self.frontier.len() > MAX_SNAPSHOT_BASELINE_ENTRIES
+            || self.author_sequences.len() > MAX_SNAPSHOT_BASELINE_ENTRIES
+            || !strictly_sorted(&self.frontier)
+            || !self
+                .author_sequences
+                .windows(2)
+                .all(|pair| pair[0].0 < pair[1].0)
+            || self.frontier.is_empty() != self.author_sequences.is_empty()
+        {
+            return Err(StoreError::InvalidSnapshotMetadata(
+                "snapshot recovery baseline is malformed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Transactional metadata paired with an immutable content-addressed blob repository.
 #[derive(Clone)]
 pub struct Store {
@@ -298,6 +406,9 @@ impl Store {
             let coverage = write
                 .open_table(SNAPSHOT_COVERAGE)
                 .map_err(database_error)?;
+            let quarantined = write
+                .open_table(QUARANTINED_COMMITS)
+                .map_err(database_error)?;
             if commits
                 .get(commit_id.as_bytes().as_slice())
                 .map_err(database_error)?
@@ -307,15 +418,13 @@ impl Store {
             }
 
             for dependency in envelope.header().dependencies() {
-                let stored = commits
-                    .get(dependency.as_bytes().as_slice())
-                    .map_err(database_error)?
-                    .is_some();
-                let snapshotted = coverage
-                    .get(dependency.as_bytes().as_slice())
-                    .map_err(database_error)?
-                    .is_some();
-                if !stored && !snapshotted {
+                if !dependency_is_accepted(
+                    &commits,
+                    &coverage,
+                    &quarantined,
+                    envelope.header().domain_id(),
+                    *dependency,
+                )? {
                     return Err(StoreError::MissingDependency(*dependency));
                 }
             }
@@ -407,7 +516,7 @@ impl Store {
                 from_sequence,
             });
         }
-        if self.contains_commit(commit_id)? {
+        if self.contains_commit(envelope.header().domain_id(), commit_id)? {
             return Ok(CommitPreflight::Duplicate(commit_id));
         }
         if let Some(existing) = self.accepted_author_commit(
@@ -432,19 +541,23 @@ impl Store {
             self.author_head(envelope.header().domain_id(), envelope.header().author())?;
         if let Some(previous) = previous_author_head
             && !self
-                .dependencies_include_ancestor(envelope.header().dependencies(), previous)
+                .dependencies_include_ancestor(
+                    envelope.header().domain_id(),
+                    envelope.header().dependencies(),
+                    previous,
+                )
                 .await?
         {
             return Err(StoreError::AuthorChainMissing { previous });
         }
-        if previous_author_head.is_none()
-            && self
-                .last_sequence(envelope.header().domain_id(), envelope.header().author())?
-                .is_some()
-        {
-            for frontier in self.frontier(envelope.header().domain_id())? {
+        if let Some(baseline) = self.snapshot_baseline(envelope.header().domain_id())? {
+            for &frontier in baseline.frontier() {
                 if !self
-                    .dependencies_include_ancestor(envelope.header().dependencies(), frontier)
+                    .dependencies_include_ancestor(
+                        envelope.header().domain_id(),
+                        envelope.header().dependencies(),
+                        frontier,
+                    )
                     .await?
                 {
                     return Err(StoreError::SnapshotBaselineMissing { frontier });
@@ -457,7 +570,11 @@ impl Store {
     }
 
     /// Returns whether commit metadata is accepted locally.
-    pub fn contains_commit(&self, commit_id: CommitId) -> Result<bool, StoreError> {
+    pub fn contains_commit(
+        &self,
+        domain_id: DomainId,
+        commit_id: CommitId,
+    ) -> Result<bool, StoreError> {
         let read = self.inner.database.begin_read().map_err(database_error)?;
         let commits = read.open_table(COMMIT_METADATA).map_err(database_error)?;
         let coverage = read.open_table(SNAPSHOT_COVERAGE).map_err(database_error)?;
@@ -467,7 +584,7 @@ impl Store {
         let stored = commits
             .get(commit_id.as_bytes().as_slice())
             .map_err(database_error)?
-            .is_some()
+            .is_some_and(|metadata| metadata.value().starts_with(domain_id.as_bytes()))
             && quarantined
                 .get(commit_id.as_bytes().as_slice())
                 .map_err(database_error)?
@@ -475,7 +592,7 @@ impl Store {
         let snapshotted = coverage
             .get(commit_id.as_bytes().as_slice())
             .map_err(database_error)?
-            .is_some();
+            .is_some_and(|covered_domain| covered_domain.value() == domain_id.as_bytes());
         Ok(stored || snapshotted)
     }
 
@@ -565,6 +682,7 @@ impl Store {
         evidence: &CommitEnvelope,
         invalid_commits: &[CommitId],
         accepted_frontier: &[CommitId],
+        author_sequences: &[(AuthorId, u64)],
         author_heads: &[(AuthorId, u64, CommitId)],
         records: &[MaterializedRecord],
     ) -> Result<(), StoreError> {
@@ -621,11 +739,14 @@ impl Store {
             for key in keys {
                 heads.remove(key.as_slice()).map_err(database_error)?;
             }
-            for (author, sequence, commit_id) in author_heads {
+            for (author, sequence) in author_sequences {
                 let key = author_sequence_key(domain_id, *author);
                 sequences
                     .insert(key.as_slice(), *sequence)
                     .map_err(database_error)?;
+            }
+            for (author, _, commit_id) in author_heads {
+                let key = author_sequence_key(domain_id, *author);
                 heads
                     .insert(key.as_slice(), commit_id.as_bytes().as_slice())
                     .map_err(database_error)?;
@@ -687,6 +808,7 @@ impl Store {
 
     async fn dependencies_include_ancestor(
         &self,
+        domain_id: DomainId,
         dependencies: &[CommitId],
         ancestor: CommitId,
     ) -> Result<bool, StoreError> {
@@ -700,8 +822,13 @@ impl Store {
                 continue;
             }
             match self.load_commit(commit_id).await {
-                Ok(envelope) => pending.extend_from_slice(envelope.header().dependencies()),
-                Err(StoreError::MissingCommitBlob(_)) if self.contains_commit(commit_id)? => {
+                Ok(envelope) if envelope.header().domain_id() == domain_id => {
+                    pending.extend_from_slice(envelope.header().dependencies());
+                }
+                Ok(_) => return Ok(false),
+                Err(StoreError::MissingCommitBlob(_))
+                    if self.contains_commit(domain_id, commit_id)? =>
+                {
                     // Snapshot-covered history is trusted as an opaque causal baseline.
                 }
                 Err(error) => return Err(error),
@@ -844,15 +971,55 @@ impl Store {
 
     /// Returns whether this domain relies on snapshot-covered commit history.
     pub fn has_snapshot_coverage(&self, domain_id: DomainId) -> Result<bool, StoreError> {
+        Ok(!self.snapshot_coverage(domain_id)?.is_empty())
+    }
+
+    /// Lists the exact opaque commit IDs represented by the installed snapshot.
+    pub fn snapshot_coverage(&self, domain_id: DomainId) -> Result<Vec<CommitId>, StoreError> {
         let read = self.inner.database.begin_read().map_err(database_error)?;
         let coverage = read.open_table(SNAPSHOT_COVERAGE).map_err(database_error)?;
+        let mut commits = Vec::new();
         for entry in coverage.iter().map_err(database_error)? {
-            let (_, value) = entry.map_err(database_error)?;
+            let (key, value) = entry.map_err(database_error)?;
             if value.value() == domain_id.as_bytes() {
-                return Ok(true);
+                let commit_id = key.value().try_into().map_err(|_| {
+                    StoreError::CorruptDerivedMetadata("coverage commit ID is invalid".into())
+                })?;
+                commits.push(CommitId::from_bytes(commit_id));
             }
         }
-        Ok(false)
+        commits.sort_unstable();
+        if commits.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(StoreError::CorruptDerivedMetadata(
+                "snapshot coverage contains duplicate commits".into(),
+            ));
+        }
+        Ok(commits)
+    }
+
+    /// Loads the immutable snapshot recovery baseline for a compacted domain.
+    pub fn snapshot_baseline(
+        &self,
+        domain_id: DomainId,
+    ) -> Result<Option<SnapshotBaseline>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let baselines = read
+            .open_table(SNAPSHOT_BASELINES)
+            .map_err(database_error)?;
+        let baseline = baselines
+            .get(domain_id.as_bytes().as_slice())
+            .map_err(database_error)?
+            .map(|bytes| SnapshotBaseline::decode_canonical(bytes.value()))
+            .transpose()?;
+        if baseline
+            .as_ref()
+            .is_some_and(|baseline| baseline.domain_id() != domain_id)
+        {
+            return Err(StoreError::CorruptDerivedMetadata(
+                "snapshot baseline crosses domains".into(),
+            ));
+        }
+        Ok(baseline)
     }
 
     /// Idempotently records local ownership of an immutable blob by one security domain.
@@ -1050,25 +1217,32 @@ impl Store {
         covered_commits: &[CommitId],
         frontier_commits: &[CommitId],
         author_sequences: &[(AuthorId, u64)],
+        baseline: &SnapshotBaseline,
     ) -> Result<(), StoreError> {
         validate_snapshot_metadata(records, covered_commits, frontier_commits, author_sequences)?;
+        if baseline.domain_id() != domain_id
+            || baseline.frontier() != frontier_commits
+            || baseline.author_sequences() != author_sequences
+        {
+            return Err(StoreError::InvalidSnapshotMetadata(
+                "snapshot recovery baseline differs from signed metadata".into(),
+            ));
+        }
+        let baseline_bytes = baseline.encode_canonical()?;
         let write = self.inner.database.begin_write().map_err(database_error)?;
         clear_materialized_domain(&write, domain_id)?;
         clear_domain_snapshot_metadata(&write, domain_id)?;
         apply_materialized_records(&write, domain_id, records)?;
         {
-            let commits = write.open_table(COMMIT_METADATA).map_err(database_error)?;
+            write
+                .open_table(SNAPSHOT_BASELINES)
+                .map_err(database_error)?
+                .insert(domain_id.as_bytes().as_slice(), baseline_bytes.as_slice())
+                .map_err(database_error)?;
             let mut coverage = write
                 .open_table(SNAPSHOT_COVERAGE)
                 .map_err(database_error)?;
             for commit_id in covered_commits {
-                if commits
-                    .get(commit_id.as_bytes().as_slice())
-                    .map_err(database_error)?
-                    .is_some()
-                {
-                    continue;
-                }
                 coverage
                     .insert(
                         commit_id.as_bytes().as_slice(),
@@ -1137,7 +1311,9 @@ impl Store {
                 continue;
             };
             let commit_id = envelope.commit_id();
-            if commit_id.to_bytes() == hash.to_bytes() && !self.contains_commit(commit_id)? {
+            if commit_id.to_bytes() == hash.to_bytes()
+                && !self.contains_commit(envelope.header().domain_id(), commit_id)?
+            {
                 orphans.push(commit_id);
             }
         }
@@ -2511,6 +2687,26 @@ impl Store {
     }
 }
 
+fn dependency_is_accepted(
+    commits: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+    coverage: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+    quarantined: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+    domain_id: DomainId,
+    dependency: CommitId,
+) -> Result<bool, StoreError> {
+    let key = dependency.as_bytes().as_slice();
+    let stored = commits
+        .get(key)
+        .map_err(database_error)?
+        .is_some_and(|metadata| metadata.value().starts_with(domain_id.as_bytes()))
+        && quarantined.get(key).map_err(database_error)?.is_none();
+    let snapshotted = coverage
+        .get(key)
+        .map_err(database_error)?
+        .is_some_and(|domain| domain.value() == domain_id.as_bytes());
+    Ok(stored || snapshotted)
+}
+
 fn validate_snapshot_metadata(
     records: &[MaterializedRecord],
     covered_commits: &[CommitId],
@@ -2566,6 +2762,9 @@ fn initialize_tables(database: &Database) -> Result<(), StoreError> {
     write.open_table(COMMIT_METADATA).map_err(database_error)?;
     write
         .open_table(SNAPSHOT_COVERAGE)
+        .map_err(database_error)?;
+    write
+        .open_table(SNAPSHOT_BASELINES)
         .map_err(database_error)?;
     write.open_table(BLOB_OWNERSHIP).map_err(database_error)?;
     write.open_table(AUTHOR_SEQUENCES).map_err(database_error)?;
@@ -2934,6 +3133,11 @@ fn clear_domain_snapshot_metadata(
     write: &redb::WriteTransaction,
     domain_id: DomainId,
 ) -> Result<(), StoreError> {
+    write
+        .open_table(SNAPSHOT_BASELINES)
+        .map_err(database_error)?
+        .remove(domain_id.as_bytes().as_slice())
+        .map_err(database_error)?;
     {
         let mut coverage = write
             .open_table(SNAPSHOT_COVERAGE)

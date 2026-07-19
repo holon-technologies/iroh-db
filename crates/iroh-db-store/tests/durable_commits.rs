@@ -11,7 +11,8 @@ use iroh_db_core::{
 };
 use iroh_db_security::{DomainKey, IrohSigner, seal_commit};
 use iroh_db_store::{
-    ApplyOutcome, BlobStore, BlobStoreError, IndexValue, MaterializedRecord, Store, StoreError,
+    ApplyOutcome, BlobStore, BlobStoreError, IndexValue, MaterializedRecord, SnapshotBaseline,
+    Store, StoreError,
 };
 
 #[derive(Default)]
@@ -57,6 +58,16 @@ impl BlobStore for MemoryBlobs {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<BlobHash>, BlobStoreError>> + Send + 'a>> {
         Box::pin(async move { Ok(self.blobs.lock().unwrap().keys().copied().collect()) })
     }
+}
+
+#[test]
+fn format_four_is_rejected_instead_of_implicitly_migrated() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("FORMAT"), "iroh-db 4.0\n").unwrap();
+    assert!(matches!(
+        Store::open(directory.path(), Arc::new(MemoryBlobs::default())),
+        Err(StoreError::UnsupportedFormat)
+    ));
 }
 
 fn id(byte: u8) -> [u8; 32] {
@@ -155,7 +166,7 @@ async fn commits_are_blob_first_atomic_idempotent_and_reopenable() {
         ApplyOutcome::Applied(first_id)
     );
     assert!(blobs.contains(BlobHash::from_bytes(first_id.to_bytes())));
-    assert!(store.contains_commit(first_id).unwrap());
+    assert!(store.contains_commit(domain, first_id).unwrap());
     assert_eq!(
         store.last_sequence(domain, signer.author()).unwrap(),
         Some(0)
@@ -176,8 +187,8 @@ async fn commits_are_blob_first_atomic_idempotent_and_reopenable() {
     drop(store);
 
     let reopened = Store::open(directory.path(), blobs).unwrap();
-    assert!(reopened.contains_commit(first_id).unwrap());
-    assert!(reopened.contains_commit(second_id).unwrap());
+    assert!(reopened.contains_commit(domain, first_id).unwrap());
+    assert!(reopened.contains_commit(domain, second_id).unwrap());
     assert_eq!(
         reopened.last_sequence(domain, signer.author()).unwrap(),
         Some(1)
@@ -220,7 +231,7 @@ async fn blob_failure_or_sequence_gap_never_mutates_metadata() {
         store.persist_commit(&first).await,
         Err(StoreError::Blob(_))
     ));
-    assert!(!store.contains_commit(first_id).unwrap());
+    assert!(!store.contains_commit(domain, first_id).unwrap());
 
     blobs.set_fail_put(false);
     let gap = commit(&signer, &key, domain, 2, Vec::new());
@@ -231,7 +242,7 @@ async fn blob_failure_or_sequence_gap_never_mutates_metadata() {
             actual: 2,
         })
     );
-    assert!(!store.contains_commit(gap.commit_id()).unwrap());
+    assert!(!store.contains_commit(domain, gap.commit_id()).unwrap());
     assert_eq!(store.last_sequence(domain, signer.author()).unwrap(), None);
 }
 
@@ -257,7 +268,7 @@ async fn next_author_sequence_must_extend_its_previous_commit() {
             previous: first.commit_id(),
         })
     );
-    assert!(!store.contains_commit(detached.commit_id()).unwrap());
+    assert!(!store.contains_commit(domain, detached.commit_id()).unwrap());
     assert_eq!(
         store.last_sequence(domain, first_author.author()).unwrap(),
         Some(0)
@@ -397,7 +408,7 @@ async fn records_schemas_and_indexes_publish_atomically_with_commit_metadata() {
         store.persist_commit_with_records(&second, &[invalid]).await,
         Err(StoreError::SchemaMismatch { .. })
     ));
-    assert!(!store.contains_commit(second.commit_id()).unwrap());
+    assert!(!store.contains_commit(domain, second.commit_id()).unwrap());
     assert_eq!(
         store
             .get_record(domain, schema.collection_id(), &record_id)
@@ -418,6 +429,17 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
     let outside_coverage = CommitId::from_bytes(id(99));
     let store = Store::open(directory.path(), blobs).unwrap();
     store.persist_commit(&accepted).await.unwrap();
+    let baseline = |frontier: Vec<CommitId>, author_sequences: Vec<(AuthorId, u64)>| {
+        SnapshotBaseline::new(
+            domain,
+            0,
+            BlobHash::from_bytes(id(88)),
+            id(89),
+            frontier,
+            author_sequences,
+        )
+        .unwrap()
+    };
 
     assert!(
         store
@@ -427,6 +449,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id],
                 &[outside_coverage],
                 &[(signer.author(), 0)],
+                &baseline(vec![outside_coverage], vec![(signer.author(), 0)]),
             )
             .is_err()
     );
@@ -440,6 +463,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id, accepted_id],
                 &[accepted_id],
                 &[(signer.author(), 0)],
+                &baseline(vec![accepted_id], vec![(signer.author(), 0)]),
             )
             .is_err()
     );
@@ -456,6 +480,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id],
                 &[accepted_id],
                 &[(first_author, 0), (second_author, 0)],
+                &baseline(vec![accepted_id], vec![(signer.author(), 0)]),
             )
             .is_err()
     );
@@ -478,10 +503,133 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id],
                 &[accepted_id],
                 &[(signer.author(), 0)],
+                &baseline(vec![accepted_id], vec![(signer.author(), 0)]),
             )
             .is_err()
     );
     assert_eq!(store.frontier(domain).unwrap(), vec![accepted_id]);
+}
+
+#[tokio::test]
+async fn snapshot_tail_preflight_uses_signed_domain_baseline() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    let domain = DomainId::from_bytes(id(1));
+    let other_domain = DomainId::from_bytes(id(2));
+    let baseline_author = IrohSigner::from_secret_bytes(id(7));
+    let fresh_author = IrohSigner::from_secret_bytes(id(9));
+    let key = DomainKey::from_bytes(id(8));
+    let opaque_frontier = CommitId::from_bytes(id(77));
+    let author_floor = vec![(baseline_author.author(), 0)];
+    let baseline = SnapshotBaseline::new(
+        domain,
+        1,
+        BlobHash::from_bytes(id(88)),
+        id(89),
+        vec![opaque_frontier],
+        author_floor.clone(),
+    )
+    .unwrap();
+    store
+        .install_snapshot(
+            domain,
+            &[],
+            &[opaque_frontier],
+            &[opaque_frontier],
+            &author_floor,
+            &baseline,
+        )
+        .unwrap();
+
+    let blind = commit(&fresh_author, &key, domain, 0, Vec::new());
+    assert_eq!(
+        store.persist_commit(&blind).await,
+        Err(StoreError::SnapshotBaselineMissing {
+            frontier: opaque_frontier
+        })
+    );
+    let first_tail = commit(&fresh_author, &key, domain, 0, vec![opaque_frontier]);
+    assert!(matches!(
+        store.persist_commit(&first_tail).await,
+        Ok(ApplyOutcome::Applied(_))
+    ));
+    let concurrent_tail = commit(&baseline_author, &key, domain, 1, vec![opaque_frontier]);
+    assert!(matches!(
+        store.persist_commit(&concurrent_tail).await,
+        Ok(ApplyOutcome::Applied(_))
+    ));
+
+    assert!(store.contains_commit(domain, opaque_frontier).unwrap());
+    assert!(
+        !store
+            .contains_commit(other_domain, opaque_frontier)
+            .unwrap()
+    );
+    let cross_domain = commit(
+        &IrohSigner::from_secret_bytes(id(11)),
+        &key,
+        other_domain,
+        0,
+        vec![opaque_frontier],
+    );
+    assert_eq!(
+        store.persist_commit(&cross_domain).await,
+        Err(StoreError::MissingDependency(opaque_frontier))
+    );
+}
+
+#[tokio::test]
+async fn retained_snapshot_frontier_remains_accepted_after_quarantine() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    let domain = DomainId::from_bytes(id(1));
+    let baseline_author = IrohSigner::from_secret_bytes(id(7));
+    let descendant_author = IrohSigner::from_secret_bytes(id(9));
+    let key = DomainKey::from_bytes(id(8));
+    let retained = commit(&baseline_author, &key, domain, 0, Vec::new());
+    let retained_id = retained.commit_id();
+    store.persist_commit(&retained).await.unwrap();
+
+    let author_floor = vec![(baseline_author.author(), 0)];
+    let baseline = SnapshotBaseline::new(
+        domain,
+        1,
+        BlobHash::from_bytes(id(88)),
+        id(89),
+        vec![retained_id],
+        author_floor.clone(),
+    )
+    .unwrap();
+    store
+        .install_snapshot(
+            domain,
+            &[],
+            &[retained_id],
+            &[retained_id],
+            &author_floor,
+            &baseline,
+        )
+        .unwrap();
+
+    let evidence = commit_variant(&baseline_author, &key, domain, 0, Vec::new(), 2);
+    store
+        .quarantine_equivocation(
+            &evidence,
+            &[retained_id],
+            &[retained_id],
+            &author_floor,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(store.is_commit_quarantined(retained_id).unwrap());
+
+    let descendant = commit(&descendant_author, &key, domain, 0, vec![retained_id]);
+    assert!(matches!(
+        store.persist_commit(&descendant).await,
+        Ok(ApplyOutcome::Applied(_))
+    ));
 }
 
 #[tokio::test]

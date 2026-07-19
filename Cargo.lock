@@ -1748,6 +1748,7 @@ dependencies = [
  "iroh-gossip",
  "minicbor",
  "n0-future",
+ "redb",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",

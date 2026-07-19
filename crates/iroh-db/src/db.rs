@@ -19,7 +19,7 @@ use iroh_db_security::{
 };
 use iroh_db_store::{
     ApplyOutcome, BlobFuture, BlobStore, BlobStoreError, IndexValue, MaterializedError,
-    MaterializedRecord, Store, StoreError,
+    MaterializedRecord, SnapshotBaseline, Store, StoreError,
 };
 use tokio::io::AsyncRead;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock, broadcast};
@@ -247,6 +247,12 @@ struct RecordAdapter {
         &VersionVector,
         &mut u32,
     ) -> Result<MaterializedRecord, DbError>,
+}
+
+struct QuarantineMetadata {
+    frontier: Vec<CommitId>,
+    author_sequences: Vec<(AuthorId, u64)>,
+    author_heads: Vec<(AuthorId, u64, CommitId)>,
 }
 
 /// Result of feeding one authenticated immutable commit into the local apply kernel.
@@ -972,6 +978,7 @@ impl IrohDb {
         authenticated_peer: AuthorId,
         envelope: CommitEnvelope,
     ) -> Result<RemoteApply, DbError> {
+        let _control_reader = self.inner.control_gate.read().await;
         let _writer = self.inner.writer.lock().await;
         let header = envelope.header();
         let domain_id = self.domain_id();
@@ -982,7 +989,11 @@ impl IrohDb {
         if let Some(outcome) = self.quarantined_remote_apply(header, commit_id)? {
             return Ok(outcome);
         }
-        if self.inner.store.contains_commit(commit_id)? {
+        if self
+            .inner
+            .store
+            .contains_commit(self.domain_id(), commit_id)?
+        {
             return Ok(RemoteApply::Duplicate(commit_id));
         }
         let active_epoch = self.inner.store.current_epoch(domain_id)?;
@@ -1126,41 +1137,21 @@ impl IrohDb {
             .read()
             .expect("record adapter lock is not poisoned")
             .clone();
-        let mutations = self.materialize_commit_ids(&accepted, &adapters).await?;
-        let accepted_set: BTreeSet<_> = accepted.iter().copied().collect();
-        let referenced: BTreeSet<_> = accepted
-            .iter()
-            .flat_map(|commit_id| graph[commit_id].iter().copied())
-            .filter(|dependency| accepted_set.contains(dependency))
-            .collect();
-        let frontier: Vec<_> = accepted
-            .iter()
-            .copied()
-            .filter(|commit_id| !referenced.contains(commit_id))
-            .collect();
-        let mut author_heads = BTreeMap::<AuthorId, (u64, CommitId)>::new();
-        for commit_id in &accepted {
-            let (commit_author, commit_sequence) = headers[commit_id];
-            author_heads
-                .entry(commit_author)
-                .and_modify(|current| {
-                    if commit_sequence > current.0 {
-                        *current = (commit_sequence, *commit_id);
-                    }
-                })
-                .or_insert((commit_sequence, *commit_id));
-        }
-        let author_heads: Vec<_> = author_heads
-            .into_iter()
-            .map(|(head_author, (head_sequence, commit_id))| {
-                (head_author, head_sequence, commit_id)
-            })
-            .collect();
+        let mutations = self.rebuild_commit_ids(&accepted, &adapters).await?;
+        let baseline = self.inner.store.snapshot_baseline(self.domain_id())?;
+        let metadata = quarantine_metadata(baseline.as_ref(), &accepted, &graph, &headers);
         let invalid: Vec<_> = invalid.into_iter().collect();
         let previous_records = self.inner.store.export_materialized(self.domain_id())?;
         self.inner
             .store
-            .quarantine_equivocation(&evidence, &invalid, &frontier, &author_heads, &mutations)
+            .quarantine_equivocation(
+                &evidence,
+                &invalid,
+                &metadata.frontier,
+                &metadata.author_sequences,
+                &metadata.author_heads,
+                &mutations,
+            )
             .await?;
         let changes = materialization_changes(&previous_records, &mutations);
         if !changes.is_empty() {
@@ -1187,7 +1178,7 @@ impl IrohDb {
             ));
         }
         for dependency in incoming.header().dependencies() {
-            if !self.inner.store.contains_commit(*dependency)? {
+            if !self.inner.store.contains_commit(domain, *dependency)? {
                 return Err(DbError::InvalidRemoteCommit(
                     "commit dependency is missing".into(),
                 ));
@@ -1248,9 +1239,21 @@ impl IrohDb {
                     pending.extend_from_slice(envelope.header().dependencies());
                 }
                 Err(StoreError::MissingCommitBlob(_))
-                    if self.inner.store.contains_commit(commit_id)? =>
+                    if self
+                        .inner
+                        .store
+                        .contains_commit(self.domain_id(), commit_id)? =>
                 {
-                    for (author, sequence) in self.inner.store.author_sequences(self.domain_id())? {
+                    let baseline = self
+                        .inner
+                        .store
+                        .snapshot_baseline(self.domain_id())?
+                        .ok_or_else(|| {
+                            DbError::InvalidSnapshot(
+                                "snapshot-covered dependency has no recovery baseline".into(),
+                            )
+                        })?;
+                    for &(author, sequence) in baseline.author_sequences() {
                         context.observe(Dot::new(author, sequence, 0));
                     }
                 }
@@ -1262,11 +1265,6 @@ impl IrohDb {
 
     pub(crate) async fn rebuild_mutations(&self) -> Result<Vec<MaterializedRecord>, DbError> {
         let domain = self.domain_id();
-        if self.inner.store.has_snapshot_coverage(domain)? {
-            return Err(DbError::InvalidSnapshot(
-                "full replay requires the installed base snapshot".into(),
-            ));
-        }
         let commit_ids = self.inner.store.list_stored_commit_ids(domain)?;
         if commit_ids.len() > MAX_RECONCILE_COMMITS {
             return Err(DbError::InvalidSnapshot(
@@ -1279,7 +1277,49 @@ impl IrohDb {
             .read()
             .expect("record adapter lock is not poisoned")
             .clone();
-        self.materialize_commit_ids(&commit_ids, &adapters).await
+        self.rebuild_commit_ids(&commit_ids, &adapters).await
+    }
+
+    async fn rebuild_commit_ids(
+        &self,
+        commit_ids: &[CommitId],
+        adapters: &BTreeMap<CollectionId, RecordAdapter>,
+    ) -> Result<Vec<MaterializedRecord>, DbError> {
+        let Some(base_records) = self.verified_snapshot_baseline_records().await? else {
+            return self.materialize_commit_ids(commit_ids, adapters).await;
+        };
+        let tail = self.materialize_commit_ids(commit_ids, adapters).await?;
+        let mut rebuilt = BTreeMap::<(CollectionId, Vec<u8>), MaterializedRecord>::new();
+        for record in base_records {
+            let collection_id = record.schema().collection_id();
+            let adapter = *adapters
+                .get(&collection_id)
+                .ok_or(DbError::UnknownRecordSchema(collection_id))?;
+            if record.state().is_none() {
+                return Err(DbError::InvalidSnapshot(
+                    "snapshot contains a deleted materialized record".into(),
+                ));
+            }
+            let canonical = (adapter.merge)(None, &record)?;
+            rebuilt.insert((collection_id, canonical.record_id().to_vec()), canonical);
+        }
+        for mutation in tail {
+            let collection_id = mutation.schema().collection_id();
+            let key = (collection_id, mutation.record_id().to_vec());
+            if mutation.state().is_none() {
+                rebuilt.remove(&key);
+                continue;
+            }
+            let adapter = *adapters
+                .get(&collection_id)
+                .ok_or(DbError::UnknownRecordSchema(collection_id))?;
+            let merged = (adapter.merge)(
+                rebuilt.get(&key).and_then(MaterializedRecord::state),
+                &mutation,
+            )?;
+            rebuilt.insert(key, merged);
+        }
+        Ok(rebuilt.into_values().collect())
     }
 
     async fn materialize_commit_ids(
@@ -1376,6 +1416,7 @@ impl IrohDb {
             return Err(DbError::EmptyTransaction);
         }
         validate_prepared_targets(&prepared)?;
+        let _control_reader = self.inner.control_gate.read().await;
         let _writer = self.inner.writer.lock().await;
         let domain_id = self.domain_id();
         let active_epoch = self.inner.store.current_epoch(domain_id)?;
@@ -2389,6 +2430,55 @@ fn is_ancestor(
     false
 }
 
+fn quarantine_metadata(
+    baseline: Option<&SnapshotBaseline>,
+    accepted: &[CommitId],
+    graph: &BTreeMap<CommitId, Vec<CommitId>>,
+    headers: &BTreeMap<CommitId, (AuthorId, u64)>,
+) -> QuarantineMetadata {
+    let mut frontier_candidates: BTreeSet<_> = baseline.map_or_else(BTreeSet::new, |baseline| {
+        baseline.frontier().iter().copied().collect()
+    });
+    frontier_candidates.extend(accepted.iter().copied());
+    let referenced: BTreeSet<_> = accepted
+        .iter()
+        .flat_map(|commit_id| graph[commit_id].iter().copied())
+        .filter(|dependency| frontier_candidates.contains(dependency))
+        .collect();
+    let frontier = frontier_candidates
+        .into_iter()
+        .filter(|commit_id| !referenced.contains(commit_id))
+        .collect();
+    let mut author_sequences: BTreeMap<AuthorId, u64> = baseline
+        .map_or_else(BTreeMap::new, |baseline| {
+            baseline.author_sequences().iter().copied().collect()
+        });
+    let mut author_heads = BTreeMap::<AuthorId, (u64, CommitId)>::new();
+    for commit_id in accepted {
+        let (author, sequence) = headers[commit_id];
+        author_sequences
+            .entry(author)
+            .and_modify(|current| *current = (*current).max(sequence))
+            .or_insert(sequence);
+        author_heads
+            .entry(author)
+            .and_modify(|current| {
+                if sequence > current.0 {
+                    *current = (sequence, *commit_id);
+                }
+            })
+            .or_insert((sequence, *commit_id));
+    }
+    QuarantineMetadata {
+        frontier,
+        author_sequences: author_sequences.into_iter().collect(),
+        author_heads: author_heads
+            .into_iter()
+            .map(|(author, (sequence, commit_id))| (author, sequence, commit_id))
+            .collect(),
+    }
+}
+
 fn merge_materialized<Record: IrohRecord>(
     existing: Option<&[u8]>,
     incoming: &MaterializedRecord,
@@ -2577,6 +2667,40 @@ mod control_recovery_tests {
         assert_eq!(rotated.domain_seed().epoch(), 1);
         drop(domain);
         drop(rotated);
+        device.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_operations_wait_for_a_stable_authority_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let device = IrohDb::open(directory.path()).await.unwrap();
+        let domain = device.create_domain(ConsistencyMode::MultiWriter).unwrap();
+        let snapshot = domain.snapshot().await.unwrap();
+
+        let authority_mutation = device.inner.control_gate.write().await;
+        let capture_domain = domain.clone();
+        let mut capture = tokio::spawn(async move { capture_domain.snapshot().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut capture)
+                .await
+                .is_err()
+        );
+        drop(authority_mutation);
+        capture.await.unwrap().unwrap();
+
+        let authority_mutation = device.inner.control_gate.write().await;
+        let install_domain = domain.clone();
+        let mut install =
+            tokio::spawn(async move { install_domain.install_snapshot(snapshot).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut install)
+                .await
+                .is_err()
+        );
+        drop(authority_mutation);
+        install.await.unwrap().unwrap();
+
+        drop(domain);
         device.close().await.unwrap();
     }
 
