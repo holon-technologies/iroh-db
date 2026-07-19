@@ -1,0 +1,23 @@
+[package]
+name = "iroh-db-sync"
+description = "Peer synchronization protocol for iroh-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+iroh-db-blobs.workspace = true
+iroh-db-core.workspace = true
+iroh-db-security.workspace = true
+iroh-db-store.workspace = true
+minicbor.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,57 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/holon-technologies/iroh-db"
+authors = ["Holon Technologies"]
+
+[workspace.dependencies]
+blake3 = "1.8.2"
+chacha20poly1305 = "0.11.0"
+fs2 = "0.4.3"
+getrandom = "0.4.3"
+hex = "0.4.3"
+hkdf = "0.13.0"
+iroh = "1.0.2"
+iroh-base = { version = "1.0.1", features = ["key"] }
+iroh-blobs = { version = "0.103.0", default-features = false, features = ["fs-store"] }
+iroh-gossip = "0.101.0"
+iroh-db-blobs = { path = "crates/iroh-db-blobs", version = "0.1.0" }
+iroh-db-core = { path = "crates/iroh-db-core", version = "0.1.0" }
+iroh-db-derive = { path = "crates/iroh-db-derive", version = "0.1.0" }
+iroh-db-query = { path = "crates/iroh-db-query", version = "0.1.0" }
+iroh-db-security = { path = "crates/iroh-db-security", version = "0.1.0" }
+iroh-db-store = { path = "crates/iroh-db-store", version = "0.1.0" }
+iroh-db-sync = { path = "crates/iroh-db-sync", version = "0.1.0" }
+minicbor = { version = "2.2.2", features = ["std", "derive"] }
+n0-future = "0.3.1"
+proc-macro-crate = "3.5.0"
+proc-macro2 = "1.0.106"
+proptest = "1.11.0"
+quote = "1.0.45"
+redb = "4.1.0"
+sha2 = "0.11.0"
+thiserror = "2.0.19"
+tokio = { version = "1.53.0", features = ["macros", "rt-multi-thread", "io-util", "sync", "time"] }
+trybuild = "1.0.116"
+syn = { version = "2.0.119", features = ["full"] }
+zeroize = { version = "1.9.0", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

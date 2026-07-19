@@ -1,0 +1,16 @@
+[package]
+name = "iroh-db-cli"
+description = "Inspection, verification, repair, and backup tools for iroh-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+iroh-db = { path = "../iroh-db", version = "0.1.0" }
+tokio.workspace = true
+
+[lints]
+workspace = true

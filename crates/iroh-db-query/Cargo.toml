@@ -1,0 +1,16 @@
+[package]
+name = "iroh-db-query"
+description = "Typed local query planning for iroh-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+iroh-db-core.workspace = true
+iroh-db-store.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,5 @@
+/target/
+**/*.irohdb/
+*.profraw
+*.proptest-regressions
+.DS_Store

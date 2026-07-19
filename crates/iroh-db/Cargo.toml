@@ -1,0 +1,34 @@
+[package]
+name = "iroh-db"
+description = "Rust-native local-first distributed database built on iroh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+blake3.workspace = true
+fs2.workspace = true
+getrandom.workspace = true
+iroh.workspace = true
+iroh-blobs.workspace = true
+iroh-gossip.workspace = true
+iroh-db-blobs.workspace = true
+iroh-db-core.workspace = true
+iroh-db-derive.workspace = true
+iroh-db-query.workspace = true
+iroh-db-security.workspace = true
+iroh-db-store.workspace = true
+iroh-db-sync.workspace = true
+minicbor.workspace = true
+n0-future.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

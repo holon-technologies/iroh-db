@@ -1,0 +1,26 @@
+[package]
+name = "iroh-db-store"
+description = "Transactional local metadata storage for iroh-db"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+fs2.workspace = true
+iroh-db-core.workspace = true
+iroh-db-security.workspace = true
+minicbor.workspace = true
+redb.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+iroh-db-security.workspace = true
+tempfile = "3.27.0"
+tokio.workspace = true
+
+[lints]
+workspace = true

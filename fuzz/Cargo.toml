@@ -1,0 +1,29 @@
+[package]
+name = "iroh-db-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+iroh-db-core = { path = "../crates/iroh-db-core" }
+iroh-db-sync = { path = "../crates/iroh-db-sync" }
+
+[[bin]]
+name = "commit_decode"
+path = "fuzz_targets/commit_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_frame_decode"
+path = "fuzz_targets/sync_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

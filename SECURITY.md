@@ -1,0 +1,14 @@
+# Security Policy
+
+Report suspected vulnerabilities privately to the maintainers. Do not include keys, invitation tickets, decrypted records, or production database archives in an issue.
+
+## Release Checklist
+
+- Run format, strict Clippy, all workspace tests, documentation, MSRV, and dependency/advisory checks.
+- Run both fuzz targets against their retained corpora and the extended reconnect/partition soak.
+- Review changes to signature contexts, canonical codecs, AEAD nonce/AAD construction, capability narrowing, control succession, epoch cuts, invitation targeting, and bounded protocol inputs.
+- Confirm secrets remain redacted and key-vault files are owner-only after create, backup, and restore.
+- Confirm repair and restore use a new/in-memory candidate and never overwrite the only known-good copy before verification.
+- Confirm gossip and errors contain no keys, capabilities, record identifiers, collection values, or plaintext.
+
+The confidentiality boundary excludes compromised unlocked devices, traffic analysis, denial of service, and plaintext already obtained by a previously authorized member.

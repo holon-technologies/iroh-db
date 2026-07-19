@@ -1,0 +1,5 @@
+error: IrohRecord requires exactly one #[iroh_db(id)] field
+ --> tests/ui/fail/missing_id.rs:5:8
+  |
+5 | struct Track {
+  |        ^^^^^

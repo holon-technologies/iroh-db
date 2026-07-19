@@ -1,0 +1,130 @@
+use std::path::Path;
+
+use iroh_blobs::{Hash, store::fs::FsStore};
+use iroh_db_core::BlobHash;
+use iroh_db_store::{BlobFuture, BlobStore, BlobStoreError};
+use tokio::io::AsyncReadExt;
+
+/// Non-owning iroh-blobs provider handler that leaves the shared local store running on shutdown.
+#[derive(Debug, Clone)]
+pub struct BlobProtocol {
+    store: iroh_blobs::api::Store,
+}
+
+impl iroh::protocol::ProtocolHandler for BlobProtocol {
+    async fn accept(
+        &self,
+        connection: iroh::endpoint::Connection,
+    ) -> Result<(), iroh::protocol::AcceptError> {
+        iroh_blobs::provider::handle_connection(
+            connection,
+            self.store.clone(),
+            iroh_blobs::provider::events::EventSender::DEFAULT,
+        )
+        .await;
+        Ok(())
+    }
+}
+
+/// Durable local blob storage backed by iroh-blobs.
+#[derive(Debug, Clone)]
+pub struct IrohBlobStore {
+    inner: FsStore,
+}
+
+impl IrohBlobStore {
+    /// Opens or creates an iroh-blobs filesystem store at `root`.
+    pub async fn load(root: impl AsRef<Path>) -> Result<Self, BlobStoreError> {
+        let inner = FsStore::load(root)
+            .await
+            .map_err(|error| BlobStoreError::new(error.to_string()))?;
+        Ok(Self { inner })
+    }
+
+    /// Flushes persistent state and shuts down the underlying store actor.
+    ///
+    /// All clones become inoperable after this call.
+    pub async fn shutdown(&self) -> Result<(), BlobStoreError> {
+        self.inner
+            .shutdown()
+            .await
+            .map_err(|error| BlobStoreError::new(error.to_string()))
+    }
+
+    /// Creates a provider protocol over this store without transferring shutdown ownership.
+    pub fn protocol(&self) -> BlobProtocol {
+        BlobProtocol {
+            store: self.inner.clone().into(),
+        }
+    }
+
+    /// Downloads and verifies one complete immutable object over an iroh-blobs connection.
+    pub async fn fetch(
+        &self,
+        connection: iroh::endpoint::Connection,
+        hash: BlobHash,
+    ) -> Result<(), BlobStoreError> {
+        self.inner
+            .remote()
+            .fetch(connection, Hash::from_bytes(hash.to_bytes()))
+            .await
+            .map_err(|error| BlobStoreError::new(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Reads one locally complete immutable object by content hash.
+    pub async fn read(&self, hash: BlobHash) -> Result<Option<Vec<u8>>, BlobStoreError> {
+        BlobStore::get(self, hash).await
+    }
+}
+
+impl BlobStore for IrohBlobStore {
+    fn put(&self, bytes: Vec<u8>) -> BlobFuture<'_, BlobHash> {
+        Box::pin(async move {
+            let tag = self
+                .inner
+                .add_bytes(bytes)
+                .await
+                .map_err(|error| BlobStoreError::new(error.to_string()))?;
+            Ok(BlobHash::from_bytes(*tag.hash.as_bytes()))
+        })
+    }
+
+    fn get(&self, hash: BlobHash) -> BlobFuture<'_, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let hash = Hash::from_bytes(hash.to_bytes());
+            let present = self
+                .inner
+                .has(hash)
+                .await
+                .map_err(|error| BlobStoreError::new(error.to_string()))?;
+            if !present {
+                return Ok(None);
+            }
+
+            let mut reader = self.inner.reader(hash);
+            let mut bytes = Vec::new();
+            reader
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|error| BlobStoreError::new(error.to_string()))?;
+            Ok(Some(bytes))
+        })
+    }
+
+    fn list(&self) -> BlobFuture<'_, Vec<BlobHash>> {
+        Box::pin(async move {
+            let mut hashes = self
+                .inner
+                .list()
+                .hashes()
+                .await
+                .map_err(|error| BlobStoreError::new(error.to_string()))?
+                .into_iter()
+                .map(|hash| BlobHash::from_bytes(*hash.as_bytes()))
+                .collect::<Vec<_>>();
+            hashes.sort_unstable();
+            Ok(hashes)
+        })
+    }
+}

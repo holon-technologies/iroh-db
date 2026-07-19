@@ -1,0 +1,11 @@
+error: multiple #[iroh_db(id)] fields
+ --> tests/ui/fail/multiple_ids.rs:8:5
+  |
+8 |     second: String,
+  |     ^^^^^^
+
+error: first record ID is here
+ --> tests/ui/fail/multiple_ids.rs:6:5
+  |
+6 |     first: String,
+  |     ^^^^^

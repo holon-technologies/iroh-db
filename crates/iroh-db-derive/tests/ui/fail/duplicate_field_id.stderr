@@ -1,0 +1,11 @@
+error: duplicate iroh-db field_id 7
+ --> tests/ui/fail/duplicate_field_id.rs:9:5
+  |
+9 |     title: Lww<String>,
+  |     ^^^^^
+
+error: first used by this field
+ --> tests/ui/fail/duplicate_field_id.rs:7:5
+  |
+7 |     id: String,
+  |     ^^
