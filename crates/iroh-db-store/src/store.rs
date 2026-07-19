@@ -19,6 +19,8 @@ const COMMIT_METADATA: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("commit_metadata_v1");
 const SNAPSHOT_COVERAGE: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("snapshot_coverage_v1");
+const BLOB_OWNERSHIP: TableDefinition<'static, &[u8], u8> =
+    TableDefinition::new("blob_ownership_v1");
 const AUTHOR_SEQUENCES: TableDefinition<'static, &[u8], u64> =
     TableDefinition::new("author_sequences_v1");
 const AUTHOR_HEADS: TableDefinition<'static, &[u8], &[u8]> =
@@ -825,6 +827,42 @@ impl Store {
         Ok(false)
     }
 
+    /// Idempotently records local ownership of an immutable blob by one security domain.
+    pub fn claim_blob(&self, domain_id: DomainId, hash: BlobHash) -> Result<(), StoreError> {
+        let write = self.inner.database.begin_write().map_err(database_error)?;
+        write
+            .open_table(BLOB_OWNERSHIP)
+            .map_err(database_error)?
+            .insert(blob_ownership_key(domain_id, hash).as_slice(), 0)
+            .map_err(database_error)?;
+        write.commit().map_err(database_error)
+    }
+
+    /// Returns whether an accepted commit or claimed immutable blob belongs to a domain.
+    pub fn owns_blob(&self, domain_id: DomainId, hash: BlobHash) -> Result<bool, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let ownership = read.open_table(BLOB_OWNERSHIP).map_err(database_error)?;
+        if ownership
+            .get(blob_ownership_key(domain_id, hash).as_slice())
+            .map_err(database_error)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let commits = read.open_table(COMMIT_METADATA).map_err(database_error)?;
+        let quarantined = read
+            .open_table(QUARANTINED_COMMITS)
+            .map_err(database_error)?;
+        Ok(commits
+            .get(hash.as_bytes().as_slice())
+            .map_err(database_error)?
+            .is_some_and(|metadata| metadata.value().starts_with(domain_id.as_bytes()))
+            && quarantined
+                .get(hash.as_bytes().as_slice())
+                .map_err(database_error)?
+                .is_none())
+    }
+
     /// Lists commit IDs whose immutable envelope blobs are stored locally.
     pub fn list_stored_commit_ids(&self, domain_id: DomainId) -> Result<Vec<CommitId>, StoreError> {
         let read = self.inner.database.begin_read().map_err(database_error)?;
@@ -1533,6 +1571,7 @@ fn initialize_tables(database: &Database) -> Result<(), StoreError> {
     write
         .open_table(SNAPSHOT_COVERAGE)
         .map_err(database_error)?;
+    write.open_table(BLOB_OWNERSHIP).map_err(database_error)?;
     write.open_table(AUTHOR_SEQUENCES).map_err(database_error)?;
     write.open_table(AUTHOR_HEADS).map_err(database_error)?;
     write.open_table(FRONTIER).map_err(database_error)?;
@@ -2028,6 +2067,13 @@ fn author_sequence_key(domain_id: DomainId, author: AuthorId) -> [u8; 64] {
     let mut key = [0_u8; 64];
     key[..32].copy_from_slice(domain_id.as_bytes());
     key[32..].copy_from_slice(author.as_bytes());
+    key
+}
+
+fn blob_ownership_key(domain_id: DomainId, hash: BlobHash) -> [u8; 64] {
+    let mut key = [0_u8; 64];
+    key[..32].copy_from_slice(domain_id.as_bytes());
+    key[32..].copy_from_slice(hash.as_bytes());
     key
 }
 

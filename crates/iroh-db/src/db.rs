@@ -8,7 +8,7 @@ use std::{
 
 use iroh_db_blobs::{BlobEngine, BlobError, BlobRef, BlobStream, IrohBlobStore};
 use iroh_db_core::{
-    AuthorId, CapabilityId, CollectionId, CommitBody, CommitCodecError, CommitEnvelope,
+    AuthorId, BlobHash, CapabilityId, CollectionId, CommitBody, CommitCodecError, CommitEnvelope,
     CommitHeader, CommitId, Dot, EqualityFilter, IrohRecord, Operation, OperationKind, RangeFilter,
     RecordError, RecordKey, SchemaId, TransactionId, TypedField, VersionVector,
 };
@@ -18,7 +18,8 @@ use iroh_db_security::{
     Permission, PermissionSet, SecurityError, open_commit, seal_commit,
 };
 use iroh_db_store::{
-    ApplyOutcome, IndexValue, MaterializedError, MaterializedRecord, Store, StoreError,
+    ApplyOutcome, BlobFuture, BlobStore, BlobStoreError, IndexValue, MaterializedError,
+    MaterializedRecord, Store, StoreError,
 };
 use tokio::io::AsyncRead;
 use tokio::sync::{Mutex, broadcast};
@@ -184,6 +185,53 @@ pub(crate) struct DbInner {
     pub(crate) writer: Mutex<()>,
     changes: RwLock<BTreeMap<iroh_db_core::DomainId, broadcast::Sender<ChangeBatch>>>,
     adapters: RwLock<BTreeMap<CollectionId, RecordAdapter>>,
+}
+
+#[derive(Clone)]
+struct DomainBlobStore {
+    blobs: Arc<IrohBlobStore>,
+    metadata: Store,
+    domain_id: iroh_db_core::DomainId,
+}
+
+impl BlobStore for DomainBlobStore {
+    fn put(&self, bytes: Vec<u8>) -> BlobFuture<'_, BlobHash> {
+        Box::pin(async move {
+            let hash = self.blobs.put(bytes).await?;
+            self.metadata
+                .claim_blob(self.domain_id, hash)
+                .map_err(blob_metadata_error)?;
+            Ok(hash)
+        })
+    }
+
+    fn get(&self, hash: BlobHash) -> BlobFuture<'_, Option<Vec<u8>>> {
+        self.blobs.get(hash)
+    }
+
+    fn list(&self) -> BlobFuture<'_, Vec<BlobHash>> {
+        Box::pin(async move {
+            let mut owned = Vec::new();
+            for hash in self.blobs.list().await? {
+                if self
+                    .metadata
+                    .owns_blob(self.domain_id, hash)
+                    .map_err(blob_metadata_error)?
+                {
+                    owned.push(hash);
+                }
+            }
+            Ok(owned)
+        })
+    }
+
+    fn claim(&self, hash: BlobHash) -> BlobFuture<'_, ()> {
+        Box::pin(async move {
+            self.metadata
+                .claim_blob(self.domain_id, hash)
+                .map_err(blob_metadata_error)
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -550,6 +598,19 @@ impl IrohDb {
             return Err(DbError::UnauthorizedDevice);
         }
         Ok(capability_id)
+    }
+
+    pub(crate) fn blob_engine(&self) -> BlobEngine {
+        BlobEngine::new_at_epoch(
+            Arc::new(DomainBlobStore {
+                blobs: self.inner.blobs.clone(),
+                metadata: self.inner.store.clone(),
+                domain_id: self.domain_id(),
+            }),
+            self.domain_id(),
+            self.epoch(),
+            self.domain_key(),
+        )
     }
 
     /// Issues a targeted signed invitation carrying the current epoch key and capability chain.
@@ -1280,12 +1341,7 @@ impl Blobs {
     }
 
     fn engine(&self) -> BlobEngine {
-        BlobEngine::new_at_epoch(
-            self.db.inner.blobs.clone(),
-            self.db.domain_id(),
-            self.db.epoch(),
-            self.db.domain_key(),
-        )
+        self.db.blob_engine()
     }
 }
 
@@ -2208,4 +2264,9 @@ pub(crate) fn private_capability(domain_id: iroh_db_core::DomainId) -> Capabilit
     hasher.update(b"iroh-db/private-capability/v1");
     hasher.update(domain_id.as_bytes());
     CapabilityId::from_bytes(*hasher.finalize().as_bytes())
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn blob_metadata_error(error: impl std::fmt::Display) -> BlobStoreError {
+    BlobStoreError::new(error.to_string())
 }

@@ -218,6 +218,105 @@ async fn controlled_domain_accepts_snapshot_from_explicit_authority() {
 }
 
 #[tokio::test]
+async fn blob_provider_requires_explicit_fetch_permission() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_device = IrohDb::open(source_dir.path()).await.unwrap();
+    let target_device = IrohDb::open(target_dir.path()).await.unwrap();
+    let source = source_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let invitation = source
+        .invite(
+            target_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let target = target_device.import_invitation(&invitation).unwrap();
+    let secret = source
+        .blobs()
+        .import_bytes(b"capability protected".to_vec(), None)
+        .await
+        .unwrap();
+    let source_node = source.start_sync().await.unwrap();
+    let target_node = target.start_sync().await.unwrap();
+
+    assert!(
+        target_node
+            .fetch_blob_from(source_node.addr(), &secret)
+            .await
+            .is_err()
+    );
+    assert!(target.blobs().open(&secret).await.is_err());
+
+    source_node.shutdown().await.unwrap();
+    target_node.shutdown().await.unwrap();
+    drop(source);
+    drop(target);
+    source_device.close().await.unwrap();
+    target_device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn blob_provider_does_not_cross_shared_store_domain_boundary() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let source_device = IrohDb::open(source_dir.path()).await.unwrap();
+    let target_device = IrohDb::open(target_dir.path()).await.unwrap();
+    let source_a = source_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let source_b = source_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let fetch = PermissionSet::from_permissions(&[Permission::Read, Permission::FetchBlobs]);
+    let invitation_a = source_a
+        .invite(
+            target_device.author_id(),
+            fetch,
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let invitation_b = source_b
+        .invite(
+            target_device.author_id(),
+            fetch,
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let target_a = target_device.import_invitation(&invitation_a).unwrap();
+    let target_b = target_device.import_invitation(&invitation_b).unwrap();
+    let secret_b = source_b
+        .blobs()
+        .import_bytes(b"domain b only".to_vec(), None)
+        .await
+        .unwrap();
+    let source_a_node = source_a.start_sync().await.unwrap();
+    let target_b_node = target_b.start_sync().await.unwrap();
+
+    assert!(
+        target_b_node
+            .fetch_blob_from(source_a_node.addr(), &secret_b)
+            .await
+            .is_err()
+    );
+    assert!(target_b.blobs().open(&secret_b).await.is_err());
+
+    source_a_node.shutdown().await.unwrap();
+    target_b_node.shutdown().await.unwrap();
+    drop(source_a);
+    drop(source_b);
+    drop(target_a);
+    drop(target_b);
+    source_device.close().await.unwrap();
+    target_device.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn three_partitioned_peers_converge_after_reordered_pairwise_sessions() {
     let seed = DomainSeed::generate().unwrap();
     let dirs = [

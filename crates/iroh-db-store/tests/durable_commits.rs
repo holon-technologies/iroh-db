@@ -445,3 +445,30 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
     );
     assert_eq!(store.frontier(domain).unwrap(), vec![accepted_id]);
 }
+
+#[tokio::test]
+async fn blob_ownership_is_domain_isolated_idempotent_and_reopenable() {
+    let directory = tempfile::tempdir().unwrap();
+    let blobs = Arc::new(MemoryBlobs::default());
+    let first_domain = DomainId::from_bytes(id(1));
+    let second_domain = DomainId::from_bytes(id(2));
+    let application_hash = BlobHash::from_bytes(id(44));
+    let signer = IrohSigner::from_secret_bytes(id(7));
+    let key = DomainKey::from_bytes(id(8));
+    let accepted = commit(&signer, &key, first_domain, 0, Vec::new());
+    let accepted_hash = BlobHash::from_bytes(accepted.commit_id().to_bytes());
+    let store = Store::open(directory.path(), blobs.clone()).unwrap();
+    store.persist_commit(&accepted).await.unwrap();
+    store.claim_blob(first_domain, application_hash).unwrap();
+    store.claim_blob(first_domain, application_hash).unwrap();
+
+    assert!(store.owns_blob(first_domain, application_hash).unwrap());
+    assert!(!store.owns_blob(second_domain, application_hash).unwrap());
+    assert!(store.owns_blob(first_domain, accepted_hash).unwrap());
+    assert!(!store.owns_blob(second_domain, accepted_hash).unwrap());
+    drop(store);
+
+    let reopened = Store::open(directory.path(), blobs).unwrap();
+    assert!(reopened.owns_blob(first_domain, application_hash).unwrap());
+    assert!(!reopened.owns_blob(second_domain, application_hash).unwrap());
+}

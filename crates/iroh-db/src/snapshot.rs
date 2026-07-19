@@ -1,4 +1,4 @@
-use iroh_db_blobs::{BlobEngine, BlobRef};
+use iroh_db_blobs::BlobRef;
 use iroh_db_core::{AuthorId, CapabilityId, CommitId};
 use iroh_db_security::{Permission, verify_snapshot_signature};
 use iroh_db_store::{MaterializedRecord, StoreError};
@@ -105,14 +105,14 @@ impl IrohDb {
             signature: signer.sign_snapshot(&signing_bytes),
         };
         let bytes = minicbor::to_vec(envelope).map_err(snapshot_codec)?;
-        let blob = blob_engine(self).import_bytes(bytes, None).await?;
+        let blob = self.blob_engine().import_bytes(bytes, None).await?;
         Ok(Snapshot { blob, state_root })
     }
 
     /// Verifies and atomically installs a local snapshot's derived state.
     pub async fn install_snapshot(&self, snapshot: Snapshot) -> Result<(), DbError> {
         let _writer = self.inner.writer.lock().await;
-        let mut stream = blob_engine(self).open(&snapshot.blob).await?;
+        let mut stream = self.blob_engine().open(&snapshot.blob).await?;
         let mut bytes = Vec::new();
         stream
             .read_to_end(&mut bytes)
@@ -184,15 +184,6 @@ impl IrohDb {
         let records = self.inner.store.export_materialized(self.domain_id())?;
         state_root(&records)
     }
-}
-
-fn blob_engine(db: &IrohDb) -> BlobEngine {
-    BlobEngine::new_at_epoch(
-        db.inner.blobs.clone(),
-        db.domain_id(),
-        db.epoch(),
-        db.domain_key(),
-    )
 }
 
 fn control_head_id(db: &IrohDb) -> Result<Option<[u8; 32]>, DbError> {

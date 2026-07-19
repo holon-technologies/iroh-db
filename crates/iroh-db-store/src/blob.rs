@@ -15,6 +15,13 @@ pub trait BlobStore: Send + Sync + 'static {
 
     /// Lists locally complete immutable objects in deterministic hash order.
     fn list(&self) -> BlobFuture<'_, Vec<BlobHash>>;
+
+    /// Records that an already stored immutable object belongs to the caller's domain context.
+    ///
+    /// Stores without domain metadata may keep the default no-op implementation.
+    fn claim(&self, _hash: BlobHash) -> BlobFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// An implementation-independent blob repository failure.

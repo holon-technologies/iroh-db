@@ -75,6 +75,7 @@ impl FetchMetrics {
 #[derive(Clone)]
 struct ProviderPool {
     local: IrohBlobStore,
+    claims: Arc<dyn BlobStore>,
     providers: Arc<Vec<iroh::endpoint::Connection>>,
     next: Arc<AtomicUsize>,
     metrics: FetchMetrics,
@@ -82,6 +83,11 @@ struct ProviderPool {
 
 impl ProviderPool {
     async fn fetch(&self, hash: BlobHash) -> Result<(), BlobError> {
+        self.fetch_unclaimed(hash).await?;
+        self.claims.claim(hash).await.map_err(BlobError::from)
+    }
+
+    async fn fetch_unclaimed(&self, hash: BlobHash) -> Result<(), BlobError> {
         if self.providers.is_empty() {
             return Err(BlobError::NoProviders);
         }
@@ -309,6 +315,7 @@ impl BlobEngine {
         let metrics = FetchMetrics::default();
         let pool = ProviderPool {
             local,
+            claims: self.store.clone(),
             providers: Arc::new(providers),
             next: Arc::new(AtomicUsize::new(match options.priority {
                 BlobPriority::High | BlobPriority::Normal => 0,
@@ -323,7 +330,7 @@ impl BlobEngine {
             .map_err(BlobError::from)?
             .is_none()
         {
-            pool.fetch(reference.manifest_hash()).await?;
+            pool.fetch_unclaimed(reference.manifest_hash()).await?;
         }
         let encoded = self
             .store
@@ -342,6 +349,10 @@ impl BlobEngine {
         let plaintext = decrypt_manifest(&self.key, &envelope)?;
         let body: ManifestBody = decode_canonical(&plaintext)?;
         validate_manifest(&body)?;
+        self.store
+            .claim(reference.manifest_hash())
+            .await
+            .map_err(BlobError::from)?;
 
         for descriptor in body
             .chunks
@@ -408,9 +419,17 @@ impl BlobEngine {
         let plaintext = decrypt_manifest(&self.key, &envelope)?;
         let body: ManifestBody = decode_canonical(&plaintext)?;
         validate_manifest(&body)?;
+        self.store
+            .claim(reference.manifest_hash())
+            .await
+            .map_err(BlobError::from)?;
         for chunk in body.chunks {
             local
                 .fetch(connection.clone(), chunk.ciphertext_hash)
+                .await
+                .map_err(BlobError::from)?;
+            self.store
+                .claim(chunk.ciphertext_hash)
                 .await
                 .map_err(BlobError::from)?;
         }

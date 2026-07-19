@@ -9,6 +9,7 @@ use tokio::io::AsyncReadExt;
 #[derive(Debug, Clone)]
 pub struct BlobProtocol {
     store: iroh_blobs::api::Store,
+    events: iroh_blobs::provider::events::EventSender,
 }
 
 impl iroh::protocol::ProtocolHandler for BlobProtocol {
@@ -19,7 +20,7 @@ impl iroh::protocol::ProtocolHandler for BlobProtocol {
         iroh_blobs::provider::handle_connection(
             connection,
             self.store.clone(),
-            iroh_blobs::provider::events::EventSender::DEFAULT,
+            self.events.clone(),
         )
         .await;
         Ok(())
@@ -53,8 +54,17 @@ impl IrohBlobStore {
 
     /// Creates a provider protocol over this store without transferring shutdown ownership.
     pub fn protocol(&self) -> BlobProtocol {
+        self.protocol_with_events(iroh_blobs::provider::events::EventSender::DEFAULT)
+    }
+
+    /// Creates a provider protocol using iroh-blobs' request interception hooks.
+    pub fn protocol_with_events(
+        &self,
+        events: iroh_blobs::provider::events::EventSender,
+    ) -> BlobProtocol {
         BlobProtocol {
             store: self.inner.clone().into(),
+            events,
         }
     }
 

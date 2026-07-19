@@ -11,6 +11,9 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
+use iroh_blobs::provider::events::{
+    AbortReason, ConnectMode, EventMask, EventSender, ObserveMode, ProviderMessage, RequestMode,
+};
 use iroh_db_blobs::{BlobEngine, BlobRef, BlobStream, FetchMetrics, FetchOptions};
 use iroh_db_core::{AuthorId, BlobHash, CommitEnvelope, CommitId, DomainId};
 use iroh_db_security::{Invitation, verify_gossip_signature};
@@ -118,6 +121,7 @@ impl SyncNode {
         remote: EndpointAddr,
         snapshot: Snapshot,
     ) -> Result<(), DbError> {
+        self.core.require_local_blob_fetch()?;
         self.core.require_trusted(author_id(remote.id))?;
         let connection = self
             .core
@@ -125,12 +129,7 @@ impl SyncNode {
             .connect(remote, iroh_blobs::ALPN)
             .await
             .map_err(network_error)?;
-        let engine = BlobEngine::new_at_epoch(
-            self.core.db.inner.blobs.clone(),
-            self.core.domain_id(),
-            self.core.db.epoch(),
-            self.core.db.domain_key(),
-        );
+        let engine = self.core.db.blob_engine();
         engine
             .fetch_from(&self.core.db.inner.blobs, connection, &snapshot.blob_ref())
             .await?;
@@ -143,6 +142,7 @@ impl SyncNode {
         remote: EndpointAddr,
         reference: &BlobRef,
     ) -> Result<(), DbError> {
+        self.core.require_local_blob_fetch()?;
         self.core.require_trusted(author_id(remote.id))?;
         let connection = self
             .core
@@ -164,6 +164,7 @@ impl SyncNode {
         reference: &BlobRef,
         options: FetchOptions,
     ) -> Result<(BlobStream, FetchMetrics), DbError> {
+        self.core.require_local_blob_fetch()?;
         let mut connections = Vec::with_capacity(providers.len());
         for provider in providers {
             self.core.require_trusted(author_id(provider.id))?;
@@ -329,9 +330,13 @@ impl IrohDb {
             pending_invitations: Arc::new(RwLock::new(BTreeMap::new())),
         };
         let gossip = Gossip::builder().spawn(endpoint.clone());
+        let blob_events = core.blob_provider_events();
         let router = Router::builder(endpoint)
             .accept(SYNC_ALPN, SyncProtocol { core: core.clone() })
-            .accept(iroh_blobs::ALPN, self.inner.blobs.protocol())
+            .accept(
+                iroh_blobs::ALPN,
+                self.inner.blobs.protocol_with_events(blob_events),
+            )
             .accept(iroh_gossip::ALPN, gossip.clone())
             .spawn();
         Ok(SyncNode {
@@ -360,6 +365,7 @@ impl ProtocolHandler for SyncProtocol {
 impl SyncCore {
     async fn sync_with(&self, remote: EndpointAddr) -> Result<SyncReport, DbError> {
         let peer = author_id(remote.id);
+        self.require_local_blob_fetch()?;
         self.require_trusted(peer)?;
         let connection = self
             .endpoint
@@ -446,6 +452,7 @@ impl SyncCore {
         connection: Connection,
         receive: &[CommitId],
     ) -> Result<(), DbError> {
+        self.require_local_blob_fetch()?;
         for commit_id in receive {
             self.db
                 .inner
@@ -540,12 +547,117 @@ impl SyncCore {
     }
 
     fn blob_engine(&self) -> BlobEngine {
-        BlobEngine::new_at_epoch(
-            self.db.inner.blobs.clone(),
-            self.domain_id(),
-            self.db.epoch(),
-            self.db.domain_key(),
-        )
+        self.db.blob_engine()
+    }
+
+    fn require_local_blob_fetch(&self) -> Result<(), DbError> {
+        let active_epoch = self.db.inner.store.current_epoch(self.domain_id())?;
+        if self.db.epoch() != active_epoch {
+            return Err(DbError::StaleEpoch {
+                handle: self.db.epoch(),
+                active: active_epoch,
+            });
+        }
+        self.db.capability_for_permission(
+            self.db.author_id(),
+            iroh_db_security::Permission::FetchBlobs,
+            active_epoch,
+        )?;
+        Ok(())
+    }
+
+    fn can_peer_fetch_blob(&self, peer: AuthorId, hash: BlobHash) -> bool {
+        let Ok(active_epoch) = self.db.inner.store.current_epoch(self.domain_id()) else {
+            return false;
+        };
+        self.db.epoch() == active_epoch
+            && self
+                .db
+                .capability_for_permission(
+                    peer,
+                    iroh_db_security::Permission::FetchBlobs,
+                    active_epoch,
+                )
+                .is_ok()
+            && self
+                .db
+                .inner
+                .store
+                .owns_blob(self.domain_id(), hash)
+                .unwrap_or(false)
+    }
+
+    fn blob_provider_events(&self) -> EventSender {
+        let mask = EventMask {
+            connected: ConnectMode::Intercept,
+            get: RequestMode::Intercept,
+            get_many: RequestMode::Disabled,
+            push: RequestMode::Disabled,
+            observe: ObserveMode::Intercept,
+            ..EventMask::DEFAULT
+        };
+        let (events, mut receiver) = EventSender::channel(64, mask);
+        let core = self.clone();
+        tokio::spawn(async move {
+            let mut peers = BTreeMap::<u64, AuthorId>::new();
+            while let Some(message) = receiver.recv().await {
+                match message {
+                    ProviderMessage::ClientConnected(message) => {
+                        let peer = message.endpoint_id.map(author_id);
+                        let allowed = peer.is_some_and(|peer| {
+                            let Ok(epoch) = core.db.inner.store.current_epoch(core.domain_id())
+                            else {
+                                return false;
+                            };
+                            core.db.epoch() == epoch
+                                && core
+                                    .db
+                                    .capability_for_permission(
+                                        peer,
+                                        iroh_db_security::Permission::FetchBlobs,
+                                        epoch,
+                                    )
+                                    .is_ok()
+                        });
+                        if let Some(peer) = peer.filter(|_| allowed) {
+                            peers.insert(message.connection_id, peer);
+                        }
+                        let result = allowed.then_some(()).ok_or(AbortReason::Permission);
+                        let _ignored = message.tx.send(result).await;
+                    }
+                    ProviderMessage::ConnectionClosed(message) => {
+                        peers.remove(&message.connection_id);
+                    }
+                    ProviderMessage::GetRequestReceived(message) => {
+                        let hash = BlobHash::from_bytes(*message.request.hash.as_bytes());
+                        let allowed = message.request.ranges.is_blob()
+                            && peers
+                                .get(&message.connection_id)
+                                .is_some_and(|peer| core.can_peer_fetch_blob(*peer, hash));
+                        let result = allowed.then_some(()).ok_or(AbortReason::Permission);
+                        let _ignored = message.tx.send(result).await;
+                    }
+                    ProviderMessage::GetManyRequestReceived(message) => {
+                        let _ignored = message.tx.send(Err(AbortReason::Permission)).await;
+                    }
+                    ProviderMessage::PushRequestReceived(message) => {
+                        let _ignored = message.tx.send(Err(AbortReason::Permission)).await;
+                    }
+                    ProviderMessage::ObserveRequestReceived(message) => {
+                        let _ignored = message.tx.send(Err(AbortReason::Permission)).await;
+                    }
+                    ProviderMessage::Throttle(message) => {
+                        let _ignored = message.tx.send(Err(AbortReason::Permission)).await;
+                    }
+                    ProviderMessage::ClientConnectedNotify(_)
+                    | ProviderMessage::GetRequestReceivedNotify(_)
+                    | ProviderMessage::GetManyRequestReceivedNotify(_)
+                    | ProviderMessage::PushRequestReceivedNotify(_)
+                    | ProviderMessage::ObserveRequestReceivedNotify(_) => {}
+                }
+            }
+        });
+        events
     }
 
     fn require_trusted(&self, peer: AuthorId) -> Result<(), DbError> {
@@ -796,4 +908,69 @@ fn sync_error(error: impl std::fmt::Display) -> DbError {
 
 fn protocol_error(message: &str) -> DbError {
     DbError::Network(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use iroh_db_security::{ConsistencyMode, Permission, PermissionSet};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn raw_blob_connection_is_rejected_without_fetch_capability() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let target_directory = tempfile::tempdir().unwrap();
+        let source_device = IrohDb::open(source_directory.path()).await.unwrap();
+        let target_device = IrohDb::open(target_directory.path()).await.unwrap();
+        let source = source_device
+            .create_domain(ConsistencyMode::MultiWriter)
+            .unwrap();
+        let invitation = source
+            .invite(
+                target_device.author_id(),
+                PermissionSet::from_permissions(&[Permission::Read]),
+                PermissionSet::empty(),
+                None,
+            )
+            .unwrap();
+        let target = target_device.import_invitation(&invitation).unwrap();
+        let reference = source
+            .blobs()
+            .import_bytes(b"provider protected".to_vec(), None)
+            .await
+            .unwrap();
+        let source_node = source.start_sync().await.unwrap();
+        let target_node = target.start_sync().await.unwrap();
+        let connection = target_node
+            .core
+            .endpoint
+            .connect(source_node.addr(), iroh_blobs::ALPN)
+            .await
+            .unwrap();
+
+        assert!(
+            target
+                .inner
+                .blobs
+                .fetch(connection, reference.manifest_hash())
+                .await
+                .is_err()
+        );
+        assert!(
+            target
+                .inner
+                .blobs
+                .read(reference.manifest_hash())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        source_node.shutdown().await.unwrap();
+        target_node.shutdown().await.unwrap();
+        drop(source);
+        drop(target);
+        source_device.close().await.unwrap();
+        target_device.close().await.unwrap();
+    }
 }
