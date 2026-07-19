@@ -101,6 +101,7 @@ impl SyncNode {
 
     /// Requests this authenticated endpoint's offered invitation and imports it locally.
     pub async fn request_invitation(&self, remote: EndpointAddr) -> Result<IrohDb, DbError> {
+        let expected_issuer = author_id(remote.id);
         let connection = self
             .core
             .endpoint
@@ -124,6 +125,9 @@ impl SyncNode {
             return Err(DbError::UnauthorizedDevice);
         };
         let invitation = Invitation::decode_canonical(&payload)?;
+        if invitation.issuer() != expected_issuer {
+            return Err(DbError::UnauthorizedDevice);
+        }
         let domain = self.core.db.import_invitation(&invitation)?;
         send.finish().map_err(network_error)?;
         Ok(domain)
@@ -1047,19 +1051,14 @@ impl SyncCore {
     }
 
     fn control_grant(&self, sequence: u64, peer: AuthorId) -> Result<SyncFrame, DbError> {
-        let chain = self
+        if sequence == 0 {
+            return Err(protocol_error("control grant sequence cannot be zero"));
+        }
+        let control = self
             .db
             .inner
             .store
-            .accepted_control_chain(self.domain_id())?;
-        let index = usize::try_from(
-            sequence
-                .checked_sub(1)
-                .ok_or_else(|| protocol_error("control grant sequence cannot be zero"))?,
-        )
-        .map_err(|_| protocol_error("control grant sequence is too large"))?;
-        let control = chain
-            .get(index)
+            .accepted_control_at_sequence(self.domain_id(), sequence)?
             .ok_or_else(|| protocol_error("requested control transition is unavailable"))?;
         if !self
             .db
@@ -1092,17 +1091,13 @@ impl SyncCore {
     }
 
     fn control_id(&self, sequence: u64) -> Result<[u8; 32], DbError> {
-        let index = usize::try_from(
-            sequence
-                .checked_sub(1)
-                .ok_or_else(|| protocol_error("control sequence cannot be zero"))?,
-        )
-        .map_err(|_| protocol_error("control sequence is too large"))?;
+        if sequence == 0 {
+            return Err(protocol_error("control sequence cannot be zero"));
+        }
         self.db
             .inner
             .store
-            .accepted_control_chain(self.domain_id())?
-            .get(index)
+            .accepted_control_at_sequence(self.domain_id(), sequence)?
             .ok_or_else(|| protocol_error("control transition is unavailable"))?
             .id()
             .map_err(DbError::from)

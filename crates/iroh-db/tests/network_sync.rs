@@ -218,6 +218,174 @@ async fn controlled_domain_accepts_snapshot_from_explicit_authority() {
 }
 
 #[tokio::test]
+async fn rotated_new_member_bootstraps_snapshot_tail_and_next_control_after_restart() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let newcomer_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let newcomer_device = IrohDb::open(newcomer_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let notes = owner.collection::<Note>();
+    notes
+        .put(note("base", "checkpointed", owner.author_id()))
+        .await
+        .unwrap();
+    let (epoch_one, _) = owner.rotate_epoch(&[]).unwrap();
+    let snapshot = epoch_one.snapshot().await.unwrap();
+    let invitation = epoch_one
+        .invite(
+            newcomer_device.author_id(),
+            PermissionSet::from_permissions(&[
+                Permission::Read,
+                Permission::Write,
+                Permission::FetchBlobs,
+            ]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let newcomer = newcomer_device.import_invitation(&invitation).unwrap();
+    let newcomer_notes = newcomer.collection::<Note>();
+    notes
+        .put(note("tail", "recent", owner.author_id()))
+        .await
+        .unwrap();
+
+    let owner_node = epoch_one.start_sync().await.unwrap();
+    let newcomer_node = newcomer.start_sync().await.unwrap();
+    newcomer_node
+        .bootstrap_from(owner_node.addr(), snapshot)
+        .await
+        .unwrap();
+    let report = newcomer_node.sync_with(owner_node.addr()).await.unwrap();
+    assert_eq!(report.received(), 1);
+    assert_eq!(
+        newcomer.state_root().unwrap(),
+        epoch_one.state_root().unwrap()
+    );
+    newcomer_node.shutdown().await.unwrap();
+    drop(newcomer_notes);
+    drop(newcomer);
+    newcomer_device.close().await.unwrap();
+
+    let reopened_device = IrohDb::open(newcomer_dir.path()).await.unwrap();
+    let reopened = reopened_device.domain(epoch_one.domain_id()).unwrap();
+    let reopened_notes = reopened.collection::<Note>();
+    let reopened_node = reopened.start_sync().await.unwrap();
+    let (epoch_two, _) = epoch_one.rotate_epoch(&[]).unwrap();
+    reopened_node.sync_with(owner_node.addr()).await.unwrap();
+    assert_eq!(reopened.domain_seed().epoch(), 2);
+    assert_eq!(
+        reopened.state_root().unwrap(),
+        epoch_two.state_root().unwrap()
+    );
+    assert!(reopened.verify().await.unwrap().derived_consistent());
+
+    reopened_node.shutdown().await.unwrap();
+    owner_node.shutdown().await.unwrap();
+    drop(notes);
+    drop(owner);
+    drop(epoch_one);
+    drop(epoch_two);
+    drop(reopened);
+    drop(reopened_notes);
+    owner_device.close().await.unwrap();
+    reopened_device.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn rotated_checkpoint_carries_omitted_writer_evidence_for_snapshot_tail() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let writer_dir = tempfile::tempdir().unwrap();
+    let newcomer_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let writer_device = IrohDb::open(writer_dir.path()).await.unwrap();
+    let newcomer_device = IrohDb::open(newcomer_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let writer_invitation = owner
+        .invite(
+            writer_device.author_id(),
+            PermissionSet::from_permissions(&[
+                Permission::Read,
+                Permission::Write,
+                Permission::FetchBlobs,
+            ]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let writer = writer_device.import_invitation(&writer_invitation).unwrap();
+    let owner_notes = owner.collection::<Note>();
+    let writer_notes = writer.collection::<Note>();
+    owner_notes
+        .put(note("base", "checkpointed", owner.author_id()))
+        .await
+        .unwrap();
+    let owner_node = owner.start_sync().await.unwrap();
+    let writer_node = writer.start_sync().await.unwrap();
+    writer_node.sync_with(owner_node.addr()).await.unwrap();
+    let (epoch_one, _) = owner.rotate_epoch(&[]).unwrap();
+    writer_node.sync_with(owner_node.addr()).await.unwrap();
+    let snapshot = epoch_one.snapshot().await.unwrap();
+    let newcomer_invitation = epoch_one
+        .invite(
+            newcomer_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::FetchBlobs]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    assert!(
+        !newcomer_invitation
+            .capability_chain()
+            .iter()
+            .chain(newcomer_invitation.controller_chain())
+            .any(|capability| capability.subject() == writer.author_id())
+    );
+    assert!(
+        newcomer_invitation
+            .authority_evidence()
+            .iter()
+            .any(|capability| capability.subject() == writer.author_id())
+    );
+    let newcomer = newcomer_device
+        .import_invitation(&newcomer_invitation)
+        .unwrap();
+    let newcomer_notes = newcomer.collection::<Note>();
+    let newcomer_node = newcomer.start_sync().await.unwrap();
+    newcomer_node
+        .bootstrap_from(owner_node.addr(), snapshot)
+        .await
+        .unwrap();
+    writer_notes
+        .put(note("tail", "writer-authored", writer.author_id()))
+        .await
+        .unwrap();
+    owner_node.sync_with(writer_node.addr()).await.unwrap();
+
+    let report = newcomer_node.sync_with(owner_node.addr()).await.unwrap();
+    assert_eq!(report.received(), 1);
+    assert_eq!(newcomer.state_root().unwrap(), writer.state_root().unwrap());
+
+    newcomer_node.shutdown().await.unwrap();
+    writer_node.shutdown().await.unwrap();
+    owner_node.shutdown().await.unwrap();
+    drop(newcomer_notes);
+    drop(writer_notes);
+    drop(owner_notes);
+    drop(newcomer);
+    drop(writer);
+    drop(owner);
+    drop(epoch_one);
+    owner_device.close().await.unwrap();
+    writer_device.close().await.unwrap();
+    newcomer_device.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn sync_automatically_installs_a_non_revoked_members_next_epoch() {
     let owner_dir = tempfile::tempdir().unwrap();
     let member_dir = tempfile::tempdir().unwrap();

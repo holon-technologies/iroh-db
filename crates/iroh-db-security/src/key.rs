@@ -124,6 +124,13 @@ impl IrohSigner {
             .to_bytes()
     }
 
+    /// Signs a history-compacting authority checkpoint.
+    pub fn sign_authority_checkpoint(&self, canonical_bytes: &[u8]) -> [u8; 64] {
+        self.secret_key
+            .sign(&authority_checkpoint_signature_message(canonical_bytes))
+            .to_bytes()
+    }
+
     /// Signs a domain control transition under a control-specific context.
     pub fn sign_control(&self, canonical_control_bytes: &[u8]) -> [u8; 64] {
         self.secret_key
@@ -180,6 +187,13 @@ pub(crate) fn domain_descriptor_signature_message(canonical_bytes: &[u8]) -> Vec
 pub(crate) fn invitation_signature_message(canonical_bytes: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(31 + canonical_bytes.len());
     message.extend_from_slice(b"iroh-db/invitation-signature/v1");
+    message.extend_from_slice(canonical_bytes);
+    message
+}
+
+pub(crate) fn authority_checkpoint_signature_message(canonical_bytes: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(41 + canonical_bytes.len());
+    message.extend_from_slice(b"iroh-db/authority-checkpoint-signature/v1");
     message.extend_from_slice(canonical_bytes);
     message
 }

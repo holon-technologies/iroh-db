@@ -7,8 +7,8 @@ use std::{
 
 use iroh_db_core::{AuthorId, BlobHash, DomainId};
 use iroh_db_security::{
-    CapabilityCertificate, ConsistencyMode, ControlTransition, DomainDescriptor, IrohSigner,
-    Permission, PermissionSet,
+    CapabilityCertificate, ConsistencyMode, ControlTransition, DomainDescriptor, DomainSeed,
+    Invitation, IrohSigner, Permission, PermissionSet,
 };
 use iroh_db_store::{BlobStore, BlobStoreError, Store, StoreError};
 use redb::TableDefinition;
@@ -837,6 +837,353 @@ fn controller_equivocation_freezes_both_receipt_orders_durably() {
         reopened.current_epoch(fixture.domain),
         Err(StoreError::ControlFork { .. })
     ));
+}
+
+#[test]
+fn checkpoint_head_equivocation_freezes_without_retained_predecessor() {
+    let fixture = AuthorityFixture::new();
+    let member = IrohSigner::from_secret_bytes([121; 32]);
+    let seed = DomainSeed::from_epoch_key(fixture.domain, 2, [122; 32]);
+    let head = ControlTransition::issue(
+        fixture.domain,
+        2,
+        Some([123; 32]),
+        1,
+        Vec::new(),
+        Vec::new(),
+        fixture.owner.author(),
+        fixture.owner.author(),
+        fixture.root.id().unwrap(),
+        seed.distribution_digest(),
+        fixture.root.id().unwrap(),
+        [124; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+    let leaf = fixture
+        .root
+        .delegate_at_control(
+            &fixture.owner,
+            member.author(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            2,
+            Some(head.id().unwrap()),
+            2,
+            None,
+            [125; 32],
+        )
+        .unwrap();
+    let invitation = Invitation::issue_at_checkpoint(
+        fixture.descriptor.clone(),
+        vec![fixture.root.clone(), leaf],
+        vec![fixture.root.clone()],
+        seed,
+        Some(head.clone()),
+        Vec::new(),
+        fixture.root.id().unwrap(),
+        member.author(),
+        &fixture.owner,
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    store
+        .import_authority_checkpoint_atomic(&invitation)
+        .unwrap();
+    let conflicting = ControlTransition::issue(
+        fixture.domain,
+        2,
+        Some([123; 32]),
+        1,
+        Vec::new(),
+        Vec::new(),
+        fixture.owner.author(),
+        fixture.owner.author(),
+        fixture.root.id().unwrap(),
+        [126; 32],
+        fixture.root.id().unwrap(),
+        [127; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        store.observe_control(&conflicting),
+        Err(StoreError::ControlFork { .. })
+    ));
+    assert!(matches!(
+        store.current_epoch(fixture.domain),
+        Err(StoreError::ControlFork { .. })
+    ));
+    drop(store);
+    let reopened = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    assert!(matches!(
+        reopened.current_epoch(fixture.domain),
+        Err(StoreError::ControlFork { .. })
+    ));
+}
+
+#[test]
+fn checkpoint_rejects_omitted_sequence_zero_capability_replay() {
+    let fixture = AuthorityFixture::new();
+    let member = IrohSigner::from_secret_bytes([131; 32]);
+    let omitted = IrohSigner::from_secret_bytes([132; 32]);
+    let seed = DomainSeed::from_epoch_key(fixture.domain, 2, [133; 32]);
+    let head = ControlTransition::issue(
+        fixture.domain,
+        2,
+        Some([134; 32]),
+        1,
+        Vec::new(),
+        Vec::new(),
+        fixture.owner.author(),
+        fixture.owner.author(),
+        fixture.root.id().unwrap(),
+        seed.distribution_digest(),
+        fixture.root.id().unwrap(),
+        [135; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+    let leaf = fixture
+        .root
+        .delegate_at_control(
+            &fixture.owner,
+            member.author(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            2,
+            Some(head.id().unwrap()),
+            2,
+            None,
+            [136; 32],
+        )
+        .unwrap();
+    let invitation = Invitation::issue_at_checkpoint(
+        fixture.descriptor.clone(),
+        vec![fixture.root.clone(), leaf],
+        vec![fixture.root.clone()],
+        seed,
+        Some(head),
+        Vec::new(),
+        fixture.root.id().unwrap(),
+        member.author(),
+        &fixture.owner,
+    )
+    .unwrap();
+    let omitted_capability = fixture
+        .root
+        .delegate(
+            &fixture.owner,
+            omitted.author(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            0,
+            None,
+            [137; 32],
+        )
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    store
+        .import_authority_checkpoint_atomic(&invitation)
+        .unwrap();
+
+    assert!(
+        store
+            .install_capability_chain_atomic(&[fixture.root.clone(), omitted_capability])
+            .is_err()
+    );
+}
+
+#[test]
+fn post_checkpoint_control_can_nominate_omitted_historical_admin() {
+    let fixture = AuthorityFixture::new();
+    let member = IrohSigner::from_secret_bytes([141; 32]);
+    let seed = DomainSeed::from_epoch_key(fixture.domain, 2, [142; 32]);
+    let head = ControlTransition::issue(
+        fixture.domain,
+        2,
+        Some([143; 32]),
+        1,
+        Vec::new(),
+        Vec::new(),
+        fixture.owner.author(),
+        fixture.owner.author(),
+        fixture.root.id().unwrap(),
+        seed.distribution_digest(),
+        fixture.root.id().unwrap(),
+        [144; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+    let leaf = fixture
+        .root
+        .delegate_at_control(
+            &fixture.owner,
+            member.author(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            2,
+            Some(head.id().unwrap()),
+            2,
+            None,
+            [145; 32],
+        )
+        .unwrap();
+    let invitation = Invitation::issue_at_checkpoint(
+        fixture.descriptor.clone(),
+        vec![fixture.root.clone(), leaf],
+        vec![fixture.root.clone()],
+        seed,
+        Some(head.clone()),
+        Vec::new(),
+        fixture.root.id().unwrap(),
+        member.author(),
+        &fixture.owner,
+    )
+    .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    store
+        .import_authority_checkpoint_atomic(&invitation)
+        .unwrap();
+    let transfer = ControlTransition::issue(
+        fixture.domain,
+        3,
+        Some(head.id().unwrap()),
+        2,
+        Vec::new(),
+        Vec::new(),
+        fixture.owner.author(),
+        fixture.delegate.author(),
+        fixture.delegate_capability.id().unwrap(),
+        [146; 32],
+        fixture.root.id().unwrap(),
+        [147; 32],
+        &fixture.owner,
+    )
+    .unwrap();
+
+    store
+        .apply_control_bundle(
+            &transfer,
+            &[fixture.root.clone(), fixture.delegate_capability.clone()],
+        )
+        .unwrap();
+    assert_eq!(
+        store.current_controller(fixture.domain).unwrap(),
+        fixture.delegate.author()
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn checkpoint_preserves_newer_active_owner_leaf_instead_of_reactivating_root() {
+    let fixture = AuthorityFixture::new();
+    let source_dir = tempfile::tempdir().unwrap();
+    let source = fixture.bootstrap(source_dir.path());
+    let first = fixture.control(
+        &fixture.owner,
+        &fixture.root,
+        1,
+        None,
+        0,
+        fixture.delegate.author(),
+        151,
+    );
+    source.apply_control(&first).unwrap();
+    let seed = DomainSeed::from_epoch_key(fixture.domain, 2, [152; 32]);
+    let second = ControlTransition::issue(
+        fixture.domain,
+        2,
+        Some(first.id().unwrap()),
+        1,
+        Vec::new(),
+        Vec::new(),
+        fixture.owner.author(),
+        fixture.delegate.author(),
+        fixture.delegate_capability.id().unwrap(),
+        seed.distribution_digest(),
+        fixture.delegate_capability.id().unwrap(),
+        [153; 32],
+        &fixture.delegate,
+    )
+    .unwrap();
+    source.apply_control(&second).unwrap();
+    let refreshed_owner = fixture
+        .root
+        .delegate_at_control(
+            &fixture.owner,
+            fixture.owner.author(),
+            PermissionSet::all(),
+            PermissionSet::all(),
+            2,
+            Some(second.id().unwrap()),
+            2,
+            None,
+            [154; 32],
+        )
+        .unwrap();
+    source.install_capability(&refreshed_owner).unwrap();
+    let target = IrohSigner::from_secret_bytes([155; 32]);
+    let target_capability = refreshed_owner
+        .delegate(
+            &fixture.owner,
+            target.author(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            2,
+            None,
+            [156; 32],
+        )
+        .unwrap();
+    source.install_capability(&target_capability).unwrap();
+    let target_chain = source
+        .capability_chain(target_capability.id().unwrap())
+        .unwrap();
+    let controller_chain = source
+        .capability_chain(fixture.delegate_capability.id().unwrap())
+        .unwrap();
+    let active_chains = source
+        .active_capabilities(fixture.domain)
+        .unwrap()
+        .into_iter()
+        .map(|id| source.capability_chain(id).unwrap())
+        .collect::<Vec<_>>();
+
+    let invitation = Invitation::issue_at_checkpoint_with_evidence(
+        fixture.descriptor.clone(),
+        target_chain,
+        controller_chain,
+        &active_chains,
+        seed,
+        Some(second),
+        Vec::new(),
+        refreshed_owner.id().unwrap(),
+        target.author(),
+        &fixture.owner,
+    )
+    .unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let imported = Store::open(target_dir.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    imported
+        .import_authority_checkpoint_atomic(&invitation)
+        .unwrap();
+
+    assert_eq!(
+        imported
+            .active_capability(fixture.domain, fixture.owner.author())
+            .unwrap(),
+        Some(refreshed_owner.id().unwrap())
+    );
+    assert_ne!(
+        imported
+            .active_capability(fixture.domain, fixture.owner.author())
+            .unwrap(),
+        Some(fixture.root.id().unwrap())
+    );
 }
 
 #[test]

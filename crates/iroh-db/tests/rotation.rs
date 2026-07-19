@@ -327,3 +327,41 @@ async fn controller_transfer_authorizes_only_the_successor() {
     owner_device.close().await.unwrap();
     successor_device.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn brand_new_member_imports_a_current_rotated_domain_invitation() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let newcomer_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let newcomer_device = IrohDb::open(newcomer_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let (rotated, control) = owner.rotate_epoch(&[]).unwrap();
+    let invitation = rotated
+        .invite(
+            newcomer_device.author_id(),
+            writer_permissions(),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    assert_eq!(invitation.domain_seed().epoch(), 1);
+    assert_eq!(
+        invitation
+            .capability_chain()
+            .last()
+            .unwrap()
+            .issued_control_head(),
+        Some(control.id().unwrap())
+    );
+
+    let newcomer = newcomer_device.import_invitation(&invitation).unwrap();
+    assert_eq!(newcomer.domain_seed().epoch(), 1);
+
+    drop(owner);
+    drop(rotated);
+    drop(newcomer);
+    owner_device.close().await.unwrap();
+    newcomer_device.close().await.unwrap();
+}

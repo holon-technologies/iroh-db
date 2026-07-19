@@ -185,3 +185,61 @@ async fn online_invitation_is_released_only_to_its_authenticated_subject() {
     member_device.close().await.unwrap();
     attacker_device.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn online_invitation_must_be_signed_by_the_selected_endpoint() {
+    let owner_dir = tempfile::tempdir().unwrap();
+    let relay_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let owner_device = IrohDb::open(owner_dir.path()).await.unwrap();
+    let relay_device = IrohDb::open(relay_dir.path()).await.unwrap();
+    let target_device = IrohDb::open(target_dir.path()).await.unwrap();
+    let owner = owner_device
+        .create_domain(ConsistencyMode::MultiWriter)
+        .unwrap();
+    let relay_invitation = owner
+        .invite(
+            relay_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read, Permission::Invite]),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            None,
+        )
+        .unwrap();
+    let relay = relay_device.import_invitation(&relay_invitation).unwrap();
+    let target_invitation = owner
+        .invite(
+            target_device.author_id(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            None,
+        )
+        .unwrap();
+    let relay_node = relay.start_sync().await.unwrap();
+    relay_node.offer_invitation(&target_invitation).unwrap();
+    let target_node = target_device.start_sync().await.unwrap();
+
+    assert!(
+        target_node
+            .request_invitation(relay_node.addr())
+            .await
+            .is_err()
+    );
+
+    let owner_node = owner.start_sync().await.unwrap();
+    owner_node.offer_invitation(&target_invitation).unwrap();
+    let target = target_node
+        .request_invitation(owner_node.addr())
+        .await
+        .unwrap();
+    assert_eq!(target.domain_id(), owner.domain_id());
+
+    owner_node.shutdown().await.unwrap();
+    relay_node.shutdown().await.unwrap();
+    target_node.shutdown().await.unwrap();
+    drop(target);
+    drop(relay);
+    drop(owner);
+    owner_device.close().await.unwrap();
+    relay_device.close().await.unwrap();
+    target_device.close().await.unwrap();
+}

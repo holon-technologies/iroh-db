@@ -762,10 +762,36 @@ impl IrohDb {
             .domain_descriptor()?
             .ok_or(DbError::UnauthorizedDevice)?;
         let chain = self.inner.store.capability_chain(capability.id()?)?;
-        Invitation::issue(
+        let head = self.inner.store.control_head(self.domain_id())?;
+        let controller_capability = head.as_ref().map_or_else(
+            || {
+                self.inner
+                    .store
+                    .active_capability(self.domain_id(), descriptor.owner())?
+                    .ok_or(DbError::UnauthorizedDevice)
+            },
+            |control| Ok(control.controller_capability()),
+        )?;
+        let controller_chain = self.inner.store.capability_chain(controller_capability)?;
+        let issuer_capability = capability
+            .issuer_capability()
+            .ok_or(DbError::UnauthorizedDevice)?;
+        let active_chains = self
+            .inner
+            .store
+            .active_capabilities(self.domain_id())?
+            .into_iter()
+            .map(|id| self.inner.store.capability_chain(id).map_err(DbError::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        Invitation::issue_at_checkpoint_with_evidence(
             descriptor,
             chain,
+            controller_chain,
+            &active_chains,
             self.domain_seed(),
+            head,
+            self.inner.store.subject_revocations(self.domain_id())?,
+            issuer_capability,
             subject,
             &self.inner.credentials.signer(),
         )
@@ -786,20 +812,39 @@ impl IrohDb {
         if invitation.subject() != self.author_id() {
             return Err(DbError::UnauthorizedDevice);
         }
-        if self
+        let authority_exists = self
             .inner
             .store
             .domain_descriptor(invitation.descriptor().domain_id())?
-            .is_some()
-        {
+            .is_some();
+        if authority_exists {
+            let domain_id = invitation.descriptor().domain_id();
+            let current_head = self.inner.store.control_head(domain_id)?;
+            let current_head_id = current_head
+                .as_ref()
+                .map(ControlTransition::id)
+                .transpose()?;
+            let checkpoint_head_id = invitation
+                .authority_checkpoint()
+                .head()
+                .map(ControlTransition::id)
+                .transpose()?;
+            if self.inner.store.current_epoch(domain_id)? != invitation.domain_seed().epoch()
+                || current_head_id != checkpoint_head_id
+            {
+                return Err(DbError::UnauthorizedDevice);
+            }
             self.inner
                 .store
-                .current_epoch(invitation.descriptor().domain_id())?;
+                .install_capability_chain_atomic(invitation.capability_chain())?;
+            self.inner
+                .store
+                .trust_author(domain_id, invitation.issuer())?;
+        } else {
+            self.inner
+                .store
+                .import_authority_checkpoint_atomic(invitation)?;
         }
-        let chain = invitation.capability_chain();
-        self.inner
-            .store
-            .import_domain_authority_atomic(invitation.descriptor(), chain)?;
         self.inner
             .credentials
             .store_domain(&invitation.domain_seed())?;

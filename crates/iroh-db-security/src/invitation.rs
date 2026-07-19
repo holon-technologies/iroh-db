@@ -1,17 +1,19 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead as _, KeyInit as _, Payload},
 };
-use iroh_db_core::{AuthorId, DomainId};
+use iroh_db_core::{AuthorId, CapabilityId, DomainId};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{
-    CapabilityCertificate, DomainDescriptor, DomainKey, DomainSeed, IrohSigner, Permission,
-    key::invitation_signature_message,
+    AuthorityCheckpoint, CapabilityCertificate, ControlTransition, DomainDescriptor, DomainKey,
+    DomainSeed, IrohSigner, Permission, key::invitation_signature_message,
 };
 
-const INVITATION_VERSION: u16 = 1;
-const MAX_INVITATION_BYTES: usize = 64 * 1024;
+const INVITATION_VERSION: u16 = 2;
+const MAX_INVITATION_BYTES: usize = 1024 * 1024;
 const TICKET_AAD: &[u8] = b"iroh-db/offline-invitation-ticket/v1";
 
 /// A signed endpoint-targeted domain bootstrap payload.
@@ -19,6 +21,9 @@ const TICKET_AAD: &[u8] = b"iroh-db/offline-invitation-ticket/v1";
 pub struct Invitation {
     descriptor: DomainDescriptor,
     chain: Vec<CapabilityCertificate>,
+    controller_chain: Vec<CapabilityCertificate>,
+    authority_evidence: Vec<CapabilityCertificate>,
+    checkpoint: AuthorityCheckpoint,
     seed: DomainSeed,
     subject: AuthorId,
     issuer: AuthorId,
@@ -35,11 +40,117 @@ impl Invitation {
         subject: AuthorId,
         issuer: &IrohSigner,
     ) -> Result<Self, InvitationError> {
+        let root = chain.first().ok_or(InvitationError::InvalidChain)?.clone();
+        let issuer_capability = chain
+            .last()
+            .filter(|capability| capability.subject() == issuer.author())
+            .or_else(|| chain.iter().rev().nth(1))
+            .ok_or(InvitationError::InvalidChain)?
+            .id()
+            .map_err(authority_error)?;
+        Self::issue_at_checkpoint(
+            descriptor,
+            chain,
+            vec![root],
+            seed,
+            None,
+            Vec::new(),
+            issuer_capability,
+            subject,
+            issuer,
+        )
+    }
+
+    /// Issues a current-epoch invitation carrying a signed compact authority baseline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_at_checkpoint(
+        descriptor: DomainDescriptor,
+        chain: Vec<CapabilityCertificate>,
+        controller_chain: Vec<CapabilityCertificate>,
+        seed: DomainSeed,
+        head: Option<ControlTransition>,
+        subject_revocations: Vec<(AuthorId, u64)>,
+        issuer_capability: CapabilityId,
+        subject: AuthorId,
+        issuer: &IrohSigner,
+    ) -> Result<Self, InvitationError> {
+        let active_chains = vec![chain.clone(), controller_chain.clone()];
+        Self::issue_at_checkpoint_with_evidence(
+            descriptor,
+            chain,
+            controller_chain,
+            &active_chains,
+            seed,
+            head,
+            subject_revocations,
+            issuer_capability,
+            subject,
+            issuer,
+        )
+    }
+
+    /// Issues a checkpoint with complete evidence for the domain's active members.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_at_checkpoint_with_evidence(
+        descriptor: DomainDescriptor,
+        chain: Vec<CapabilityCertificate>,
+        controller_chain: Vec<CapabilityCertificate>,
+        active_chains: &[Vec<CapabilityCertificate>],
+        seed: DomainSeed,
+        head: Option<ControlTransition>,
+        subject_revocations: Vec<(AuthorId, u64)>,
+        issuer_capability: CapabilityId,
+        subject: AuthorId,
+        issuer: &IrohSigner,
+    ) -> Result<Self, InvitationError> {
         let mut nonce = [0_u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| InvitationError::RandomnessUnavailable)?;
+        let mut evidence = BTreeMap::new();
+        for capability in chain
+            .iter()
+            .chain(&controller_chain)
+            .chain(active_chains.iter().flatten())
+        {
+            evidence.insert(
+                capability.id().map_err(authority_error)?,
+                capability.clone(),
+            );
+        }
+        let capability_ids = evidence.keys().copied().collect::<Vec<_>>();
+        let authority_evidence = evidence.into_values().collect::<Vec<_>>();
+        let leaf = chain.last().ok_or(InvitationError::InvalidChain)?;
+        let controller = controller_chain
+            .last()
+            .ok_or(InvitationError::InvalidChain)?;
+        let mut active_capability_ids = active_chains
+            .iter()
+            .filter_map(|active_chain| active_chain.last())
+            .map(CapabilityCertificate::id)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(authority_error)?;
+        active_capability_ids.extend([
+            leaf.id().map_err(authority_error)?,
+            controller.id().map_err(authority_error)?,
+            issuer_capability,
+        ]);
+        let checkpoint = AuthorityCheckpoint::issue(
+            descriptor.domain_id(),
+            seed.epoch(),
+            head,
+            capability_ids,
+            active_capability_ids,
+            subject_revocations,
+            issuer_capability,
+            subject,
+            issuer,
+        )
+        .map_err(authority_error)?;
         let mut invitation = Self {
             descriptor,
             chain,
+            controller_chain,
+            authority_evidence,
+            checkpoint,
             seed,
             subject,
             issuer: issuer.author(),
@@ -56,6 +167,10 @@ impl Invitation {
         self.subject
     }
 
+    pub const fn issuer(&self) -> AuthorId {
+        self.issuer
+    }
+
     /// Returns the signed immutable domain descriptor.
     pub const fn descriptor(&self) -> &DomainDescriptor {
         &self.descriptor
@@ -64,6 +179,18 @@ impl Invitation {
     /// Returns the validated root-to-leaf capability chain.
     pub fn capability_chain(&self) -> &[CapabilityCertificate] {
         &self.chain
+    }
+
+    pub fn controller_chain(&self) -> &[CapabilityCertificate] {
+        &self.controller_chain
+    }
+
+    pub fn authority_evidence(&self) -> &[CapabilityCertificate] {
+        &self.authority_evidence
+    }
+
+    pub const fn authority_checkpoint(&self) -> &AuthorityCheckpoint {
+        &self.checkpoint
     }
 
     /// Exports the sensitive current epoch seed for the targeted key-vault import path.
@@ -102,9 +229,24 @@ impl Invitation {
             .iter()
             .map(|bytes| CapabilityCertificate::decode_canonical(bytes).map_err(authority_error))
             .collect::<Result<Vec<_>, _>>()?;
+        let controller_chain = content
+            .controller_chain
+            .iter()
+            .map(|bytes| CapabilityCertificate::decode_canonical(bytes).map_err(authority_error))
+            .collect::<Result<Vec<_>, _>>()?;
+        let authority_evidence = content
+            .authority_evidence
+            .iter()
+            .map(|bytes| CapabilityCertificate::decode_canonical(bytes).map_err(authority_error))
+            .collect::<Result<Vec<_>, _>>()?;
+        let checkpoint =
+            AuthorityCheckpoint::decode_canonical(&content.checkpoint).map_err(authority_error)?;
         let invitation = Self {
             descriptor,
             chain,
+            controller_chain,
+            authority_evidence,
+            checkpoint,
             seed: DomainSeed::from_parts(
                 content.domain_id,
                 content.epoch,
@@ -154,6 +296,16 @@ impl Invitation {
             .iter()
             .map(|capability| capability.encode_canonical().map_err(authority_error))
             .collect::<Result<Vec<_>, _>>()?;
+        let controller_chain = self
+            .controller_chain
+            .iter()
+            .map(|capability| capability.encode_canonical().map_err(authority_error))
+            .collect::<Result<Vec<_>, _>>()?;
+        let authority_evidence = self
+            .authority_evidence
+            .iter()
+            .map(|capability| capability.encode_canonical().map_err(authority_error))
+            .collect::<Result<Vec<_>, _>>()?;
         minicbor::to_vec(InvitationContent {
             version: INVITATION_VERSION,
             descriptor: self
@@ -166,6 +318,12 @@ impl Invitation {
             domain_key: *self.seed.domain_key().as_bytes(),
             subject: self.subject,
             nonce: self.nonce,
+            controller_chain,
+            authority_evidence,
+            checkpoint: self
+                .checkpoint
+                .encode_canonical()
+                .map_err(authority_error)?,
         })
         .map_err(codec_error)
     }
@@ -192,6 +350,168 @@ impl Invitation {
             || leaf.issuer_endpoint() != self.issuer
         {
             return Err(InvitationError::InvalidChain);
+        }
+        self.validate_checkpoint(root, leaf)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn validate_checkpoint(
+        &self,
+        root: &CapabilityCertificate,
+        leaf: &CapabilityCertificate,
+    ) -> Result<(), InvitationError> {
+        self.checkpoint.verify().map_err(authority_error)?;
+        if self.checkpoint.domain_id() != self.descriptor.domain_id()
+            || self.checkpoint.epoch() != self.seed.epoch()
+            || self.checkpoint.subject() != self.subject
+            || self.checkpoint.issuer() != self.issuer
+        {
+            return Err(InvitationError::InvalidChain);
+        }
+        let expected_anchor = self
+            .checkpoint
+            .head()
+            .map(ControlTransition::id)
+            .transpose()
+            .map_err(authority_error)?;
+        let expected_sequence = self
+            .checkpoint
+            .head()
+            .map_or(0, ControlTransition::sequence);
+        if leaf.issued_control_sequence() != expected_sequence
+            || leaf.issued_control_head() != expected_anchor
+        {
+            return Err(InvitationError::InvalidChain);
+        }
+        let controller = self
+            .controller_chain
+            .last()
+            .ok_or(InvitationError::InvalidChain)?;
+        if self.controller_chain.first() != Some(root)
+            || self
+                .controller_chain
+                .iter()
+                .any(|capability| capability.domain_id() != self.descriptor.domain_id())
+        {
+            return Err(InvitationError::InvalidChain);
+        }
+        for pair in self.controller_chain.windows(2) {
+            pair[1]
+                .validate_delegation(&pair[0])
+                .map_err(authority_error)?;
+        }
+        let (controller_subject, controller_id) = self.checkpoint.head().map_or(
+            (self.descriptor.owner(), self.controller_chain[0].id()),
+            |head| (head.controller(), Ok(head.controller_capability())),
+        );
+        if let Some(head) = self.checkpoint.head() {
+            head.verify().map_err(authority_error)?;
+            if self.seed.distribution_digest() != head.key_distribution_digest() {
+                return Err(InvitationError::InvalidChain);
+            }
+            for subject in head.revoked_subjects() {
+                if !self
+                    .checkpoint
+                    .subject_revocations()
+                    .contains(&(*subject, head.sequence()))
+                {
+                    return Err(InvitationError::InvalidChain);
+                }
+            }
+        }
+        if controller.subject() != controller_subject
+            || controller.id().map_err(authority_error)?
+                != controller_id.map_err(authority_error)?
+            || !controller.permits(Permission::Admin, self.seed.epoch())
+        {
+            return Err(InvitationError::InvalidChain);
+        }
+        let ids = self
+            .authority_evidence
+            .iter()
+            .map(CapabilityCertificate::id)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(authority_error)?;
+        if !ids.windows(2).all(|pair| pair[0] < pair[1])
+            || ids.as_slice() != self.checkpoint.capability_ids()
+        {
+            return Err(InvitationError::InvalidChain);
+        }
+        let evidence = self
+            .authority_evidence
+            .iter()
+            .zip(ids.iter().copied())
+            .map(|(capability, id)| (id, capability))
+            .collect::<BTreeMap<_, _>>();
+        let root_id = root.id().map_err(authority_error)?;
+        if evidence.get(&root_id).copied() != Some(root)
+            || self
+                .chain
+                .iter()
+                .chain(&self.controller_chain)
+                .any(|capability| {
+                    capability
+                        .id()
+                        .ok()
+                        .and_then(|id| evidence.get(&id).copied())
+                        != Some(capability)
+                })
+        {
+            return Err(InvitationError::InvalidChain);
+        }
+        for capability in &self.authority_evidence {
+            if capability.domain_id() != self.descriptor.domain_id() {
+                return Err(InvitationError::InvalidChain);
+            }
+            if let Some(parent_id) = capability.issuer_capability() {
+                let parent = evidence
+                    .get(&parent_id)
+                    .ok_or(InvitationError::InvalidChain)?;
+                capability
+                    .validate_delegation(parent)
+                    .map_err(authority_error)?;
+            } else if capability != root {
+                return Err(InvitationError::InvalidChain);
+            }
+        }
+        let issuer_capability = self
+            .authority_evidence
+            .iter()
+            .find(|capability| capability.id().ok() == Some(self.checkpoint.issuer_capability()))
+            .ok_or(InvitationError::InvalidChain)?;
+        if issuer_capability.subject() != self.issuer
+            || !issuer_capability.permits(Permission::Invite, self.seed.epoch())
+        {
+            return Err(InvitationError::InvalidChain);
+        }
+        let required_active = [
+            leaf.id().map_err(authority_error)?,
+            controller.id().map_err(authority_error)?,
+            self.checkpoint.issuer_capability(),
+        ];
+        if required_active
+            .iter()
+            .any(|id| !self.checkpoint.active_capability_ids().contains(id))
+        {
+            return Err(InvitationError::InvalidChain);
+        }
+        let mut active_subjects = BTreeSet::new();
+        for id in self.checkpoint.active_capability_ids() {
+            let capability = evidence.get(id).ok_or(InvitationError::InvalidChain)?;
+            if !active_subjects.insert(capability.subject()) {
+                return Err(InvitationError::InvalidChain);
+            }
+        }
+        for capability in &self.authority_evidence {
+            if self
+                .checkpoint
+                .subject_revocations()
+                .iter()
+                .find(|(subject, _)| *subject == capability.subject())
+                .is_some_and(|(_, sequence)| *sequence > capability.issued_control_sequence())
+            {
+                return Err(InvitationError::InvalidChain);
+            }
         }
         Ok(())
     }
@@ -322,6 +642,12 @@ struct InvitationContent {
     subject: AuthorId,
     #[n(7)]
     nonce: [u8; 32],
+    #[n(8)]
+    controller_chain: Vec<Vec<u8>>,
+    #[n(9)]
+    checkpoint: Vec<u8>,
+    #[n(10)]
+    authority_evidence: Vec<Vec<u8>>,
 }
 
 #[derive(minicbor::Encode, minicbor::Decode)]

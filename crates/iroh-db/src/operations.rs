@@ -113,6 +113,15 @@ impl IrohDb {
         if !self
             .inner
             .store
+            .authority_checkpoint_consistent(self.domain_id())?
+        {
+            return Err(DbError::Operation(
+                "authority checkpoint evidence is incomplete".into(),
+            ));
+        }
+        if !self
+            .inner
+            .store
             .subject_revocations_consistent(self.domain_id())?
         {
             return Err(DbError::Operation(

@@ -1,6 +1,6 @@
 use iroh_db_security::{
-    CapabilityCertificate, ConsistencyMode, DomainDescriptor, DomainSeed, Invitation,
-    InvitationTicket, IrohSigner, Permission, PermissionSet,
+    CapabilityCertificate, ConsistencyMode, ControlTransition, DomainDescriptor, DomainSeed,
+    Invitation, InvitationTicket, IrohSigner, Permission, PermissionSet,
 };
 
 #[test]
@@ -72,4 +72,74 @@ fn modified_online_invitation_fails_before_key_import() {
     let last = encoded.len() - 1;
     encoded[last] ^= 1;
     assert!(Invitation::decode_canonical(&encoded).is_err());
+}
+
+#[test]
+fn rotated_invitation_rejects_epoch_key_not_bound_to_control() {
+    let owner = IrohSigner::from_secret_bytes([41; 32]);
+    let member = IrohSigner::from_secret_bytes([42; 32]);
+    let initial_seed = DomainSeed::generate().unwrap();
+    let invited_seed = initial_seed.next_epoch().unwrap();
+    let descriptor = DomainDescriptor::issue(
+        initial_seed.domain_id(),
+        ConsistencyMode::MultiWriter,
+        &owner,
+        [43; 32],
+    )
+    .unwrap();
+    let root = CapabilityCertificate::issue_root(
+        initial_seed.domain_id(),
+        PermissionSet::all(),
+        &owner,
+        [44; 32],
+    )
+    .unwrap();
+    let control = ControlTransition::issue(
+        initial_seed.domain_id(),
+        1,
+        None,
+        0,
+        Vec::new(),
+        Vec::new(),
+        owner.author(),
+        owner.author(),
+        root.id().unwrap(),
+        [45; 32],
+        root.id().unwrap(),
+        [46; 32],
+        &owner,
+    )
+    .unwrap();
+    assert_ne!(
+        invited_seed.distribution_digest(),
+        control.key_distribution_digest()
+    );
+    let leaf = root
+        .delegate_at_control(
+            &owner,
+            member.author(),
+            PermissionSet::from_permissions(&[Permission::Read]),
+            PermissionSet::empty(),
+            1,
+            Some(control.id().unwrap()),
+            1,
+            None,
+            [47; 32],
+        )
+        .unwrap();
+
+    assert!(
+        Invitation::issue_at_checkpoint(
+            descriptor,
+            vec![root.clone(), leaf],
+            vec![root.clone()],
+            invited_seed,
+            Some(control),
+            Vec::new(),
+            root.id().unwrap(),
+            member.author(),
+            &owner,
+        )
+        .is_err()
+    );
 }

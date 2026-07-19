@@ -65,7 +65,7 @@ async fn verify_repair_backup_and_restore_preserve_state_root() {
 #[test]
 fn restore_rejects_tampered_backup_before_creating_destination() {
     let source = tempfile::tempdir().unwrap();
-    std::fs::write(source.path().join("FORMAT"), "iroh-db 3.0\n").unwrap();
+    std::fs::write(source.path().join("FORMAT"), "iroh-db 4.0\n").unwrap();
     std::fs::create_dir(source.path().join("locks")).unwrap();
     std::fs::write(source.path().join("locks/writer.lock"), b"").unwrap();
     std::fs::write(source.path().join("payload"), b"original").unwrap();

@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod authority;
+mod checkpoint;
 mod commit;
 mod credentials;
 mod gossip;
@@ -14,6 +15,7 @@ pub use authority::{
     AuthorityError, CapabilityCertificate, ConsistencyMode, ControlTransition, DomainDescriptor,
     Permission, PermissionSet,
 };
+pub use checkpoint::{AuthorityCheckpoint, CheckpointError};
 pub use commit::{SecurityError, open_commit, seal_commit};
 pub use credentials::{DomainSeed, LocalCredentials};
 pub use gossip::verify_gossip_signature;
