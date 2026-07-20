@@ -16,7 +16,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-deny
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-      - run: cargo publish --workspace --dry-run
+      - run: cargo doc --workspace --no-deps
+      - run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+      - run: cargo deny check
+      - run: bash scripts/verify-packages.sh
+      # Cargo cannot verify mutually unpublished workspace tarballs without a
+      # registry; the extracted archives are compiled by the preceding step.
+      - run: cargo publish --workspace --dry-run --no-verify

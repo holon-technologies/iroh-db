@@ -79,3 +79,5 @@ The MSRV is Rust 1.91. Fuzz targets live in `fuzz/`; the extended reconnect soak
 ## License
 
 Licensed under either Apache-2.0 or MIT, at your option.
+Reviewed dependency license notices are listed in
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).

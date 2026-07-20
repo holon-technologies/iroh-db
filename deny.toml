@@ -1,6 +1,12 @@
 [advisories]
 version = 2
 yanked = "deny"
+unused-ignored-advisory = "deny"
+ignore = [
+  { id = "RUSTSEC-2023-0089", reason = "informational unmaintained atomic-polyfill is reachable only through current iroh ecosystem dependencies via postcard/heapless; RustSec has no patched version" },
+  { id = "RUSTSEC-2024-0436", reason = "informational unmaintained paste is reachable only through current iroh portmapper/netwatch; RustSec has no patched version" },
+  { id = "RUSTSEC-2024-0370", reason = "informational unmaintained proc-macro-error is reachable only through current iroh-blobs/bao-tree/genawaiter; RustSec has no patched version" },
+]
 
 [licenses]
 version = 2
@@ -14,6 +20,17 @@ allow = [
   "MPL-2.0",
   "Unicode-3.0",
   "Zlib",
+]
+exceptions = [
+  # Exact versions keep future packages and dependency upgrades under these
+  # licenses review-gated instead of allowing either license globally.
+  { crate = "async_io_stream@0.3.3", allow = ["Unlicense"] },
+  { crate = "pharos@0.5.3", allow = ["Unlicense"] },
+  { crate = "ws_stream_wasm@0.7.5", allow = ["Unlicense"] },
+  { crate = "minicbor@2.2.2", allow = ["BlueOak-1.0.0"] },
+  { crate = "minicbor-derive@0.19.4", allow = ["BlueOak-1.0.0"] },
+  { crate = "webpki-root-certs@1.0.9", allow = ["CDLA-Permissive-2.0"] },
+  { crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [bans]

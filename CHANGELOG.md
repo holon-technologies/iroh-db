@@ -10,3 +10,6 @@ All notable changes are documented here. The project follows semantic versioning
 - Lazy multi-provider encrypted blob streaming with seek, retry, prefetch, and transfer counters.
 - Verification, repair, checksummed backup/restore, operational metrics, CLI, CI, fuzz targets, and churn/soak harnesses.
 - Durable authenticated snapshot baselines make verification, repair, and equivocation quarantine reconstruct snapshot-plus-tail state without trusting mutable materialized tables.
+- Full dependency-policy checks are release-blocking with exact reviewed
+  license exceptions, reasoned upstream advisory exceptions, and third-party
+  notices.

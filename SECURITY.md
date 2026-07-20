@@ -6,6 +6,9 @@ Report suspected vulnerabilities privately to the maintainers. Do not include ke
 
 - Run format, strict Clippy, all workspace tests, documentation, MSRV, and dependency/advisory checks.
 - Run both fuzz targets against their retained corpora and the extended reconnect/partition soak.
+- Review every package-scoped license or advisory exception in `deny.toml`;
+  exceptions must identify an exact package/version or advisory ID, explain the
+  current upstream path, and be removed as soon as it no longer applies.
 - Review changes to signature contexts, canonical codecs, AEAD nonce/AAD construction, capability narrowing, control succession, epoch cuts, invitation targeting, and bounded protocol inputs.
 - Confirm secrets remain redacted and key-vault files are owner-only after create, backup, and restore.
 - Confirm repair and restore use a new/in-memory candidate and never overwrite the only known-good copy before verification.
