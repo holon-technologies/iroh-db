@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ApplyOutcome","MaterializedError","StoreError"],"struct":["BlobStoreError","IndexValue","MaterializedRecord","SnapshotBaseline","Store","StoredRecord"],"trait":["BlobStore"],"type":["BlobFuture"]};

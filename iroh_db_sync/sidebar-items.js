@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_CAPABILITY_BYTES","MAX_CAPABILITY_CHAIN","MAX_CONTROL_CAPABILITIES","MAX_CONTROL_FRAME","MAX_GOSSIP_HINT","MAX_PROTOCOL_VERSION","MAX_REFERENCES","MAX_SESSION_REFERENCES","MIN_PROTOCOL_VERSION"],"enum":["SyncFrame","SyncFrameError"],"fn":["missing_commits","negotiate_protocol"],"struct":["GossipHint"]};
