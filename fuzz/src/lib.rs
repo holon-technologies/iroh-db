@@ -3,10 +3,11 @@
 use std::fmt::Debug;
 
 use iroh_db_core::{
-    AuthorId, CapabilityId, CollectionId, CommitBody, CommitEnvelope, CommitHeader, CommitId,
-    CommitSignature, CrdtKind, DomainId, Dot, FieldDescriptor, GrowOnlySet, Immutable, Lww, Merge,
-    MultiValue, Operation, OperationKind, OrSet, OrderedList, PnCounter, SchemaDescriptor,
-    SchemaId, TransactionId, VersionVector, decode_record_fields, encode_record_fields,
+    AuthorId, BlobHash, CapabilityId, CollectionId, CommitBody, CommitEnvelope, CommitHeader,
+    CommitId, CommitSignature, CrdtKind, DomainId, Dot, FieldDescriptor, GrowOnlySet, Immutable,
+    Lww, Merge, MigrationId, MultiValue, Operation, OperationKind, OrSet, OrderedList, PnCounter,
+    SchemaActivation, SchemaDescriptor, SchemaId, SchemaStage, TransactionId, VersionVector,
+    decode_record_fields, encode_record_fields,
 };
 use iroh_db_security::{
     AuthorityCheckpoint, CapabilityCertificate, ConsistencyMode, ControlTransition,
@@ -23,6 +24,8 @@ const VALID_DOMAIN_DESCRIPTOR: &[u8] = b"valid:security:descriptor:";
 const VALID_SCHEMA: &[u8] = b"valid:state:schema:";
 const VALID_RECORD_FIELDS: &[u8] = b"valid:state:fields:";
 const VALID_MATERIALIZED_RECORD: &[u8] = b"valid:state:materialized:";
+const VALID_SCHEMA_STAGE: &[u8] = b"valid:state:migration-stage:";
+const VALID_SCHEMA_ACTIVATION: &[u8] = b"valid:state:migration-activation:";
 
 /// Exercises every canonical commit decoder and its successful round trip.
 pub fn exercise_commit_decode(data: &[u8]) {
@@ -86,6 +89,12 @@ pub fn exercise_state_decode(data: &[u8]) {
     let _ = decode_record_fields(data);
     if let Ok(value) = MaterializedRecord::decode_canonical(data) {
         assert_eq!(value.encode_canonical().unwrap(), data);
+    }
+    if let Ok(value) = SchemaStage::decode_canonical(data) {
+        assert_eq!(value.encode_canonical(), data);
+    }
+    if let Ok(value) = SchemaActivation::decode_canonical(data) {
+        assert_eq!(value.encode_canonical(), data);
     }
 }
 
@@ -257,6 +266,8 @@ fn valid_sync_seed(data: &[u8]) -> Option<Vec<u8>> {
             SyncFrame::Hello {
                 nonce: seed_array(seed, 0),
                 max_frame: u32::try_from(MAX_CONTROL_FRAME).unwrap(),
+                min_protocol: iroh_db_sync::MIN_PROTOCOL_VERSION,
+                max_protocol: iroh_db_sync::MAX_PROTOCOL_VERSION,
             }
             .encode_canonical()
             .expect("the structured frame is valid"),
@@ -322,6 +333,42 @@ fn valid_state_seed(data: &[u8]) -> Option<Vec<u8>> {
             .expect("the structured record fields stay bounded"),
         );
     }
+    if let Some(seed) = data.strip_prefix(VALID_SCHEMA_STAGE) {
+        let (from, to) = migration_schemas();
+        let record_id: Vec<_> = seed.iter().copied().take(128).collect();
+        let state = encode_record_fields([(1, record_id.clone())])
+            .expect("the structured migration state stays bounded");
+        let target = MaterializedRecord::upsert(to.clone(), record_id.clone(), state, vec![])
+            .expect("the structured migration target stays bounded")
+            .encode_canonical()
+            .expect("the structured migration target encodes");
+        return Some(
+            SchemaStage::new(
+                MigrationId::from_bytes(seed_array(seed, 128)),
+                from,
+                to,
+                record_id,
+                BlobHash::from_bytes(seed_array(seed, 160)),
+                target,
+            )
+            .expect("the structured stage is valid")
+            .encode_canonical(),
+        );
+    }
+    if let Some(seed) = data.strip_prefix(VALID_SCHEMA_ACTIVATION) {
+        let (from, to) = migration_schemas();
+        return Some(
+            SchemaActivation::new(
+                MigrationId::from_bytes(seed_array(seed, 0)),
+                from,
+                to,
+                seed_u64(seed, 32),
+                BlobHash::from_bytes(seed_array(seed, 40)),
+            )
+            .expect("the structured activation is valid")
+            .encode_canonical(),
+        );
+    }
 
     data.strip_prefix(VALID_MATERIALIZED_RECORD).map(|seed| {
         let state = encode_record_fields([(1, seed.iter().copied().take(256).collect())])
@@ -339,6 +386,25 @@ fn valid_state_seed(data: &[u8]) -> Option<Vec<u8>> {
         .encode_canonical()
         .expect("the structured materialized record encodes")
     })
+}
+
+fn migration_schemas() -> (SchemaDescriptor, SchemaDescriptor) {
+    let from = SchemaDescriptor::new(
+        "fuzz-migration-records",
+        1,
+        vec![FieldDescriptor::new(1, "id", CrdtKind::Immutable, "Vec<u8>").record_id()],
+    )
+    .expect("the structured source schema is valid");
+    let to = SchemaDescriptor::new(
+        "fuzz-migration-records",
+        2,
+        vec![
+            FieldDescriptor::new(1, "id", CrdtKind::Immutable, "Vec<u8>").record_id(),
+            FieldDescriptor::new(2, "value", CrdtKind::Lww, "Vec<u8>"),
+        ],
+    )
+    .expect("the structured target schema is valid");
+    (from, to)
 }
 
 fn sample_schema(seed: &[u8]) -> SchemaDescriptor {
@@ -399,5 +465,11 @@ mod tests {
 
         let materialized = valid_state_seed(b"valid:state:materialized:mutable").unwrap();
         MaterializedRecord::decode_canonical(&materialized).unwrap();
+
+        let stage = valid_state_seed(b"valid:state:migration-stage:mutable").unwrap();
+        SchemaStage::decode_canonical(&stage).unwrap();
+
+        let activation = valid_state_seed(b"valid:state:migration-activation:mutable").unwrap();
+        SchemaActivation::decode_canonical(&activation).unwrap();
     }
 }

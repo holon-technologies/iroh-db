@@ -51,6 +51,9 @@ pub struct OperationalMetrics {
     frontier_size: usize,
     materialized_records: usize,
     local_domains: usize,
+    active_migrations: usize,
+    staged_migration_records: usize,
+    frozen_migrations: usize,
 }
 
 impl OperationalMetrics {
@@ -68,6 +71,18 @@ impl OperationalMetrics {
 
     pub const fn local_domains(self) -> usize {
         self.local_domains
+    }
+
+    pub const fn active_migrations(self) -> usize {
+        self.active_migrations
+    }
+
+    pub const fn staged_migration_records(self) -> usize {
+        self.staged_migration_records
+    }
+
+    pub const fn frozen_migrations(self) -> usize {
+        self.frozen_migrations
     }
 }
 
@@ -92,6 +107,8 @@ impl VerificationReport {
 impl IrohDb {
     /// Returns a low-cardinality operational snapshot safe for metrics exporters.
     pub fn operational_metrics(&self) -> Result<OperationalMetrics, DbError> {
+        let (active_migrations, staged_migration_records, frozen_migrations) =
+            self.inner.store.migration_counts(self.domain_id())?;
         Ok(OperationalMetrics {
             accepted_commits: self
                 .inner
@@ -105,6 +122,9 @@ impl IrohDb {
                 .export_materialized(self.domain_id())?
                 .len(),
             local_domains: self.domains()?.len(),
+            active_migrations,
+            staged_migration_records,
+            frozen_migrations,
         })
     }
 

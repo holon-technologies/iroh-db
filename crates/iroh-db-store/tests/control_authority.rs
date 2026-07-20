@@ -615,7 +615,7 @@ fn corrupt_subject_revocation_index_fails_closed_and_repairs_from_control() {
     );
     drop(store);
 
-    let database = redb::Database::create(directory.path().join("meta.redb")).unwrap();
+    let database = redb::Database::create(directory.path().join("meta-v6.redb")).unwrap();
     let write = database.begin_write().unwrap();
     {
         let mut table = write.open_table(SUBJECT_REVOCATIONS).unwrap();

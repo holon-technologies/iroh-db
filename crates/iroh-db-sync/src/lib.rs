@@ -12,7 +12,11 @@ pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
 pub const MAX_REFERENCES: usize = 4_096;
 /// Maximum aggregate immutable references accepted during one reconciliation round.
 pub const MAX_SESSION_REFERENCES: usize = 65_536;
-const PROTOCOL_VERSION: u16 = 2;
+const WIRE_FORMAT_VERSION: u16 = 3;
+/// Oldest commit/sync protocol understood by this release.
+pub const MIN_PROTOCOL_VERSION: u16 = 3;
+/// Newest commit/sync protocol understood by this release.
+pub const MAX_PROTOCOL_VERSION: u16 = 3;
 const GOSSIP_VERSION: u16 = 1;
 /// Maximum encoded gossip announcement size.
 pub const MAX_GOSSIP_HINT: usize = 512;
@@ -131,6 +135,10 @@ pub enum SyncFrame {
         nonce: [u8; 32],
         /// Largest control frame accepted by the sender.
         max_frame: u32,
+        /// Oldest object protocol the sender can safely accept.
+        min_protocol: u16,
+        /// Newest object protocol the sender can safely accept.
+        max_protocol: u16,
     },
     /// Proves possession of authorization material for exactly one domain.
     DomainRequest {
@@ -322,6 +330,38 @@ pub fn missing_commits(
         .collect())
 }
 
+/// Selects the newest protocol supported by both endpoints.
+pub fn negotiate_protocol(
+    local_min: u16,
+    local_max: u16,
+    remote_min: u16,
+    remote_max: u16,
+) -> Result<u16, SyncFrameError> {
+    if local_min > local_max {
+        return Err(SyncFrameError::InvalidProtocolRange {
+            min: local_min,
+            max: local_max,
+        });
+    }
+    if remote_min > remote_max {
+        return Err(SyncFrameError::InvalidProtocolRange {
+            min: remote_min,
+            max: remote_max,
+        });
+    }
+    let minimum = local_min.max(remote_min);
+    let maximum = local_max.min(remote_max);
+    if minimum > maximum {
+        return Err(SyncFrameError::NoCommonProtocol {
+            local_min,
+            local_max,
+            remote_min,
+            remote_max,
+        });
+    }
+    Ok(maximum)
+}
+
 /// A rejected control frame or reconciliation plan.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SyncFrameError {
@@ -337,6 +377,19 @@ pub enum SyncFrameError {
     /// The encoded version is not supported.
     #[error("unsupported sync protocol version: {0}")]
     UnsupportedVersion(u16),
+    /// A hello advertised its version interval backwards.
+    #[error("invalid protocol range {min}..={max}")]
+    InvalidProtocolRange { min: u16, max: u16 },
+    /// The peers have no mutually understood object protocol.
+    #[error(
+        "no common protocol: local {local_min}..={local_max}, remote {remote_min}..={remote_max}"
+    )]
+    NoCommonProtocol {
+        local_min: u16,
+        local_max: u16,
+        remote_min: u16,
+        remote_max: u16,
+    },
     /// The frame kind and its populated fields disagree.
     #[error("control frame shape is invalid")]
     InvalidShape,
@@ -415,12 +468,16 @@ struct WireFrame {
     payloads: Vec<Vec<u8>>,
     #[n(13)]
     epoch_key: Option<minicbor::bytes::ByteArray<32>>,
+    #[n(14)]
+    min_protocol: Option<u16>,
+    #[n(15)]
+    max_protocol: Option<u16>,
 }
 
 impl From<&SyncFrame> for WireFrame {
     fn from(frame: &SyncFrame) -> Self {
         let mut wire = Self {
-            version: PROTOCOL_VERSION,
+            version: WIRE_FORMAT_VERSION,
             kind: 0,
             domain_id: None,
             nonce_or_proof: None,
@@ -434,12 +491,21 @@ impl From<&SyncFrame> for WireFrame {
             head: None,
             payloads: Vec::new(),
             epoch_key: None,
+            min_protocol: None,
+            max_protocol: None,
         };
         match frame {
-            SyncFrame::Hello { nonce, max_frame } => {
+            SyncFrame::Hello {
+                nonce,
+                max_frame,
+                min_protocol,
+                max_protocol,
+            } => {
                 wire.kind = 0;
                 wire.nonce_or_proof = Some((*nonce).into());
                 wire.max_frame = Some(*max_frame);
+                wire.min_protocol = Some(*min_protocol);
+                wire.max_protocol = Some(*max_protocol);
             }
             SyncFrame::DomainRequest {
                 domain_id,
@@ -512,8 +578,11 @@ impl TryFrom<WireFrame> for SyncFrame {
     type Error = SyncFrameError;
 
     fn try_from(wire: WireFrame) -> Result<Self, SyncFrameError> {
-        if wire.version != PROTOCOL_VERSION {
+        if wire.version != WIRE_FORMAT_VERSION {
             return Err(SyncFrameError::UnsupportedVersion(wire.version));
+        }
+        if wire.kind != 0 && (wire.min_protocol.is_some() || wire.max_protocol.is_some()) {
+            return Err(SyncFrameError::InvalidShape);
         }
         if wire.kind >= 10 {
             let frame = decode_authority_frame(wire)?;
@@ -531,6 +600,8 @@ impl TryFrom<WireFrame> for SyncFrame {
                 Self::Hello {
                     nonce: fixed_proof(wire.nonce_or_proof)?,
                     max_frame: wire.max_frame.ok_or(SyncFrameError::InvalidShape)?,
+                    min_protocol: wire.min_protocol.ok_or(SyncFrameError::InvalidShape)?,
+                    max_protocol: wire.max_protocol.ok_or(SyncFrameError::InvalidShape)?,
                 }
             }
             1 if wire.max_frame.is_none()
@@ -652,6 +723,8 @@ fn unused_scalar_fields(wire: &WireFrame) -> bool {
         && wire.head.is_none()
         && wire.payloads.is_empty()
         && wire.epoch_key.is_none()
+        && wire.min_protocol.is_none()
+        && wire.max_protocol.is_none()
 }
 
 fn unused_scalar_fields_except_payload(wire: &WireFrame) -> bool {
@@ -665,6 +738,8 @@ fn unused_scalar_fields_except_payload(wire: &WireFrame) -> bool {
         && wire.head.is_none()
         && wire.payloads.is_empty()
         && wire.epoch_key.is_none()
+        && wire.min_protocol.is_none()
+        && wire.max_protocol.is_none()
 }
 
 fn fixed_proof(value: Option<minicbor::bytes::ByteArray<32>>) -> Result<[u8; 32], SyncFrameError> {
@@ -678,6 +753,14 @@ fn validate(frame: &SyncFrame) -> Result<(), SyncFrameError> {
         {
             Err(SyncFrameError::FrameTooLarge(*max_frame as usize))
         }
+        SyncFrame::Hello {
+            min_protocol,
+            max_protocol,
+            ..
+        } if min_protocol > max_protocol => Err(SyncFrameError::InvalidProtocolRange {
+            min: *min_protocol,
+            max: *max_protocol,
+        }),
         SyncFrame::AuthorityState {
             epoch, sequence, ..
         } if epoch != sequence => Err(SyncFrameError::InvalidShape),

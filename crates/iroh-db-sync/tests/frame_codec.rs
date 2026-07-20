@@ -1,22 +1,45 @@
 use iroh_db_core::{CommitId, DomainId};
-use iroh_db_sync::{MAX_CONTROL_FRAME, SyncFrame, SyncFrameError, missing_commits};
+use iroh_db_sync::{
+    MAX_CONTROL_FRAME, MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION, SyncFrame, SyncFrameError,
+    missing_commits, negotiate_protocol,
+};
 
 #[test]
 fn hello_has_stable_canonical_bytes() {
     let frame = SyncFrame::Hello {
         nonce: [0; 32],
         max_frame: u32::try_from(MAX_CONTROL_FRAME).unwrap(),
+        min_protocol: MIN_PROTOCOL_VERSION,
+        max_protocol: MAX_PROTOCOL_VERSION,
     };
     let bytes = frame.encode_canonical().unwrap();
     assert_eq!(
         hex::encode(&bytes),
         concat!(
-            "8d0200f65820",
+            "900300f65820",
             "0000000000000000000000000000000000000000000000000000000000000000",
-            "801a00100000f6f6f6f6f6f680"
+            "801a00100000f6f6f6f6f6f680f60303"
         )
     );
     assert_eq!(SyncFrame::decode_canonical(&bytes).unwrap(), frame);
+}
+
+#[test]
+fn protocol_ranges_choose_the_highest_overlap_and_fail_closed() {
+    assert_eq!(negotiate_protocol(2, 4, 3, 5).unwrap(), 4);
+    assert_eq!(
+        negotiate_protocol(1, 2, 3, 4),
+        Err(SyncFrameError::NoCommonProtocol {
+            local_min: 1,
+            local_max: 2,
+            remote_min: 3,
+            remote_max: 4,
+        })
+    );
+    assert_eq!(
+        negotiate_protocol(4, 3, 3, 4),
+        Err(SyncFrameError::InvalidProtocolRange { min: 4, max: 3 })
+    );
 }
 
 #[test]

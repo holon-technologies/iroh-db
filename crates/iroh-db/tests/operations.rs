@@ -34,7 +34,7 @@ fn note(author: AuthorId) -> Note {
 }
 
 fn corrupt_first_record(path: &std::path::Path) {
-    let database = redb::Database::create(path.join("meta.redb")).unwrap();
+    let database = redb::Database::create(path.join("meta-v6.redb")).unwrap();
     let write = database.begin_write().unwrap();
     {
         let mut records = write.open_table(RECORDS).unwrap();
@@ -61,7 +61,7 @@ fn corrupt_first_record(path: &std::path::Path) {
 }
 
 fn mutate_snapshot_metadata(path: &std::path::Path, domain_id: DomainId, remove_baseline: bool) {
-    let database = redb::Database::create(path.join("meta.redb")).unwrap();
+    let database = redb::Database::create(path.join("meta-v6.redb")).unwrap();
     let write = database.begin_write().unwrap();
     if remove_baseline {
         write

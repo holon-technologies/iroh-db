@@ -288,6 +288,10 @@ pub enum OperationKind {
     OrderedListRemove = 12,
     /// Merges a complete canonical CRDT field state.
     FieldStateMerge = 13,
+    /// Stages one target-schema record without changing visible state.
+    SchemaStage = 14,
+    /// Atomically activates a completely staged schema transition.
+    SchemaActivate = 15,
 }
 
 impl TryFrom<u8> for OperationKind {
@@ -308,6 +312,8 @@ impl TryFrom<u8> for OperationKind {
             11 => Ok(Self::OrderedListInsert),
             12 => Ok(Self::OrderedListRemove),
             13 => Ok(Self::FieldStateMerge),
+            14 => Ok(Self::SchemaStage),
+            15 => Ok(Self::SchemaActivate),
             value => Err(CommitCodecError::UnknownOperationKind(value)),
         }
     }

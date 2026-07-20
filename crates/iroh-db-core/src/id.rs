@@ -118,6 +118,10 @@ fixed_id!(
     /// A unique identifier for one domain-local transaction.
     TransactionId
 );
+fixed_id!(
+    /// A stable identifier for one domain-local schema migration attempt.
+    MigrationId
+);
 
 impl CollectionId {
     /// Derives the stable collection identifier for a declared collection name.

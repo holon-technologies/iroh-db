@@ -1,12 +1,12 @@
 use iroh_db_blobs::BlobRef;
-use iroh_db_core::{AuthorId, CapabilityId, CommitId};
+use iroh_db_core::{AuthorId, CapabilityId, CommitId, SchemaActivation};
 use iroh_db_security::{CapabilityCertificate, Permission, verify_snapshot_signature};
 use iroh_db_store::{MaterializedRecord, SnapshotBaseline, StoreError};
 use tokio::io::AsyncReadExt as _;
 
 use crate::{DbError, IrohDb};
 
-const SNAPSHOT_VERSION: u16 = 2;
+const SNAPSHOT_VERSION: u16 = 3;
 
 /// An immutable encrypted local snapshot and its verified state root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +53,8 @@ struct SnapshotContent {
     control_head: Option<[u8; 32]>,
     #[n(8)]
     capability_id: CapabilityId,
+    #[n(9)]
+    schema_activations: Vec<Vec<u8>>,
 }
 
 #[derive(minicbor::Encode, minicbor::Decode)]
@@ -94,6 +96,9 @@ impl IrohDb {
             epoch: active_epoch,
             control_head: control_head_id(self)?,
             capability_id,
+            schema_activations: encode_activations(
+                &self.inner.store.active_schema_activations(domain_id)?,
+            ),
         };
         let content = minicbor::to_vec(content).map_err(snapshot_codec)?;
         let state_root = state_root(&records)?;
@@ -139,12 +144,14 @@ impl IrohDb {
             content.frontier.clone(),
             content.author_sequences.clone(),
         )?;
+        let activations = decode_activations(&content.schema_activations)?;
         if let Err(error) = self.inner.store.install_snapshot(
             content.domain_id,
             &records,
             &content.covered_commits,
             &content.frontier,
             &content.author_sequences,
+            &activations,
             &baseline,
         ) {
             return match error {
@@ -417,6 +424,7 @@ fn validate_snapshot_metadata(content: &SnapshotContent) -> Result<(), DbError> 
             "snapshot causal metadata is malformed".into(),
         ));
     }
+    decode_activations(&content.schema_activations)?;
     Ok(())
 }
 
@@ -446,6 +454,29 @@ fn decode_records(records: &[Vec<u8>]) -> Result<Vec<MaterializedRecord>, DbErro
         .iter()
         .map(|record| MaterializedRecord::decode_canonical(record).map_err(DbError::from))
         .collect()
+}
+
+fn encode_activations(activations: &[SchemaActivation]) -> Vec<Vec<u8>> {
+    activations
+        .iter()
+        .map(SchemaActivation::encode_canonical)
+        .collect()
+}
+
+fn decode_activations(values: &[Vec<u8>]) -> Result<Vec<SchemaActivation>, DbError> {
+    let activations = values
+        .iter()
+        .map(|bytes| SchemaActivation::decode_canonical(bytes).map_err(DbError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    if activations
+        .windows(2)
+        .any(|pair| pair[0].to().collection_id() >= pair[1].to().collection_id())
+    {
+        return Err(DbError::InvalidSnapshot(
+            "schema activations are not unique and ordered".into(),
+        ));
+    }
+    Ok(activations)
 }
 
 fn state_root(records: &[MaterializedRecord]) -> Result<[u8; 32], DbError> {

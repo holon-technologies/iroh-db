@@ -8,7 +8,8 @@ use std::{
 use fs2::FileExt as _;
 use iroh_db_core::{
     AuthorId, BlobHash, CapabilityId, CollectionId, CommitCodecError, CommitEnvelope, CommitId,
-    DomainId, SchemaDescriptor, SchemaError,
+    DomainId, MigrationCodecError, MigrationId, SchemaActivation, SchemaDescriptor, SchemaError,
+    SchemaStage, staging_digest,
 };
 use iroh_db_security::{
     AuthorityCheckpoint, CapabilityCertificate, ControlTransition, DomainDescriptor, Invitation,
@@ -18,7 +19,8 @@ use redb::{Database, ReadableDatabase as _, ReadableTable as _, TableDefinition}
 
 use crate::{BlobStore, BlobStoreError, IndexValue, MaterializedRecord, StoredRecord};
 
-const FORMAT_CONTENTS: &str = "iroh-db 5.0\n";
+const FORMAT_V5: &str = "iroh-db 5.0\n";
+const FORMAT_CONTENTS: &str = "iroh-db 6.0\n";
 const SNAPSHOT_BASELINE_VERSION: u16 = 1;
 const MAX_SNAPSHOT_BASELINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SNAPSHOT_BASELINE_ENTRIES: usize = 65_536;
@@ -71,6 +73,16 @@ const DEVICE_GROUPS: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("device_groups_v1");
 const CONSUMED_INVITATIONS: TableDefinition<'static, &[u8], u8> =
     TableDefinition::new("consumed_invitations_v1");
+const ACTIVE_SCHEMAS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("active_schemas_v1");
+const MIGRATION_STAGES: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("migration_stages_v1");
+const MIGRATION_ACTIVATIONS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("migration_activations_v1");
+const MIGRATION_CHECKPOINTS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("migration_checkpoints_v1");
+const MIGRATION_FORKS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("migration_forks_v1");
 
 /// The result of durably recording an immutable commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +178,15 @@ pub enum StoreError {
     /// A stored schema descriptor could not be decoded.
     #[error(transparent)]
     Schema(#[from] SchemaError),
+    /// A canonical schema migration object was invalid.
+    #[error(transparent)]
+    Migration(#[from] MigrationCodecError),
+    /// Migration-derived state did not match its immutable commit history.
+    #[error("schema migration metadata is invalid: {0}")]
+    InvalidMigration(String),
+    /// Two activation commits attempted different successors for one schema.
+    #[error("collection {collection_id} is frozen by incompatible schema activations")]
+    SchemaMigrationFork { collection_id: CollectionId },
     /// The same domain, collection and version was registered with different bytes.
     #[error("schema mismatch for collection {collection_id} version {version}")]
     SchemaMismatch {
@@ -329,16 +350,6 @@ impl Store {
         std::fs::create_dir_all(root.join("locks")).map_err(io_error)?;
         std::fs::create_dir_all(root.join("tmp")).map_err(io_error)?;
 
-        let format_path = root.join("FORMAT");
-        if format_path.exists() {
-            let contents = std::fs::read_to_string(&format_path).map_err(io_error)?;
-            if contents != FORMAT_CONTENTS {
-                return Err(StoreError::UnsupportedFormat);
-            }
-        } else {
-            std::fs::write(&format_path, FORMAT_CONTENTS).map_err(io_error)?;
-        }
-
         let lock = OpenOptions::new()
             .create(true)
             .read(true)
@@ -349,7 +360,9 @@ impl Store {
         lock.try_lock_exclusive()
             .map_err(|_| StoreError::AlreadyOpen)?;
 
-        let database = Database::create(root.join("meta.redb")).map_err(database_error)?;
+        prepare_store_format(root)?;
+
+        let database = Database::create(root.join("meta-v6.redb")).map_err(database_error)?;
         initialize_tables(&database)?;
         Ok(Self {
             inner: Arc::new(StoreInner {
@@ -390,17 +403,65 @@ impl Store {
             return Err(StoreError::BlobHashMismatch);
         }
 
-        self.publish_commit_with_records(envelope, records, previous_author_head)
+        self.publish_commit_components(envelope, records, &[], None, previous_author_head)
     }
 
-    fn publish_commit_with_records(
+    /// Persists an invisible bounded set of migration stages with its immutable commit.
+    pub async fn persist_schema_stages(
+        &self,
+        envelope: &CommitEnvelope,
+        stages: &[SchemaStage],
+    ) -> Result<ApplyOutcome, StoreError> {
+        if stages.is_empty() {
+            return Err(StoreError::InvalidMigration(
+                "a staging commit must contain at least one stage".into(),
+            ));
+        }
+        let commit_id = envelope.commit_id();
+        let previous_author_head = match self.commit_preflight(envelope).await? {
+            CommitPreflight::Duplicate(commit_id) => return Ok(ApplyOutcome::Duplicate(commit_id)),
+            CommitPreflight::Ready {
+                previous_author_head,
+            } => previous_author_head,
+        };
+        let expected = BlobHash::from_bytes(commit_id.to_bytes());
+        if self.inner.blobs.put(envelope.encode_canonical()).await? != expected {
+            return Err(StoreError::BlobHashMismatch);
+        }
+        self.publish_commit_components(envelope, &[], stages, None, previous_author_head)
+    }
+
+    /// Atomically publishes a completely staged schema transition with its commit.
+    pub async fn persist_schema_activation(
+        &self,
+        envelope: &CommitEnvelope,
+        activation: &SchemaActivation,
+    ) -> Result<ApplyOutcome, StoreError> {
+        let commit_id = envelope.commit_id();
+        let previous_author_head = match self.commit_preflight(envelope).await? {
+            CommitPreflight::Duplicate(commit_id) => return Ok(ApplyOutcome::Duplicate(commit_id)),
+            CommitPreflight::Ready {
+                previous_author_head,
+            } => previous_author_head,
+        };
+        let expected = BlobHash::from_bytes(commit_id.to_bytes());
+        if self.inner.blobs.put(envelope.encode_canonical()).await? != expected {
+            return Err(StoreError::BlobHashMismatch);
+        }
+        self.publish_commit_components(envelope, &[], &[], Some(activation), previous_author_head)
+    }
+
+    fn publish_commit_components(
         &self,
         envelope: &CommitEnvelope,
         records: &[MaterializedRecord],
+        stages: &[SchemaStage],
+        activation: Option<&SchemaActivation>,
         previous_author_head: Option<CommitId>,
     ) -> Result<ApplyOutcome, StoreError> {
         let commit_id = envelope.commit_id();
         let write = self.inner.database.begin_write().map_err(database_error)?;
+        let mut migration_fork: Option<CollectionId>;
         {
             let mut commits = write.open_table(COMMIT_METADATA).map_err(database_error)?;
             let coverage = write
@@ -481,22 +542,107 @@ impl Store {
                 .insert(author_key.as_slice(), commit_id.as_bytes().as_slice())
                 .map_err(database_error)?;
 
-            let mut frontier = write.open_table(FRONTIER).map_err(database_error)?;
-            for dependency in envelope.header().dependencies() {
-                let dependency_key = frontier_key(envelope.header().domain_id(), *dependency);
-                frontier
-                    .remove(dependency_key.as_slice())
-                    .map_err(database_error)?;
-            }
-            let commit_key = frontier_key(envelope.header().domain_id(), commit_id);
-            frontier
-                .insert(commit_key.as_slice(), 0)
-                .map_err(database_error)?;
+            publish_frontier(&write, envelope.header().domain_id(), envelope, commit_id)?;
 
             apply_materialized_records(&write, envelope.header().domain_id(), records)?;
+            migration_fork = apply_schema_stages(&write, envelope.header().domain_id(), stages)?;
+            if migration_fork.is_none()
+                && let Some(activation) = activation
+                && apply_schema_activation(&write, envelope.header().domain_id(), activation)?
+            {
+                migration_fork = Some(activation.to().collection_id());
+            }
         }
         write.commit().map_err(database_error)?;
+        if let Some(collection_id) = migration_fork {
+            return Err(StoreError::SchemaMigrationFork { collection_id });
+        }
         Ok(ApplyOutcome::Applied(commit_id))
+    }
+
+    /// Returns the active schema activation for a collection, if it has migrated.
+    pub fn active_schema_activation(
+        &self,
+        domain_id: DomainId,
+        collection_id: CollectionId,
+    ) -> Result<Option<SchemaActivation>, StoreError> {
+        if self.migration_frozen(domain_id, collection_id)? {
+            return Err(StoreError::SchemaMigrationFork { collection_id });
+        }
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(ACTIVE_SCHEMAS).map_err(database_error)?;
+        table
+            .get(active_schema_key(domain_id, collection_id).as_slice())
+            .map_err(database_error)?
+            .map(|value| {
+                SchemaActivation::decode_canonical(value.value()).map_err(StoreError::from)
+            })
+            .transpose()
+    }
+
+    /// Lists active schema cuts for a domain in collection order.
+    pub fn active_schema_activations(
+        &self,
+        domain_id: DomainId,
+    ) -> Result<Vec<SchemaActivation>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let forks = read.open_table(MIGRATION_FORKS).map_err(database_error)?;
+        if !table_keys_with_prefix(&forks, domain_id.as_bytes())?.is_empty() {
+            return Err(StoreError::InvalidMigration(
+                "domain contains a frozen schema activation fork".into(),
+            ));
+        }
+        let table = read.open_table(ACTIVE_SCHEMAS).map_err(database_error)?;
+        let mut activations = Vec::new();
+        for entry in table.iter().map_err(database_error)? {
+            let (key, value) = entry.map_err(database_error)?;
+            if key.value().starts_with(domain_id.as_bytes()) {
+                activations.push(SchemaActivation::decode_canonical(value.value())?);
+            }
+        }
+        activations.sort_unstable_by_key(|activation| activation.to().collection_id());
+        Ok(activations)
+    }
+
+    /// Returns whether incompatible activation siblings froze a collection.
+    pub fn migration_frozen(
+        &self,
+        domain_id: DomainId,
+        collection_id: CollectionId,
+    ) -> Result<bool, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(MIGRATION_FORKS).map_err(database_error)?;
+        Ok(table
+            .get(active_schema_key(domain_id, collection_id).as_slice())
+            .map_err(database_error)?
+            .is_some())
+    }
+
+    /// Returns low-cardinality active, staged-record, and frozen migration counts.
+    pub fn migration_counts(
+        &self,
+        domain_id: DomainId,
+    ) -> Result<(usize, usize, usize), StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let active = read.open_table(ACTIVE_SCHEMAS).map_err(database_error)?;
+        let stages = read.open_table(MIGRATION_STAGES).map_err(database_error)?;
+        let forks = read.open_table(MIGRATION_FORKS).map_err(database_error)?;
+        Ok((
+            table_keys_with_prefix(&active, domain_id.as_bytes())?.len(),
+            table_keys_with_prefix(&stages, domain_id.as_bytes())?.len(),
+            table_keys_with_prefix(&forks, domain_id.as_bytes())?.len(),
+        ))
+    }
+
+    /// Loads every durable stage for one migration in source-key order.
+    pub fn schema_stages(
+        &self,
+        domain_id: DomainId,
+        migration_id: MigrationId,
+    ) -> Result<Vec<SchemaStage>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let table = read.open_table(MIGRATION_STAGES).map_err(database_error)?;
+        load_schema_stages(&table, domain_id, migration_id)
     }
 
     async fn commit_preflight(
@@ -550,7 +696,12 @@ impl Store {
         {
             return Err(StoreError::AuthorChainMissing { previous });
         }
-        if let Some(baseline) = self.snapshot_baseline(envelope.header().domain_id())? {
+        if let Some(baseline) = self.snapshot_baseline(envelope.header().domain_id())?
+            && baseline
+                .author_sequences()
+                .iter()
+                .any(|(author, _)| *author == envelope.header().author())
+        {
             for &frontier in baseline.frontier() {
                 if !self
                     .dependencies_include_ancestor(
@@ -950,6 +1101,34 @@ impl Store {
             .transpose()
     }
 
+    /// Loads the highest registered schema version for one collection.
+    pub fn latest_registered_schema(
+        &self,
+        domain_id: DomainId,
+        collection_id: CollectionId,
+    ) -> Result<Option<SchemaDescriptor>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let schemas = read.open_table(SCHEMAS).map_err(database_error)?;
+        let mut prefix = [0_u8; 64];
+        prefix[..32].copy_from_slice(domain_id.as_bytes());
+        prefix[32..].copy_from_slice(collection_id.as_bytes());
+        let mut latest: Option<SchemaDescriptor> = None;
+        for entry in schemas.iter().map_err(database_error)? {
+            let (key, value) = entry.map_err(database_error)?;
+            if !key.value().starts_with(&prefix) {
+                continue;
+            }
+            let schema = SchemaDescriptor::decode_canonical(value.value())?;
+            if latest
+                .as_ref()
+                .is_none_or(|current| schema.version() > current.version())
+            {
+                latest = Some(schema);
+            }
+        }
+        Ok(latest)
+    }
+
     /// Lists accepted commit IDs, including snapshot-covered history, in deterministic order.
     pub fn list_commit_ids(&self, domain_id: DomainId) -> Result<Vec<CommitId>, StoreError> {
         let mut ids = self.list_stored_commit_ids(domain_id)?;
@@ -1152,17 +1331,24 @@ impl Store {
         let schemas = read.open_table(SCHEMAS).map_err(database_error)?;
         let records = read.open_table(RECORDS).map_err(database_error)?;
         let record_indexes = read.open_table(RECORD_INDEX_KEYS).map_err(database_error)?;
-        let mut schema_values = Vec::new();
+        let mut schema_values = BTreeMap::<CollectionId, SchemaDescriptor>::new();
         for entry in schemas.iter().map_err(database_error)? {
             let (key, value) = entry.map_err(database_error)?;
             if key.value().starts_with(domain_id.as_bytes()) {
-                schema_values.push(SchemaDescriptor::decode_canonical(value.value())?);
+                let schema = SchemaDescriptor::decode_canonical(value.value())?;
+                schema_values
+                    .entry(schema.collection_id())
+                    .and_modify(|current| {
+                        if schema.version() > current.version() {
+                            *current = schema.clone();
+                        }
+                    })
+                    .or_insert(schema);
             }
         }
-        schema_values.sort_by_key(|schema| (schema.collection_id(), schema.version()));
 
         let mut exported = Vec::new();
-        for schema in schema_values {
+        for schema in schema_values.into_values() {
             let prefix = record_prefix(domain_id, schema.collection_id());
             for entry in records.iter().map_err(database_error)? {
                 let (key, value) = entry.map_err(database_error)?;
@@ -1210,6 +1396,7 @@ impl Store {
     }
 
     /// Atomically installs snapshot-derived state and its causal acceptance baseline.
+    #[allow(clippy::too_many_arguments)]
     pub fn install_snapshot(
         &self,
         domain_id: DomainId,
@@ -1217,6 +1404,7 @@ impl Store {
         covered_commits: &[CommitId],
         frontier_commits: &[CommitId],
         author_sequences: &[(AuthorId, u64)],
+        activations: &[SchemaActivation],
         baseline: &SnapshotBaseline,
     ) -> Result<(), StoreError> {
         validate_snapshot_metadata(records, covered_commits, frontier_commits, author_sequences)?;
@@ -1231,8 +1419,10 @@ impl Store {
         let baseline_bytes = baseline.encode_canonical()?;
         let write = self.inner.database.begin_write().map_err(database_error)?;
         clear_materialized_domain(&write, domain_id)?;
+        clear_domain_migration_metadata(&write, domain_id)?;
         clear_domain_snapshot_metadata(&write, domain_id)?;
         apply_materialized_records(&write, domain_id, records)?;
+        install_snapshot_activations(&write, domain_id, records, activations)?;
         {
             write
                 .open_table(SNAPSHOT_BASELINES)
@@ -2707,6 +2897,26 @@ fn dependency_is_accepted(
     Ok(stored || snapshotted)
 }
 
+fn publish_frontier(
+    write: &redb::WriteTransaction,
+    domain_id: DomainId,
+    envelope: &CommitEnvelope,
+    commit_id: CommitId,
+) -> Result<(), StoreError> {
+    let mut frontier = write.open_table(FRONTIER).map_err(database_error)?;
+    for dependency in envelope.header().dependencies() {
+        let dependency_key = frontier_key(domain_id, *dependency);
+        frontier
+            .remove(dependency_key.as_slice())
+            .map_err(database_error)?;
+    }
+    let commit_key = frontier_key(domain_id, commit_id);
+    frontier
+        .insert(commit_key.as_slice(), 0)
+        .map_err(database_error)?;
+    Ok(())
+}
+
 fn validate_snapshot_metadata(
     records: &[MaterializedRecord],
     covered_commits: &[CommitId],
@@ -2807,7 +3017,95 @@ fn initialize_tables(database: &Database) -> Result<(), StoreError> {
     write
         .open_table(CONSUMED_INVITATIONS)
         .map_err(database_error)?;
+    write.open_table(ACTIVE_SCHEMAS).map_err(database_error)?;
+    write.open_table(MIGRATION_STAGES).map_err(database_error)?;
+    write
+        .open_table(MIGRATION_ACTIVATIONS)
+        .map_err(database_error)?;
+    write
+        .open_table(MIGRATION_CHECKPOINTS)
+        .map_err(database_error)?;
+    write.open_table(MIGRATION_FORKS).map_err(database_error)?;
     write.commit().map_err(database_error)
+}
+
+fn prepare_store_format(root: &Path) -> Result<(), StoreError> {
+    let format_path = root.join("FORMAT");
+    if !format_path.exists() {
+        return write_format_marker(root, FORMAT_CONTENTS);
+    }
+    match std::fs::read_to_string(&format_path)
+        .map_err(io_error)?
+        .as_str()
+    {
+        FORMAT_CONTENTS => Ok(()),
+        FORMAT_V5 => shadow_migrate_v5(root),
+        _ => Err(StoreError::UnsupportedFormat),
+    }
+}
+
+fn shadow_migrate_v5(root: &Path) -> Result<(), StoreError> {
+    let legacy = root.join("meta.redb");
+    let preserved = root.join("meta-v5.redb");
+    let candidate = root.join("tmp/meta-v6.redb");
+    let live = root.join("meta-v6.redb");
+    if !preserved.exists() {
+        if !legacy.is_file() {
+            return Err(StoreError::Io("format v5 metadata file is missing".into()));
+        }
+        copy_and_sync(&legacy, &preserved)?;
+    }
+    if candidate.exists() {
+        std::fs::remove_file(&candidate).map_err(io_error)?;
+    }
+    copy_and_sync(&preserved, &candidate)?;
+    {
+        let mut database = Database::create(&candidate).map_err(database_error)?;
+        initialize_tables(&database)?;
+        if !database.check_integrity().map_err(database_error)? {
+            return Err(StoreError::Database(
+                "v6 shadow metadata required integrity repair".into(),
+            ));
+        }
+    }
+    if live.exists() {
+        std::fs::remove_file(&live).map_err(io_error)?;
+    }
+    std::fs::rename(&candidate, &live).map_err(io_error)?;
+    sync_directory(root)?;
+    write_format_marker(root, FORMAT_CONTENTS)
+}
+
+fn copy_and_sync(source: &Path, destination: &Path) -> Result<(), StoreError> {
+    std::fs::copy(source, destination).map_err(io_error)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)
+        .map_err(io_error)?
+        .sync_all()
+        .map_err(io_error)
+}
+
+fn write_format_marker(root: &Path, contents: &str) -> Result<(), StoreError> {
+    let candidate = root.join("tmp/FORMAT.next");
+    std::fs::write(&candidate, contents).map_err(io_error)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&candidate)
+        .map_err(io_error)?
+        .sync_all()
+        .map_err(io_error)?;
+    std::fs::rename(candidate, root.join("FORMAT")).map_err(io_error)?;
+    sync_directory(root)
+}
+
+fn sync_directory(path: &Path) -> Result<(), StoreError> {
+    File::open(path)
+        .map_err(io_error)?
+        .sync_all()
+        .map_err(io_error)
 }
 
 fn trusted_author_key(domain_id: DomainId, author: AuthorId) -> [u8; 64] {
@@ -3059,6 +3357,278 @@ fn apply_materialized_records(
     Ok(())
 }
 
+fn apply_schema_stages(
+    write: &redb::WriteTransaction,
+    domain_id: DomainId,
+    stages: &[SchemaStage],
+) -> Result<Option<CollectionId>, StoreError> {
+    if stages.is_empty() {
+        return Ok(None);
+    }
+    staging_digest(stages)?;
+    let mut table = write.open_table(MIGRATION_STAGES).map_err(database_error)?;
+    for stage in stages {
+        let target = MaterializedRecord::decode_canonical(stage.target_record())
+            .map_err(|error| StoreError::InvalidMigration(error.to_string()))?;
+        if target.state().is_none()
+            || target.record_id() != stage.source_record_id()
+            || target.schema().schema_id() != stage.to().schema_id()
+        {
+            return Err(StoreError::InvalidMigration(
+                "stage target does not match its target schema and source key".into(),
+            ));
+        }
+        let key = migration_stage_key(domain_id, stage.migration_id(), stage.source_record_id());
+        let bytes = stage.encode_canonical();
+        let existing = table
+            .get(key.as_slice())
+            .map_err(database_error)?
+            .map(|value| value.value().to_vec());
+        if let Some(existing) = existing.filter(|existing| existing != &bytes) {
+            let evidence = minicbor::to_vec((existing, bytes.clone()))
+                .map_err(|error| StoreError::InvalidMigration(error.to_string()))?;
+            drop(table);
+            write
+                .open_table(MIGRATION_FORKS)
+                .map_err(database_error)?
+                .insert(
+                    active_schema_key(domain_id, stage.to().collection_id()).as_slice(),
+                    evidence.as_slice(),
+                )
+                .map_err(database_error)?;
+            return Ok(Some(stage.to().collection_id()));
+        }
+        table
+            .insert(key.as_slice(), bytes.as_slice())
+            .map_err(database_error)?;
+    }
+    Ok(None)
+}
+
+fn apply_schema_activation(
+    write: &redb::WriteTransaction,
+    domain_id: DomainId,
+    activation: &SchemaActivation,
+) -> Result<bool, StoreError> {
+    let collection_id = activation.to().collection_id();
+    let history_key =
+        migration_activation_key(domain_id, collection_id, activation.from().schema_id());
+    let activation_bytes = activation.encode_canonical();
+    let conflict = {
+        let history = write
+            .open_table(MIGRATION_ACTIVATIONS)
+            .map_err(database_error)?;
+        history
+            .get(history_key.as_slice())
+            .map_err(database_error)?
+            .map(|existing| existing.value().to_vec())
+            .filter(|existing| existing != &activation_bytes)
+    };
+    if let Some(existing) = conflict {
+        let evidence = minicbor::to_vec((existing, activation_bytes.clone()))
+            .map_err(|error| StoreError::InvalidMigration(error.to_string()))?;
+        write
+            .open_table(MIGRATION_FORKS)
+            .map_err(database_error)?
+            .insert(
+                active_schema_key(domain_id, collection_id).as_slice(),
+                evidence.as_slice(),
+            )
+            .map_err(database_error)?;
+        return Ok(true);
+    }
+
+    let stages = {
+        let table = write.open_table(MIGRATION_STAGES).map_err(database_error)?;
+        load_schema_stages(&table, domain_id, activation.migration_id())?
+    };
+    if u64::try_from(stages.len()).ok() != Some(activation.staged_records())
+        || staging_digest(&stages)? != activation.staging_digest()
+        || stages.iter().any(|stage| {
+            stage.from().schema_id() != activation.from().schema_id()
+                || stage.to().schema_id() != activation.to().schema_id()
+        })
+    {
+        return Err(StoreError::InvalidMigration(
+            "activation does not commit to the complete durable staging set".into(),
+        ));
+    }
+
+    let mut targets = Vec::with_capacity(stages.len());
+    for stage in &stages {
+        targets.push(
+            MaterializedRecord::decode_canonical(stage.target_record())
+                .map_err(|error| StoreError::InvalidMigration(error.to_string()))?,
+        );
+    }
+    clear_materialized_collection(write, domain_id, collection_id)?;
+    register_schema(write, domain_id, activation.from())?;
+    register_schema(write, domain_id, activation.to())?;
+    apply_materialized_records(write, domain_id, &targets)?;
+
+    write
+        .open_table(MIGRATION_ACTIVATIONS)
+        .map_err(database_error)?
+        .insert(history_key.as_slice(), activation_bytes.as_slice())
+        .map_err(database_error)?;
+    write
+        .open_table(ACTIVE_SCHEMAS)
+        .map_err(database_error)?
+        .insert(
+            active_schema_key(domain_id, collection_id).as_slice(),
+            activation_bytes.as_slice(),
+        )
+        .map_err(database_error)?;
+    Ok(false)
+}
+
+fn load_schema_stages(
+    table: &impl redb::ReadableTable<&'static [u8], &'static [u8]>,
+    domain_id: DomainId,
+    migration_id: MigrationId,
+) -> Result<Vec<SchemaStage>, StoreError> {
+    let prefix = migration_stage_prefix(domain_id, migration_id);
+    let mut stages = Vec::new();
+    for entry in table.iter().map_err(database_error)? {
+        let (key, value) = entry.map_err(database_error)?;
+        if key.value().starts_with(&prefix) {
+            stages.push(SchemaStage::decode_canonical(value.value())?);
+        }
+    }
+    stages.sort_unstable_by(|left, right| left.source_record_id().cmp(right.source_record_id()));
+    Ok(stages)
+}
+
+fn register_schema(
+    write: &redb::WriteTransaction,
+    domain_id: DomainId,
+    schema: &SchemaDescriptor,
+) -> Result<(), StoreError> {
+    let key = schema_key(domain_id, schema.collection_id(), schema.version());
+    let bytes = schema.encode_canonical();
+    let mut schemas = write.open_table(SCHEMAS).map_err(database_error)?;
+    if let Some(existing) = schemas.get(key.as_slice()).map_err(database_error)?
+        && existing.value() != bytes
+    {
+        return Err(StoreError::SchemaMismatch {
+            collection_id: schema.collection_id(),
+            version: schema.version(),
+        });
+    }
+    schemas
+        .insert(key.as_slice(), bytes.as_slice())
+        .map_err(database_error)?;
+    Ok(())
+}
+
+fn clear_materialized_collection(
+    write: &redb::WriteTransaction,
+    domain_id: DomainId,
+    collection_id: CollectionId,
+) -> Result<(), StoreError> {
+    let prefix = record_prefix(domain_id, collection_id);
+    {
+        let mut table = write.open_table(RECORDS).map_err(database_error)?;
+        for key in table_keys_with_prefix(&table, &prefix)? {
+            table.remove(key.as_slice()).map_err(database_error)?;
+        }
+    }
+    {
+        let mut table = write
+            .open_table(RECORD_INDEX_KEYS)
+            .map_err(database_error)?;
+        for key in table_keys_with_prefix(&table, &prefix)? {
+            table.remove(key.as_slice()).map_err(database_error)?;
+        }
+    }
+    {
+        let mut table = write.open_table(SECONDARY_INDEX).map_err(database_error)?;
+        let mut keys = Vec::new();
+        for entry in table.iter().map_err(database_error)? {
+            let (key, _) = entry.map_err(database_error)?;
+            if key.value().starts_with(&prefix) {
+                keys.push(key.value().to_vec());
+            }
+        }
+        for key in keys {
+            table.remove(key.as_slice()).map_err(database_error)?;
+        }
+    }
+    Ok(())
+}
+
+fn install_snapshot_activations(
+    write: &redb::WriteTransaction,
+    domain_id: DomainId,
+    records: &[MaterializedRecord],
+    activations: &[SchemaActivation],
+) -> Result<(), StoreError> {
+    if activations
+        .windows(2)
+        .any(|pair| pair[0].to().collection_id() >= pair[1].to().collection_id())
+    {
+        return Err(StoreError::InvalidSnapshotMetadata(
+            "schema activations are not unique and ordered".into(),
+        ));
+    }
+    for activation in activations {
+        let collection_id = activation.to().collection_id();
+        if records.iter().any(|record| {
+            record.schema().collection_id() == collection_id
+                && record.schema().schema_id() != activation.to().schema_id()
+        }) {
+            return Err(StoreError::InvalidSnapshotMetadata(
+                "record schema disagrees with active migration".into(),
+            ));
+        }
+        register_schema(write, domain_id, activation.from())?;
+        register_schema(write, domain_id, activation.to())?;
+        let bytes = activation.encode_canonical();
+        write
+            .open_table(ACTIVE_SCHEMAS)
+            .map_err(database_error)?
+            .insert(
+                active_schema_key(domain_id, collection_id).as_slice(),
+                bytes.as_slice(),
+            )
+            .map_err(database_error)?;
+        write
+            .open_table(MIGRATION_ACTIVATIONS)
+            .map_err(database_error)?
+            .insert(
+                migration_activation_key(domain_id, collection_id, activation.from().schema_id())
+                    .as_slice(),
+                bytes.as_slice(),
+            )
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
+fn clear_domain_migration_metadata(
+    write: &redb::WriteTransaction,
+    domain_id: DomainId,
+) -> Result<(), StoreError> {
+    for table_definition in [
+        ACTIVE_SCHEMAS,
+        MIGRATION_STAGES,
+        MIGRATION_ACTIVATIONS,
+        MIGRATION_FORKS,
+    ] {
+        let mut table = write.open_table(table_definition).map_err(database_error)?;
+        for key in table_keys_with_prefix(&table, domain_id.as_bytes())? {
+            table.remove(key.as_slice()).map_err(database_error)?;
+        }
+    }
+    let mut checkpoints = write
+        .open_table(MIGRATION_CHECKPOINTS)
+        .map_err(database_error)?;
+    for key in table_keys_with_prefix(&checkpoints, domain_id.as_bytes())? {
+        checkpoints.remove(key.as_slice()).map_err(database_error)?;
+    }
+    Ok(())
+}
+
 fn remove_record_indexes(
     write: &redb::WriteTransaction,
     record_key: &[u8],
@@ -3267,6 +3837,44 @@ fn schema_key(domain_id: DomainId, collection_id: CollectionId, version: u32) ->
     key[..32].copy_from_slice(domain_id.as_bytes());
     key[32..64].copy_from_slice(collection_id.as_bytes());
     key[64..].copy_from_slice(&version.to_be_bytes());
+    key
+}
+
+fn active_schema_key(domain_id: DomainId, collection_id: CollectionId) -> [u8; 64] {
+    let mut key = [0_u8; 64];
+    key[..32].copy_from_slice(domain_id.as_bytes());
+    key[32..].copy_from_slice(collection_id.as_bytes());
+    key
+}
+
+fn migration_stage_prefix(domain_id: DomainId, migration_id: MigrationId) -> [u8; 64] {
+    let mut prefix = [0_u8; 64];
+    prefix[..32].copy_from_slice(domain_id.as_bytes());
+    prefix[32..].copy_from_slice(migration_id.as_bytes());
+    prefix
+}
+
+fn migration_stage_key(
+    domain_id: DomainId,
+    migration_id: MigrationId,
+    record_id: &[u8],
+) -> Vec<u8> {
+    let prefix = migration_stage_prefix(domain_id, migration_id);
+    let mut key = Vec::with_capacity(prefix.len() + record_id.len());
+    key.extend_from_slice(&prefix);
+    key.extend_from_slice(record_id);
+    key
+}
+
+fn migration_activation_key(
+    domain_id: DomainId,
+    collection_id: CollectionId,
+    from_schema: iroh_db_core::SchemaId,
+) -> [u8; 96] {
+    let mut key = [0_u8; 96];
+    key[..32].copy_from_slice(domain_id.as_bytes());
+    key[32..64].copy_from_slice(collection_id.as_bytes());
+    key[64..].copy_from_slice(from_schema.as_bytes());
     key
 }
 

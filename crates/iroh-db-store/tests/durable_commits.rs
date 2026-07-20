@@ -7,7 +7,8 @@ use std::{
 
 use iroh_db_core::{
     AuthorId, BlobHash, CapabilityId, CommitBody, CommitEnvelope, CommitHeader, CommitId, CrdtKind,
-    DomainId, FieldDescriptor, SchemaDescriptor, SchemaId, TransactionId,
+    DomainId, FieldDescriptor, MigrationId, SchemaActivation, SchemaDescriptor, SchemaId,
+    TransactionId, staging_digest,
 };
 use iroh_db_security::{DomainKey, IrohSigner, seal_commit};
 use iroh_db_store::{
@@ -68,6 +69,138 @@ fn format_four_is_rejected_instead_of_implicitly_migrated() {
         Store::open(directory.path(), Arc::new(MemoryBlobs::default())),
         Err(StoreError::UnsupportedFormat)
     ));
+}
+
+#[tokio::test]
+async fn format_five_is_shadow_migrated_and_preserved() {
+    let directory = tempfile::tempdir().unwrap();
+    let blobs = Arc::new(MemoryBlobs::default());
+    let signer = IrohSigner::generate();
+    let key = DomainKey::generate().unwrap();
+    let domain = DomainId::from_bytes(id(44));
+    let envelope = commit(&signer, &key, domain, 0, vec![]);
+
+    let store = Store::open(directory.path(), blobs.clone()).unwrap();
+    store.persist_commit(&envelope).await.unwrap();
+    drop(store);
+
+    // Simulate the last supported directory marker. The metadata file contains
+    // only compatible v5 data; v6 must copy it rather than reinterpret it.
+    std::fs::rename(
+        directory.path().join("meta-v6.redb"),
+        directory.path().join("meta.redb"),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("FORMAT"), "iroh-db 5.0\n").unwrap();
+    let migrated = Store::open(directory.path(), blobs).unwrap();
+
+    assert!(
+        migrated
+            .contains_commit(domain, envelope.commit_id())
+            .unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("FORMAT")).unwrap(),
+        "iroh-db 6.0\n"
+    );
+    assert!(directory.path().join("meta-v5.redb").is_file());
+    assert!(directory.path().join("meta-v6.redb").is_file());
+    assert!(directory.path().join("meta.redb").is_file());
+}
+
+#[tokio::test]
+async fn interrupted_v5_shadow_migration_restarts_from_preserved_source() {
+    let directory = tempfile::tempdir().unwrap();
+    let blobs = Arc::new(MemoryBlobs::default());
+    let signer = IrohSigner::generate();
+    let key = DomainKey::generate().unwrap();
+    let domain = DomainId::from_bytes(id(49));
+    let envelope = commit(&signer, &key, domain, 0, vec![]);
+    let store = Store::open(directory.path(), blobs.clone()).unwrap();
+    store.persist_commit(&envelope).await.unwrap();
+    drop(store);
+
+    std::fs::rename(
+        directory.path().join("meta-v6.redb"),
+        directory.path().join("meta.redb"),
+    )
+    .unwrap();
+    std::fs::copy(
+        directory.path().join("meta.redb"),
+        directory.path().join("meta-v5.redb"),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("meta-v6.redb"), b"partial").unwrap();
+    std::fs::write(directory.path().join("tmp/meta-v6.redb"), b"partial").unwrap();
+    std::fs::write(directory.path().join("FORMAT"), "iroh-db 5.0\n").unwrap();
+
+    let recovered = Store::open(directory.path(), blobs).unwrap();
+    assert!(
+        recovered
+            .contains_commit(domain, envelope.commit_id())
+            .unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("FORMAT")).unwrap(),
+        "iroh-db 6.0\n"
+    );
+}
+
+#[test]
+fn snapshot_install_publishes_active_schema_cut_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let domain = DomainId::from_bytes(id(45));
+    let from = SchemaDescriptor::new(
+        "snapshot-migration",
+        1,
+        vec![FieldDescriptor::new(1, "id", CrdtKind::Immutable, "String").record_id()],
+    )
+    .unwrap();
+    let to = SchemaDescriptor::new(
+        "snapshot-migration",
+        2,
+        vec![
+            FieldDescriptor::new(1, "id", CrdtKind::Immutable, "String").record_id(),
+            FieldDescriptor::new(2, "title", CrdtKind::Lww, "String"),
+        ],
+    )
+    .unwrap();
+    let activation = SchemaActivation::new(
+        MigrationId::from_bytes(id(46)),
+        from,
+        to.clone(),
+        0,
+        staging_digest(&[]).unwrap(),
+    )
+    .unwrap();
+    let baseline = SnapshotBaseline::new(
+        domain,
+        0,
+        BlobHash::from_bytes(id(47)),
+        id(48),
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let store = Store::open(directory.path(), Arc::new(MemoryBlobs::default())).unwrap();
+    store
+        .install_snapshot(
+            domain,
+            &[],
+            &[],
+            &[],
+            &[],
+            std::slice::from_ref(&activation),
+            &baseline,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .active_schema_activation(domain, to.collection_id())
+            .unwrap(),
+        Some(activation)
+    );
 }
 
 fn id(byte: u8) -> [u8; 32] {
@@ -449,6 +582,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id],
                 &[outside_coverage],
                 &[(signer.author(), 0)],
+                &[],
                 &baseline(vec![outside_coverage], vec![(signer.author(), 0)]),
             )
             .is_err()
@@ -463,6 +597,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id, accepted_id],
                 &[accepted_id],
                 &[(signer.author(), 0)],
+                &[],
                 &baseline(vec![accepted_id], vec![(signer.author(), 0)]),
             )
             .is_err()
@@ -480,6 +615,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id],
                 &[accepted_id],
                 &[(first_author, 0), (second_author, 0)],
+                &[],
                 &baseline(vec![accepted_id], vec![(signer.author(), 0)]),
             )
             .is_err()
@@ -503,6 +639,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id],
                 &[accepted_id],
                 &[(signer.author(), 0)],
+                &[],
                 &baseline(vec![accepted_id], vec![(signer.author(), 0)]),
             )
             .is_err()
@@ -537,18 +674,17 @@ async fn snapshot_tail_preflight_uses_signed_domain_baseline() {
             &[opaque_frontier],
             &[opaque_frontier],
             &author_floor,
+            &[],
             &baseline,
         )
         .unwrap();
 
     let blind = commit(&fresh_author, &key, domain, 0, Vec::new());
-    assert_eq!(
+    assert!(matches!(
         store.persist_commit(&blind).await,
-        Err(StoreError::SnapshotBaselineMissing {
-            frontier: opaque_frontier
-        })
-    );
-    let first_tail = commit(&fresh_author, &key, domain, 0, vec![opaque_frontier]);
+        Ok(ApplyOutcome::Applied(_))
+    ));
+    let first_tail = commit(&fresh_author, &key, domain, 1, vec![blind.commit_id()]);
     assert!(matches!(
         store.persist_commit(&first_tail).await,
         Ok(ApplyOutcome::Applied(_))
@@ -607,6 +743,7 @@ async fn retained_snapshot_frontier_remains_accepted_after_quarantine() {
             &[retained_id],
             &[retained_id],
             &author_floor,
+            &[],
             &baseline,
         )
         .unwrap();

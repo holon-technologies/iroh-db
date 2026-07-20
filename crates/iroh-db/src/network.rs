@@ -21,8 +21,8 @@ use iroh_db_security::{
     verify_gossip_signature,
 };
 use iroh_db_sync::{
-    GossipHint, MAX_CONTROL_FRAME, MAX_REFERENCES, MAX_SESSION_REFERENCES, SyncFrame,
-    missing_commits,
+    GossipHint, MAX_CONTROL_FRAME, MAX_PROTOCOL_VERSION, MAX_REFERENCES, MAX_SESSION_REFERENCES,
+    MIN_PROTOCOL_VERSION, SyncFrame, missing_commits, negotiate_protocol,
 };
 use iroh_gossip::{
     api::{Event as GossipEvent, GossipReceiver, GossipSender},
@@ -34,7 +34,7 @@ use n0_future::StreamExt as _;
 use crate::{DbError, IrohDb, Snapshot};
 
 /// The sole iroh-db control-plane ALPN.
-pub const SYNC_ALPN: &[u8] = b"/iroh-db/sync/2";
+pub const SYNC_ALPN: &[u8] = b"/iroh-db/sync/3";
 
 /// Result counters for one complete bidirectional reconciliation round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,17 +109,22 @@ impl SyncNode {
             .await
             .map_err(network_error)?;
         let (mut send, mut recv) = connection.open_bi().await.map_err(network_error)?;
-        send_frame(
-            &mut send,
-            &SyncFrame::Hello {
-                nonce: random_nonce()?,
-                max_frame: max_control_frame(),
-            },
-        )
-        .await?;
-        if !matches!(recv_frame(&mut recv).await?, SyncFrame::Hello { .. }) {
+        send_frame(&mut send, &hello_frame(random_nonce()?)).await?;
+        let SyncFrame::Hello {
+            min_protocol,
+            max_protocol,
+            ..
+        } = recv_frame(&mut recv).await?
+        else {
             return Err(protocol_error("expected hello"));
-        }
+        };
+        negotiate_protocol(
+            MIN_PROTOCOL_VERSION,
+            MAX_PROTOCOL_VERSION,
+            min_protocol,
+            max_protocol,
+        )
+        .map_err(network_error)?;
         send_frame(&mut send, &SyncFrame::InvitationRequest).await?;
         let SyncFrame::Invitation { payload } = recv_frame(&mut recv).await? else {
             return Err(DbError::UnauthorizedDevice);
@@ -516,21 +521,23 @@ impl SyncCore {
     ) -> Result<HandshakeState, DbError> {
         self.require_local_permission(Permission::Read)?;
         let local_nonce = random_nonce()?;
-        send_frame(
-            send,
-            &SyncFrame::Hello {
-                nonce: local_nonce,
-                max_frame: max_control_frame(),
-            },
-        )
-        .await?;
+        send_frame(send, &hello_frame(local_nonce)).await?;
         let SyncFrame::Hello {
             nonce: remote_nonce,
+            min_protocol,
+            max_protocol,
             ..
         } = recv_frame(recv).await?
         else {
             return Err(protocol_error("expected hello"));
         };
+        negotiate_protocol(
+            MIN_PROTOCOL_VERSION,
+            MAX_PROTOCOL_VERSION,
+            min_protocol,
+            max_protocol,
+        )
+        .map_err(network_error)?;
         send_frame(send, &self.authority_state()?).await?;
         let SyncFrame::AuthorityState {
             epoch: remote_epoch,
@@ -596,6 +603,7 @@ impl SyncCore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn serve(
         &self,
         peer_endpoint: iroh::EndpointId,
@@ -605,20 +613,22 @@ impl SyncCore {
         let peer = author_id(peer_endpoint);
         let SyncFrame::Hello {
             nonce: remote_nonce,
+            min_protocol,
+            max_protocol,
             ..
         } = recv_frame(recv).await?
         else {
             return Err(protocol_error("expected hello"));
         };
-        let local_nonce = random_nonce()?;
-        send_frame(
-            send,
-            &SyncFrame::Hello {
-                nonce: local_nonce,
-                max_frame: max_control_frame(),
-            },
+        negotiate_protocol(
+            MIN_PROTOCOL_VERSION,
+            MAX_PROTOCOL_VERSION,
+            min_protocol,
+            max_protocol,
         )
-        .await?;
+        .map_err(network_error)?;
+        let local_nonce = random_nonce()?;
+        send_frame(send, &hello_frame(local_nonce)).await?;
         let next = recv_frame(recv).await?;
         if next == SyncFrame::InvitationRequest {
             return self.serve_invitation(peer, send).await;
@@ -1435,6 +1445,15 @@ fn random_nonce() -> Result<[u8; 32], DbError> {
 
 fn max_control_frame() -> u32 {
     u32::try_from(MAX_CONTROL_FRAME).expect("control frame limit fits u32")
+}
+
+fn hello_frame(nonce: [u8; 32]) -> SyncFrame {
+    SyncFrame::Hello {
+        nonce,
+        max_frame: max_control_frame(),
+        min_protocol: MIN_PROTOCOL_VERSION,
+        max_protocol: MAX_PROTOCOL_VERSION,
+    }
 }
 
 fn digest_commits(commits: &[CommitId]) -> [u8; 32] {

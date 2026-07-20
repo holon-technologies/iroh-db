@@ -2,15 +2,16 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
 use iroh_db_blobs::{BlobEngine, BlobError, BlobRef, BlobStream, FetchScheduler, IrohBlobStore};
 use iroh_db_core::{
     AuthorId, BlobHash, CapabilityId, CollectionId, CommitBody, CommitCodecError, CommitEnvelope,
-    CommitHeader, CommitId, Dot, EqualityFilter, IrohRecord, Operation, OperationKind, RangeFilter,
-    RecordError, RecordKey, SchemaId, TransactionId, TypedField, VersionVector,
+    CommitHeader, CommitId, Dot, EqualityFilter, IrohRecord, MigrationId, Operation, OperationKind,
+    RangeFilter, RecordError, RecordKey, SchemaActivation, SchemaId, SchemaStage, TransactionId,
+    TypedField, VersionVector, staging_digest,
 };
 use iroh_db_security::{
     AuthorityError, CapabilityCertificate, ConsistencyMode, ControlTransition, DomainDescriptor,
@@ -19,7 +20,7 @@ use iroh_db_security::{
 };
 use iroh_db_store::{
     ApplyOutcome, BlobFuture, BlobStore, BlobStoreError, IndexValue, MaterializedError,
-    MaterializedRecord, SnapshotBaseline, Store, StoreError,
+    MaterializedRecord, SnapshotBaseline, Store, StoreError, StoredRecord,
 };
 use tokio::io::AsyncRead;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock, broadcast};
@@ -36,6 +37,9 @@ pub enum DbError {
     /// A typed record failed schema or codec validation.
     #[error(transparent)]
     Record(#[from] RecordError),
+    /// A registered schema migration was invalid or its deterministic transform failed.
+    #[error(transparent)]
+    Migration(#[from] MigrationError),
     /// A prepared materialization violated storage bounds.
     #[error(transparent)]
     Materialized(#[from] MaterializedError),
@@ -51,6 +55,9 @@ pub enum DbError {
     /// A bounded canonical commit object could not be constructed.
     #[error(transparent)]
     Commit(#[from] CommitCodecError),
+    /// A canonical migration stage or activation was invalid.
+    #[error(transparent)]
+    MigrationCodec(#[from] iroh_db_core::MigrationCodecError),
     /// The operating-system cryptographic random source failed.
     #[error("cryptographic randomness is unavailable")]
     RandomnessUnavailable,
@@ -90,6 +97,21 @@ pub enum DbError {
     /// A remote commit targets a typed collection not registered by this process.
     #[error("record schema is not registered for collection {0}")]
     UnknownRecordSchema(CollectionId),
+    /// A newer schema was used without traversing the registered migration chain.
+    #[error(
+        "collection {collection_id} requires a schema migration from version {stored_version} to {requested_version}"
+    )]
+    SchemaMigrationRequired {
+        /// Stable collection requiring migration.
+        collection_id: CollectionId,
+        /// Highest durable schema version.
+        stored_version: u32,
+        /// Schema version requested by the write.
+        requested_version: u32,
+    },
+    /// Incompatible activation siblings froze a collection pending explicit recovery.
+    #[error("collection {0} is frozen by incompatible schema activations")]
+    SchemaMigrationFrozen(CollectionId),
     /// A remote commit header, operation, or materialization disagreed about its target.
     #[error("remote commit operation is inconsistent: {0}")]
     InvalidRemoteCommit(String),
@@ -99,6 +121,72 @@ pub enum DbError {
     /// Verification, repair, backup, or restore failed without overwriting a good copy.
     #[error("operation failed: {0}")]
     Operation(String),
+}
+
+/// A deterministic application schema migration failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MigrationError {
+    /// The registered descriptors cannot form one adjacent migration step.
+    #[error("invalid migration registration: {0}")]
+    InvalidRegistration(String),
+    /// A stored source record or transformed target record violated its type contract.
+    #[error("migration record is invalid: {0}")]
+    InvalidRecord(String),
+    /// The application rejected a source record without exposing its contents.
+    #[error("application migration failed: {0}")]
+    Application(String),
+}
+
+/// Progress from one complete pass over every registered local-domain migration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MigrationReport {
+    staged: usize,
+    already_staged: usize,
+    activated: usize,
+    already_activated: usize,
+    activation_commits: Vec<CommitId>,
+}
+
+impl MigrationReport {
+    /// Number of source records newly staged by this pass.
+    pub const fn staged(&self) -> usize {
+        self.staged
+    }
+
+    /// Number of matching durable stages reused during resumption.
+    pub const fn already_staged(&self) -> usize {
+        self.already_staged
+    }
+
+    /// Number of collection transitions activated by this pass.
+    pub const fn activated(&self) -> usize {
+        self.activated
+    }
+
+    /// Number of transitions already active before this pass.
+    pub const fn already_activated(&self) -> usize {
+        self.already_activated
+    }
+
+    /// Activation commits created by this pass in domain/step order.
+    pub fn activation_commits(&self) -> &[CommitId] {
+        &self.activation_commits
+    }
+
+    fn absorb(&mut self, step: MigrationReport) {
+        self.staged += step.staged;
+        self.already_staged += step.already_staged;
+        self.activated += step.activated;
+        self.already_activated += step.already_activated;
+        self.activation_commits.extend(step.activation_commits);
+    }
+}
+
+impl MigrationError {
+    /// Creates a redacted application-level transform failure.
+    pub fn application(message: impl Into<String>) -> Self {
+        Self::Application(message.into())
+    }
 }
 
 /// A committed materialized-record change.
@@ -178,6 +266,26 @@ pub struct IrohDb {
     pub(crate) domain: Arc<RwLock<DomainSeed>>,
 }
 
+/// Opens a database with the exact deterministic schema migrations understood
+/// by this application version.
+pub struct IrohDbBuilder {
+    root: PathBuf,
+    migrations: Vec<MigrationStep>,
+    run_migrations_on_open: bool,
+}
+
+#[derive(Clone)]
+struct MigrationStep {
+    from: iroh_db_core::SchemaDescriptor,
+    to: iroh_db_core::SchemaDescriptor,
+    register_from: fn(&IrohDb),
+    register_to: fn(&IrohDb),
+    transform: Arc<MigrationTransform>,
+}
+
+type MigrationTransform =
+    dyn Fn(&[u8]) -> Result<PreparedRecord, MigrationError> + Send + Sync + 'static;
+
 pub(crate) struct DbInner {
     pub(crate) store: Store,
     pub(crate) blobs: Arc<IrohBlobStore>,
@@ -187,7 +295,8 @@ pub(crate) struct DbInner {
     pub(crate) control_gate: AsyncRwLock<()>,
     domains: RwLock<BTreeMap<iroh_db_core::DomainId, Arc<RwLock<DomainSeed>>>>,
     changes: RwLock<BTreeMap<iroh_db_core::DomainId, broadcast::Sender<ChangeBatch>>>,
-    adapters: RwLock<BTreeMap<CollectionId, RecordAdapter>>,
+    adapters: RwLock<BTreeMap<(CollectionId, SchemaId), RecordAdapter>>,
+    migrations: RwLock<Vec<MigrationStep>>,
 }
 
 #[derive(Clone)]
@@ -239,7 +348,6 @@ impl BlobStore for DomainBlobStore {
 
 #[derive(Clone, Copy)]
 struct RecordAdapter {
-    schema_id: SchemaId,
     merge: fn(Option<&[u8]>, &MaterializedRecord) -> Result<MaterializedRecord, DbError>,
     canonicalize: fn(
         &MaterializedRecord,
@@ -263,6 +371,11 @@ pub enum RemoteApply {
     Applied(CommitId),
     /// The exact commit was already accepted.
     Duplicate(CommitId),
+    /// The commit is durable history but targets a schema outside the active cut.
+    SchemaRebaseRequired {
+        /// Immutable commit retained for explicit application-level transformation.
+        commit: CommitId,
+    },
     /// Conflicting author-sequence branches were removed from accepted history.
     Quarantined {
         /// The author whose signing key produced conflicting commits.
@@ -306,7 +419,117 @@ impl ProjectionReport {
     }
 }
 
+impl IrohDbBuilder {
+    /// Defers migration work until [`IrohDb::run_migrations`] is called.
+    #[must_use]
+    pub const fn defer_migrations(mut self) -> Self {
+        self.run_migrations_on_open = false;
+        self
+    }
+
+    /// Registers one exact adjacent schema migration. The transform is a
+    /// function pointer so durable behavior cannot depend on captured runtime
+    /// state.
+    pub fn migration<From, To>(
+        mut self,
+        transform: fn(From) -> Result<To, MigrationError>,
+    ) -> Result<Self, MigrationError>
+    where
+        From: IrohRecord + 'static,
+        To: IrohRecord<Id = From::Id> + 'static,
+    {
+        let from = From::schema().map_err(|error| {
+            MigrationError::InvalidRegistration(format!("source schema: {error}"))
+        })?;
+        let to = To::schema().map_err(|error| {
+            MigrationError::InvalidRegistration(format!("target schema: {error}"))
+        })?;
+        if from.collection_id() != to.collection_id() {
+            return Err(MigrationError::InvalidRegistration(
+                "source and target collection IDs differ".into(),
+            ));
+        }
+        if from.version().checked_add(1) != Some(to.version()) {
+            return Err(MigrationError::InvalidRegistration(
+                "schema versions must be adjacent and increasing".into(),
+            ));
+        }
+        if self
+            .migrations
+            .iter()
+            .any(|step| step.from.schema_id() == from.schema_id())
+        {
+            return Err(MigrationError::InvalidRegistration(
+                "source schema already has a registered successor".into(),
+            ));
+        }
+        let migration = move |state: &[u8]| {
+            let source = From::decode_record(state)
+                .map_err(|error| MigrationError::InvalidRecord(error.to_string()))?;
+            let source_id = source
+                .record_id()
+                .map_err(|error| MigrationError::InvalidRecord(error.to_string()))?;
+            let target = transform(source)?;
+            let target_id = target
+                .record_id()
+                .map_err(|error| MigrationError::InvalidRecord(error.to_string()))?;
+            if source_id != target_id {
+                return Err(MigrationError::InvalidRecord(
+                    "migration changed the canonical primary key".into(),
+                ));
+            }
+            prepare_upsert(&target)
+                .map_err(|error| MigrationError::InvalidRecord(error.to_string()))
+        };
+        self.migrations.push(MigrationStep {
+            from,
+            to,
+            register_from: register_record_adapter::<From>,
+            register_to: register_record_adapter::<To>,
+            transform: Arc::new(migration),
+        });
+        Ok(self)
+    }
+
+    /// Opens the local database, registers historical adapters, and resumes
+    /// every applicable migration before returning a readable handle.
+    pub async fn open(self) -> Result<IrohDb, DbError> {
+        self.open_with_report().await.map(|(database, _)| database)
+    }
+
+    /// Opens the database and returns exact migration work performed while opening.
+    pub async fn open_with_report(mut self) -> Result<(IrohDb, MigrationReport), DbError> {
+        self.migrations
+            .sort_by_key(|step| (step.from.collection_id(), step.from.version()));
+        let database = IrohDb::open(&self.root).await?;
+        for step in &self.migrations {
+            (step.register_from)(&database);
+            (step.register_to)(&database);
+        }
+        *database
+            .inner
+            .migrations
+            .write()
+            .expect("migration registry lock is not poisoned") = self.migrations;
+        let report = if self.run_migrations_on_open {
+            database.run_migrations().await?
+        } else {
+            MigrationReport::default()
+        };
+        Ok((database, report))
+    }
+}
+
 impl IrohDb {
+    /// Begins opening a database with an application migration registry.
+    pub fn builder(root: impl AsRef<Path>) -> IrohDbBuilder {
+        IrohDbBuilder {
+            root: root.as_ref().to_path_buf(),
+            migrations: Vec::new(),
+            run_migrations_on_open: true,
+        }
+    }
+
     /// Opens or creates an offline embedded database. No endpoint is started.
     pub async fn open(root: impl AsRef<Path>) -> Result<Self, DbError> {
         let root = root.as_ref();
@@ -351,6 +574,7 @@ impl IrohDb {
                 domains: RwLock::new(domains),
                 changes: RwLock::new(domain_changes),
                 adapters: RwLock::new(BTreeMap::new()),
+                migrations: RwLock::new(Vec::new()),
             }),
             domain,
         })
@@ -369,19 +593,7 @@ impl IrohDb {
 
     /// Opens a strongly typed collection in the default private domain.
     pub fn collection<Record: IrohRecord>(&self) -> Collection<Record> {
-        let schema = Record::schema().expect("a record schema is statically valid");
-        self.inner
-            .adapters
-            .write()
-            .expect("record adapter lock is not poisoned")
-            .insert(
-                schema.collection_id(),
-                RecordAdapter {
-                    schema_id: schema.schema_id(),
-                    merge: merge_materialized::<Record>,
-                    canonicalize: canonicalize_materialized::<Record>,
-                },
-            );
+        register_record_adapter::<Record>(self);
         Collection {
             db: self.clone(),
             marker: PhantomData,
@@ -1000,47 +1212,36 @@ impl IrohDb {
         {
             return Ok(RemoteApply::Duplicate(commit_id));
         }
-        let active_epoch = self.inner.store.current_epoch(domain_id)?;
-        if header.epoch() < active_epoch {
-            return Err(DbError::RebaseRequired(commit_id));
-        }
-        if header.epoch() != active_epoch {
-            return Err(DbError::UnauthorizedDevice);
-        }
-        if !self
-            .inner
-            .store
-            .is_author_trusted(domain_id, authenticated_peer)?
-            || !self
-                .inner
-                .store
-                .is_author_trusted(domain_id, header.author())?
-        {
-            return Err(DbError::UnauthorizedDevice);
-        }
-        if self.inner.store.domain_descriptor(domain_id)?.is_some()
-            && !self.inner.store.authorize_capability(
-                domain_id,
-                header.author(),
-                header.capability_id(),
-                Permission::Write,
-                header.epoch(),
-            )?
-        {
-            return Err(DbError::UnauthorizedDevice);
-        }
+        self.validate_remote_commit_authority(authenticated_peer, header, commit_id)?;
         let body = open_commit(&envelope, &self.domain_key_for(header.epoch())?)?;
         if let Some(existing) = self.inner.store.conflicting_author_commit(&envelope)? {
             return self.quarantine_equivocation(envelope, existing).await;
         }
-        self.validate_consistency(header.author(), &body)?;
-
         let adapters = self
             .inner
             .adapters
             .read()
             .expect("record adapter lock is not poisoned")
             .clone();
+        let migration = decode_migration_body(&envelope, &body)?;
+        if let Some(outcome) = self
+            .accept_remote_migration(&envelope, migration, &adapters)
+            .await?
+        {
+            return Ok(outcome);
+        }
+        self.validate_consistency(header.author(), &body)?;
+        if self.commit_requires_schema_rebase(&body)? {
+            return match self
+                .inner
+                .store
+                .persist_commit_with_records(&envelope, &[])
+                .await?
+            {
+                ApplyOutcome::Duplicate(id) => Ok(RemoteApply::Duplicate(id)),
+                ApplyOutcome::Applied(id) => Ok(RemoteApply::SchemaRebaseRequired { commit: id }),
+            };
+        }
         let mutations = self
             .converged_mutations(&envelope, &body, &adapters)
             .await?;
@@ -1073,6 +1274,232 @@ impl IrohDb {
                 Ok(RemoteApply::Applied(id))
             }
         }
+    }
+
+    fn validate_remote_commit_authority(
+        &self,
+        authenticated_peer: AuthorId,
+        header: &CommitHeader,
+        commit_id: CommitId,
+    ) -> Result<(), DbError> {
+        let domain_id = self.domain_id();
+        let active_epoch = self.inner.store.current_epoch(domain_id)?;
+        if header.epoch() < active_epoch {
+            return Err(DbError::RebaseRequired(commit_id));
+        }
+        if header.epoch() != active_epoch
+            || !self
+                .inner
+                .store
+                .is_author_trusted(domain_id, authenticated_peer)?
+            || !self
+                .inner
+                .store
+                .is_author_trusted(domain_id, header.author())?
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        if self.inner.store.domain_descriptor(domain_id)?.is_some()
+            && !self.inner.store.authorize_capability(
+                domain_id,
+                header.author(),
+                header.capability_id(),
+                Permission::Write,
+                header.epoch(),
+            )?
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        Ok(())
+    }
+
+    async fn accept_remote_migration(
+        &self,
+        envelope: &CommitEnvelope,
+        migration: MigrationBody,
+        adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
+    ) -> Result<Option<RemoteApply>, DbError> {
+        let header = envelope.header();
+        match migration {
+            MigrationBody::Ordinary => Ok(None),
+            MigrationBody::Stages(stage_batch) => {
+                self.validate_remote_migration_authority(header)?;
+                validate_staged_records(&stage_batch, adapters)?;
+                let outcome = self
+                    .inner
+                    .store
+                    .persist_schema_stages(envelope, &stage_batch)
+                    .await?;
+                Ok(Some(match outcome {
+                    ApplyOutcome::Duplicate(id) => RemoteApply::Duplicate(id),
+                    ApplyOutcome::Applied(id) => RemoteApply::Applied(id),
+                }))
+            }
+            MigrationBody::Activation(activation) => {
+                self.validate_remote_migration_authority(header)?;
+                self.validate_activation_cut(envelope, &activation).await?;
+                let before = self.inner.store.export_materialized(self.domain_id())?;
+                let outcome = self
+                    .inner
+                    .store
+                    .persist_schema_activation(envelope, &activation)
+                    .await?;
+                Ok(Some(match outcome {
+                    ApplyOutcome::Duplicate(id) => RemoteApply::Duplicate(id),
+                    ApplyOutcome::Applied(id) => {
+                        let after = self.inner.store.export_materialized(self.domain_id())?;
+                        let changes = materialization_changes(&before, &after);
+                        if !changes.is_empty() {
+                            let _no_subscribers = self.changes().send(ChangeBatch {
+                                commit_id: id,
+                                sequence: header.author_sequence(),
+                                changes,
+                            });
+                        }
+                        RemoteApply::Applied(id)
+                    }
+                }))
+            }
+        }
+    }
+
+    fn validate_remote_migration_authority(&self, header: &CommitHeader) -> Result<(), DbError> {
+        if self
+            .inner
+            .store
+            .domain_descriptor(self.domain_id())?
+            .is_some()
+            && (self.inner.store.current_controller(self.domain_id())? != header.author()
+                || !self.inner.store.authorize_capability(
+                    self.domain_id(),
+                    header.author(),
+                    header.capability_id(),
+                    Permission::Admin,
+                    header.epoch(),
+                )?)
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        Ok(())
+    }
+
+    fn commit_requires_schema_rebase(&self, body: &CommitBody) -> Result<bool, DbError> {
+        let mut older = false;
+        let mut current = false;
+        for operation in body.operations() {
+            let mutation = MaterializedRecord::decode_canonical(operation.payload())?;
+            let Some(activation) = self
+                .inner
+                .store
+                .active_schema_activation(self.domain_id(), operation.collection_id())?
+            else {
+                current = true;
+                continue;
+            };
+            if mutation.schema().version() < activation.to().version() {
+                older = true;
+            } else {
+                current = true;
+            }
+        }
+        if older && current {
+            return Err(DbError::InvalidRemoteCommit(
+                "one commit crosses an active schema boundary".into(),
+            ));
+        }
+        Ok(older)
+    }
+
+    async fn validate_activation_cut(
+        &self,
+        incoming: &CommitEnvelope,
+        activation: &SchemaActivation,
+    ) -> Result<(), DbError> {
+        let mut graph = BTreeMap::<CommitId, Vec<CommitId>>::new();
+        let mut evidence = BTreeMap::<Vec<u8>, Vec<(CommitId, SchemaStage)>>::new();
+        for commit_id in self.inner.store.list_stored_commit_ids(self.domain_id())? {
+            let envelope = self.inner.store.load_commit(commit_id).await?;
+            graph.insert(commit_id, envelope.header().dependencies().to_vec());
+            let body = open_commit(&envelope, &self.domain_key_for(envelope.header().epoch())?)?;
+            if let MigrationBody::Stages(stages) = decode_migration_body(&envelope, &body)? {
+                for stage in stages {
+                    if stage.migration_id() == activation.migration_id() {
+                        evidence
+                            .entry(stage.source_record_id().to_vec())
+                            .or_default()
+                            .push((commit_id, stage));
+                    }
+                }
+            }
+        }
+        graph.insert(
+            incoming.commit_id(),
+            incoming.header().dependencies().to_vec(),
+        );
+        let durable = self
+            .inner
+            .store
+            .schema_stages(self.domain_id(), activation.migration_id())?;
+        for stage in durable {
+            let causally_selected =
+                evidence
+                    .get(stage.source_record_id())
+                    .is_some_and(|candidates| {
+                        candidates.iter().any(|(commit_id, candidate)| {
+                            candidate == &stage
+                                && is_ancestor(*commit_id, incoming.commit_id(), &graph)
+                        })
+                    });
+            if !causally_selected {
+                return Err(DbError::InvalidRemoteCommit(
+                    "activation does not causally depend on its complete staging set".into(),
+                ));
+            }
+        }
+        let selected_ids: Vec<_> = graph
+            .keys()
+            .copied()
+            .filter(|commit_id| {
+                *commit_id != incoming.commit_id()
+                    && is_ancestor(*commit_id, incoming.commit_id(), &graph)
+            })
+            .collect();
+        let adapters = self
+            .inner
+            .adapters
+            .read()
+            .expect("record adapter lock is not poisoned")
+            .clone();
+        let source_records = self.rebuild_commit_ids(&selected_ids, &adapters).await?;
+        let sources: BTreeMap<_, _> = source_records
+            .iter()
+            .filter(|record| {
+                record.schema().collection_id() == activation.from().collection_id()
+                    && record.schema().schema_id() == activation.from().schema_id()
+                    && record.state().is_some()
+            })
+            .map(|record| (record.record_id().to_vec(), record))
+            .collect();
+        let durable = self
+            .inner
+            .store
+            .schema_stages(self.domain_id(), activation.migration_id())?;
+        if sources.len() != durable.len()
+            || durable.iter().any(|stage| {
+                sources
+                    .get(stage.source_record_id())
+                    .and_then(|record| record.state())
+                    .is_none_or(|state| {
+                        BlobHash::from_bytes(*blake3::hash(state).as_bytes())
+                            != stage.source_digest()
+                    })
+            })
+        {
+            return Err(DbError::InvalidRemoteCommit(
+                "activation staging does not exactly cover its source-state cut".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn quarantined_remote_apply(
@@ -1172,7 +1599,7 @@ impl IrohDb {
         &self,
         incoming: &CommitEnvelope,
         incoming_body: &CommitBody,
-        adapters: &BTreeMap<CollectionId, RecordAdapter>,
+        adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
     ) -> Result<Vec<MaterializedRecord>, DbError> {
         let domain = self.domain_id();
         let existing_ids = self.inner.store.list_stored_commit_ids(domain)?;
@@ -1201,18 +1628,23 @@ impl IrohDb {
             let envelope = self.inner.store.load_commit(commit_id).await?;
             graph.insert(commit_id, envelope.header().dependencies().to_vec());
             let body = open_commit(&envelope, &self.domain_key_for(envelope.header().epoch())?)?;
-            collect_affected_operations(commit_id, &body, &affected, &mut candidates)?;
+            if matches!(
+                decode_migration_body(&envelope, &body)?,
+                MigrationBody::Ordinary
+            ) {
+                collect_affected_operations(commit_id, &body, &affected, &mut candidates)?;
+            }
         }
         let incoming_id = incoming.commit_id();
         graph.insert(incoming_id, incoming.header().dependencies().to_vec());
         collect_affected_operations(incoming_id, incoming_body, &affected, &mut candidates)?;
 
         let mut mutations = Vec::with_capacity(affected.len());
-        for (key, adapter) in affected {
+        for key in affected.into_keys() {
             let entries = candidates
                 .remove(&key)
                 .ok_or_else(|| DbError::InvalidRemoteCommit("missing record operation".into()))?;
-            mutations.push(resolve_record_heads(&key, adapter, &entries, &graph)?);
+            mutations.push(resolve_record_heads(&key, &entries, &graph, adapters)?);
         }
         Ok(mutations)
     }
@@ -1287,7 +1719,7 @@ impl IrohDb {
     async fn rebuild_commit_ids(
         &self,
         commit_ids: &[CommitId],
-        adapters: &BTreeMap<CollectionId, RecordAdapter>,
+        adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
     ) -> Result<Vec<MaterializedRecord>, DbError> {
         let Some(base_records) = self.verified_snapshot_baseline_records().await? else {
             return self.materialize_commit_ids(commit_ids, adapters).await;
@@ -1297,7 +1729,7 @@ impl IrohDb {
         for record in base_records {
             let collection_id = record.schema().collection_id();
             let adapter = *adapters
-                .get(&collection_id)
+                .get(&(collection_id, record.schema().schema_id()))
                 .ok_or(DbError::UnknownRecordSchema(collection_id))?;
             if record.state().is_none() {
                 return Err(DbError::InvalidSnapshot(
@@ -1309,18 +1741,31 @@ impl IrohDb {
         }
         for mutation in tail {
             let collection_id = mutation.schema().collection_id();
+            if self
+                .inner
+                .store
+                .active_schema_activation(self.domain_id(), collection_id)?
+                .is_some_and(|activation| mutation.schema().version() < activation.to().version())
+            {
+                continue;
+            }
             let key = (collection_id, mutation.record_id().to_vec());
             if mutation.state().is_none() {
                 rebuilt.remove(&key);
                 continue;
             }
+            let existing = rebuilt.get(&key);
+            if existing.is_some_and(|value| value.schema().version() > mutation.schema().version())
+            {
+                continue;
+            }
             let adapter = *adapters
-                .get(&collection_id)
+                .get(&(collection_id, mutation.schema().schema_id()))
                 .ok_or(DbError::UnknownRecordSchema(collection_id))?;
-            let merged = (adapter.merge)(
-                rebuilt.get(&key).and_then(MaterializedRecord::state),
-                &mutation,
-            )?;
+            let existing_state = existing
+                .filter(|value| value.schema().schema_id() == mutation.schema().schema_id())
+                .and_then(MaterializedRecord::state);
+            let merged = (adapter.merge)(existing_state, &mutation)?;
             rebuilt.insert(key, merged);
         }
         Ok(rebuilt.into_values().collect())
@@ -1329,27 +1774,103 @@ impl IrohDb {
     async fn materialize_commit_ids(
         &self,
         commit_ids: &[CommitId],
-        adapters: &BTreeMap<CollectionId, RecordAdapter>,
+        adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
     ) -> Result<Vec<MaterializedRecord>, DbError> {
         let mut graph = BTreeMap::<CommitId, Vec<CommitId>>::new();
         let mut candidates = RecordCandidates::new();
+        let mut stages_by_record = BTreeMap::<(MigrationId, Vec<u8>), SchemaStage>::new();
+        let mut activations = Vec::<(CommitId, SchemaActivation)>::new();
         for &commit_id in commit_ids {
             let envelope = self.inner.store.load_commit(commit_id).await?;
             graph.insert(commit_id, envelope.header().dependencies().to_vec());
             let body = open_commit(&envelope, &self.domain_key_for(envelope.header().epoch())?)?;
-            let dependency_context = self
-                .dependency_context(envelope.header().dependencies())
-                .await?;
-            let affected =
-                validate_incoming_operations(&envelope, &body, adapters, &dependency_context)?;
-            collect_affected_operations(commit_id, &body, &affected, &mut candidates)?;
+            match decode_migration_body(&envelope, &body)? {
+                MigrationBody::Ordinary => {
+                    let dependency_context = self
+                        .dependency_context(envelope.header().dependencies())
+                        .await?;
+                    let affected = validate_incoming_operations(
+                        &envelope,
+                        &body,
+                        adapters,
+                        &dependency_context,
+                    )?;
+                    collect_affected_operations(commit_id, &body, &affected, &mut candidates)?;
+                }
+                MigrationBody::Stages(stage_batch) => {
+                    for stage in stage_batch {
+                        let key = (stage.migration_id(), stage.source_record_id().to_vec());
+                        if let Some(existing) = stages_by_record.insert(key, stage.clone())
+                            && existing != stage
+                        {
+                            return Err(DbError::InvalidRemoteCommit(
+                                "migration history contains conflicting stages".into(),
+                            ));
+                        }
+                    }
+                }
+                MigrationBody::Activation(activation) => {
+                    activations.push((commit_id, *activation));
+                }
+            }
+        }
+
+        let mut active = BTreeMap::<CollectionId, (CommitId, SchemaActivation)>::new();
+        for (commit_id, activation) in activations {
+            let collection = activation.to().collection_id();
+            if let Some((_, existing)) = active.get(&collection) {
+                if existing.from().schema_id() == activation.from().schema_id()
+                    && existing != &activation
+                {
+                    return Err(DbError::InvalidRemoteCommit(
+                        "collection has incompatible schema activation siblings".into(),
+                    ));
+                }
+                if existing.to().version() >= activation.to().version() {
+                    continue;
+                }
+            }
+            active.insert(collection, (commit_id, activation));
+        }
+
+        for (&collection, (activation_commit, activation)) in &active {
+            let activation_stages: Vec<_> = stages_by_record
+                .values()
+                .filter(|stage| stage.migration_id() == activation.migration_id())
+                .cloned()
+                .collect();
+            if u64::try_from(activation_stages.len()).ok() != Some(activation.staged_records())
+                || staging_digest(&activation_stages)? != activation.staging_digest()
+            {
+                return Err(DbError::InvalidRemoteCommit(
+                    "activation staging set is incomplete during rebuild".into(),
+                ));
+            }
+            for stage in activation_stages {
+                let target = MaterializedRecord::decode_canonical(stage.target_record())?;
+                candidates
+                    .entry((collection, target.record_id().to_vec()))
+                    .or_default()
+                    .push((*activation_commit, target));
+            }
+        }
+
+        for (key, entries) in &mut candidates {
+            let Some((activation_commit, activation)) = active.get(&key.0) else {
+                continue;
+            };
+            entries.retain(|(commit_id, mutation)| {
+                mutation.schema().version() >= activation.to().version()
+                    && (*commit_id == *activation_commit
+                        || is_ancestor(*activation_commit, *commit_id, &graph))
+            });
         }
         let mut mutations = Vec::with_capacity(candidates.len());
         for (key, entries) in candidates {
-            let adapter = *adapters
-                .get(&key.0)
-                .ok_or(DbError::UnknownRecordSchema(key.0))?;
-            mutations.push(resolve_record_heads(&key, adapter, &entries, &graph)?);
+            if entries.is_empty() {
+                continue;
+            }
+            mutations.push(resolve_record_heads(&key, &entries, &graph, adapters)?);
         }
         Ok(mutations)
     }
@@ -1415,6 +1936,255 @@ impl IrohDb {
             .clone()
     }
 
+    /// Resumes every registered transition across all locally attached domains.
+    pub async fn run_migrations(&self) -> Result<MigrationReport, DbError> {
+        let steps = self
+            .inner
+            .migrations
+            .read()
+            .expect("migration registry lock is not poisoned")
+            .clone();
+        let mut report = MigrationReport::default();
+        for domain_id in self.domains()? {
+            let domain = self.domain(domain_id)?;
+            for step in &steps {
+                report.absorb(domain.run_migration_step(step).await?);
+            }
+        }
+        Ok(report)
+    }
+
+    async fn run_migration_step(&self, step: &MigrationStep) -> Result<MigrationReport, DbError> {
+        let _control_reader = self.inner.control_gate.read().await;
+        let _writer = self.inner.writer.lock().await;
+        let domain_id = self.domain_id();
+        let collection_id = step.from.collection_id();
+        if let Some(active) = self
+            .inner
+            .store
+            .active_schema_activation(domain_id, collection_id)?
+            && active.to().version() >= step.to.version()
+        {
+            let registered =
+                self.inner
+                    .store
+                    .registered_schema(domain_id, collection_id, step.to.version())?;
+            if registered.is_some_and(|schema| schema.schema_id() == step.to.schema_id()) {
+                return Ok(MigrationReport {
+                    already_activated: 1,
+                    ..MigrationReport::default()
+                });
+            }
+            return Err(MigrationError::InvalidRegistration(
+                "active migration chain contains an incompatible historical descriptor".into(),
+            )
+            .into());
+        }
+        let Some(latest) = self
+            .inner
+            .store
+            .latest_registered_schema(domain_id, collection_id)?
+        else {
+            return Ok(MigrationReport::default());
+        };
+        if latest.schema_id() != step.from.schema_id() {
+            return Err(MigrationError::InvalidRegistration(format!(
+                "durable schema version {} does not match registered source version {}",
+                latest.version(),
+                step.from.version()
+            ))
+            .into());
+        }
+        self.require_migration_coordinator()?;
+        let records = self.inner.store.list_records(domain_id, collection_id)?;
+        let migration_id =
+            migration_id(domain_id, &step.from, &step.to, source_cut_digest(&records));
+        let mut stages = Vec::with_capacity(records.len());
+        for record in records {
+            let target = (step.transform)(record.state())?;
+            let source_digest = BlobHash::from_bytes(*blake3::hash(record.state()).as_bytes());
+            stages.push(SchemaStage::new(
+                migration_id,
+                step.from.clone(),
+                step.to.clone(),
+                record.record_id().to_vec(),
+                source_digest,
+                target.materialized.encode_canonical()?,
+            )?);
+        }
+        let existing: BTreeSet<_> = self
+            .inner
+            .store
+            .schema_stages(domain_id, migration_id)?
+            .into_iter()
+            .map(|stage| stage.source_record_id().to_vec())
+            .collect();
+        let missing: Vec<_> = stages
+            .iter()
+            .filter(|stage| !existing.contains(stage.source_record_id()))
+            .cloned()
+            .collect();
+        for batch in missing.chunks(256) {
+            self.commit_schema_stages_locked(batch).await?;
+        }
+        let activation = SchemaActivation::new(
+            migration_id,
+            step.from.clone(),
+            step.to.clone(),
+            u64::try_from(stages.len()).map_err(|_| {
+                MigrationError::InvalidRegistration("migration record count overflow".into())
+            })?,
+            staging_digest(&stages)?,
+        )?;
+        let activation_commit = self.commit_schema_activation_locked(&activation).await?;
+        Ok(MigrationReport {
+            staged: missing.len(),
+            already_staged: stages.len().saturating_sub(missing.len()),
+            activated: 1,
+            already_activated: 0,
+            activation_commits: vec![activation_commit],
+        })
+    }
+
+    fn require_migration_coordinator(&self) -> Result<(), DbError> {
+        if self
+            .inner
+            .store
+            .domain_descriptor(self.domain_id())?
+            .is_some()
+            && self.inner.store.current_controller(self.domain_id())? != self.author_id()
+        {
+            return Err(DbError::UnauthorizedDevice);
+        }
+        Ok(())
+    }
+
+    async fn commit_schema_stages_locked(
+        &self,
+        stages: &[SchemaStage],
+    ) -> Result<CommitId, DbError> {
+        if stages.is_empty() {
+            return Err(DbError::EmptyTransaction);
+        }
+        let operations = stages
+            .iter()
+            .map(|stage| {
+                Operation::new(
+                    stage.to().collection_id(),
+                    stage.source_record_id().to_vec(),
+                    0,
+                    OperationKind::SchemaStage,
+                    stage.encode_canonical(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let schemas = vec![stages[0].from().schema_id(), stages[0].to().schema_id()];
+        let envelope = self.seal_migration_commit_locked(operations, schemas, Permission::Admin)?;
+        self.inner
+            .store
+            .persist_schema_stages(&envelope, stages)
+            .await?;
+        Ok(envelope.commit_id())
+    }
+
+    async fn commit_schema_activation_locked(
+        &self,
+        activation: &SchemaActivation,
+    ) -> Result<CommitId, DbError> {
+        let operation = Operation::new(
+            activation.to().collection_id(),
+            Vec::new(),
+            0,
+            OperationKind::SchemaActivate,
+            activation.encode_canonical(),
+        )?;
+        let envelope = self.seal_migration_commit_locked(
+            vec![operation],
+            vec![activation.from().schema_id(), activation.to().schema_id()],
+            Permission::Admin,
+        )?;
+        self.validate_activation_cut(&envelope, activation).await?;
+        let before = self.inner.store.export_materialized(self.domain_id())?;
+        self.inner
+            .store
+            .persist_schema_activation(&envelope, activation)
+            .await?;
+        let after = self.inner.store.export_materialized(self.domain_id())?;
+        let changes = materialization_changes(&before, &after);
+        if !changes.is_empty() {
+            let _no_subscribers = self.changes().send(ChangeBatch {
+                commit_id: envelope.commit_id(),
+                sequence: envelope.header().author_sequence(),
+                changes,
+            });
+        }
+        Ok(envelope.commit_id())
+    }
+
+    fn seal_migration_commit_locked(
+        &self,
+        operations: Vec<Operation>,
+        schemas: Vec<SchemaId>,
+        permission: Permission,
+    ) -> Result<CommitEnvelope, DbError> {
+        self.require_migration_coordinator()?;
+        let domain_id = self.domain_id();
+        let active_epoch = self.inner.store.current_epoch(domain_id)?;
+        if self.epoch() != active_epoch {
+            return Err(DbError::StaleEpoch {
+                handle: self.epoch(),
+                active: active_epoch,
+            });
+        }
+        let signer = self.inner.credentials.signer();
+        let sequence = self
+            .inner
+            .store
+            .last_sequence(domain_id, signer.author())?
+            .map_or(Ok(0), |value| {
+                value.checked_add(1).ok_or(DbError::SequenceExhausted)
+            })?;
+        let dependencies = self.inner.store.frontier(domain_id)?;
+        let capability_id = match self
+            .inner
+            .store
+            .active_capability(domain_id, signer.author())?
+        {
+            Some(capability_id)
+                if self.inner.store.authorize_capability(
+                    domain_id,
+                    signer.author(),
+                    capability_id,
+                    permission,
+                    self.epoch(),
+                )? =>
+            {
+                capability_id
+            }
+            Some(_) | None if self.inner.store.domain_descriptor(domain_id)?.is_some() => {
+                return Err(DbError::UnauthorizedDevice);
+            }
+            None => private_capability(domain_id),
+            Some(_) => return Err(DbError::UnauthorizedDevice),
+        };
+        let mut nonce = [0_u8; 24];
+        let mut transaction_id = [0_u8; 32];
+        getrandom::fill(&mut nonce).map_err(|_| DbError::RandomnessUnavailable)?;
+        getrandom::fill(&mut transaction_id).map_err(|_| DbError::RandomnessUnavailable)?;
+        let body = CommitBody::new(TransactionId::from_bytes(transaction_id), operations)?;
+        let header = CommitHeader::new(
+            domain_id,
+            self.epoch(),
+            signer.author(),
+            sequence,
+            dependencies,
+            capability_id,
+            schemas,
+            nonce,
+        )?;
+        seal_commit(header, &body, &self.domain_key(), &signer).map_err(DbError::from)
+    }
+
     async fn apply(&self, prepared: Vec<PreparedRecord>) -> Result<ChangeBatch, DbError> {
         if prepared.is_empty() {
             return Err(DbError::EmptyTransaction);
@@ -1430,6 +2200,7 @@ impl IrohDb {
                 active: active_epoch,
             });
         }
+        self.validate_schema_writes(&prepared)?;
         let signer = self.inner.credentials.signer();
         let sequence = self
             .inner
@@ -1508,6 +2279,40 @@ impl IrohDb {
         };
         let _no_subscribers = self.changes().send(batch.clone());
         Ok(batch)
+    }
+
+    fn validate_schema_writes(&self, prepared: &[PreparedRecord]) -> Result<(), DbError> {
+        for entry in prepared {
+            let schema = entry.materialized.schema();
+            self.ensure_collection_available(schema.collection_id())?;
+            let Some(stored) = self
+                .inner
+                .store
+                .latest_registered_schema(self.domain_id(), schema.collection_id())?
+            else {
+                continue;
+            };
+            if stored.schema_id() == schema.schema_id() {
+                continue;
+            }
+            return Err(DbError::SchemaMigrationRequired {
+                collection_id: schema.collection_id(),
+                stored_version: stored.version(),
+                requested_version: schema.version(),
+            });
+        }
+        Ok(())
+    }
+
+    fn ensure_collection_available(&self, collection_id: CollectionId) -> Result<(), DbError> {
+        if self
+            .inner
+            .store
+            .migration_frozen(self.domain_id(), collection_id)?
+        {
+            return Err(DbError::SchemaMigrationFrozen(collection_id));
+        }
+        Ok(())
     }
 
     fn validate_consistency(&self, author: AuthorId, body: &CommitBody) -> Result<(), DbError> {
@@ -1615,6 +2420,8 @@ impl<Record: IrohRecord> Collection<Record> {
     pub async fn get(&self, id: &Record::Id) -> Result<Option<Record>, DbError> {
         let schema = Record::schema()?;
         self.db
+            .ensure_collection_available(schema.collection_id())?;
+        self.db
             .inner
             .store
             .get_record(
@@ -1646,6 +2453,8 @@ impl<Record: IrohRecord> Collection<Record> {
     /// Subscribes to future atomic changes for this collection.
     pub fn subscribe(&self) -> Result<Subscription<Record>, DbError> {
         let schema = Record::schema()?;
+        self.db
+            .ensure_collection_available(schema.collection_id())?;
         let receiver = self.db.changes().subscribe();
         let initial = self
             .db
@@ -1811,6 +2620,8 @@ impl<Record: IrohRecord> Query<Record> {
     #[allow(clippy::unused_async)]
     pub async fn fetch_page(self) -> Result<Page<Record>, DbError> {
         let schema = Record::schema()?;
+        self.db
+            .ensure_collection_available(schema.collection_id())?;
         let domain = self.db.domain_id();
         let fingerprint = self.fingerprint(schema.collection_id())?;
         let candidates = self.candidates(domain, schema.collection_id(), &schema)?;
@@ -2138,12 +2949,14 @@ impl Transaction {
     /// Adds a typed record replacement to this transaction.
     #[allow(clippy::needless_pass_by_value)]
     pub fn put<Record: IrohRecord>(&mut self, record: Record) -> Result<(), DbError> {
+        register_record_adapter::<Record>(&self.db);
         self.prepared.push(prepare_upsert(&record)?);
         Ok(())
     }
 
     /// Adds a typed record deletion to this transaction.
     pub fn delete<Record: IrohRecord>(&mut self, id: &Record::Id) -> Result<(), DbError> {
+        register_record_adapter::<Record>(&self.db);
         self.prepared.push(prepare_delete::<Record>(id)?);
         Ok(())
     }
@@ -2158,6 +2971,50 @@ struct PreparedRecord {
     materialized: MaterializedRecord,
     schema_id: SchemaId,
     change: Change,
+}
+
+fn register_record_adapter<Record: IrohRecord>(database: &IrohDb) {
+    let schema = Record::schema().expect("a record schema is statically valid");
+    database
+        .inner
+        .adapters
+        .write()
+        .expect("record adapter lock is not poisoned")
+        .insert(
+            (schema.collection_id(), schema.schema_id()),
+            RecordAdapter {
+                merge: merge_materialized::<Record>,
+                canonicalize: canonicalize_materialized::<Record>,
+            },
+        );
+}
+
+fn migration_id(
+    domain_id: iroh_db_core::DomainId,
+    from: &iroh_db_core::SchemaDescriptor,
+    to: &iroh_db_core::SchemaDescriptor,
+    source_cut_digest: BlobHash,
+) -> MigrationId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"iroh-db/schema-migration/v1");
+    hasher.update(domain_id.as_bytes());
+    hasher.update(from.schema_id().as_bytes());
+    hasher.update(to.schema_id().as_bytes());
+    hasher.update(source_cut_digest.as_bytes());
+    MigrationId::from_bytes(*hasher.finalize().as_bytes())
+}
+
+fn source_cut_digest(records: &[StoredRecord]) -> BlobHash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"iroh-db/schema-source-cut/v1");
+    hasher.update(&(records.len() as u64).to_be_bytes());
+    for record in records {
+        hasher.update(&(record.record_id().len() as u64).to_be_bytes());
+        hasher.update(record.record_id());
+        hasher.update(&(record.state().len() as u64).to_be_bytes());
+        hasher.update(record.state());
+    }
+    BlobHash::from_bytes(*hasher.finalize().as_bytes())
 }
 
 fn validate_prepared_targets(prepared: &[PreparedRecord]) -> Result<(), DbError> {
@@ -2175,7 +3032,7 @@ fn validate_prepared_targets(prepared: &[PreparedRecord]) -> Result<(), DbError>
 
 fn canonical_operations(
     prepared: &[PreparedRecord],
-    adapters: &BTreeMap<CollectionId, RecordAdapter>,
+    adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
     author: AuthorId,
     sequence: u64,
     dependency_context: &VersionVector,
@@ -2185,7 +3042,7 @@ fn canonical_operations(
     for entry in prepared {
         let mutation = if entry.materialized.state().is_some() {
             let adapter = adapters
-                .get(&entry.change.collection_id)
+                .get(&(entry.change.collection_id, entry.schema_id))
                 .ok_or(DbError::UnknownRecordSchema(entry.change.collection_id))?;
             (adapter.canonicalize)(
                 &entry.materialized,
@@ -2253,6 +3110,103 @@ fn prepare_delete<Record: IrohRecord>(id: &Record::Id) -> Result<PreparedRecord,
 type RecordTarget = (CollectionId, Vec<u8>);
 type RecordCandidates = BTreeMap<RecordTarget, Vec<(CommitId, MaterializedRecord)>>;
 
+enum MigrationBody {
+    Ordinary,
+    Stages(Vec<SchemaStage>),
+    Activation(Box<SchemaActivation>),
+}
+
+fn decode_migration_body(
+    envelope: &CommitEnvelope,
+    body: &CommitBody,
+) -> Result<MigrationBody, DbError> {
+    let has_migration = body.operations().iter().any(|operation| {
+        matches!(
+            operation.kind(),
+            OperationKind::SchemaStage | OperationKind::SchemaActivate
+        )
+    });
+    if !has_migration {
+        return Ok(MigrationBody::Ordinary);
+    }
+    if body
+        .operations()
+        .iter()
+        .all(|operation| operation.kind() == OperationKind::SchemaStage)
+    {
+        let mut stages = Vec::with_capacity(body.operations().len());
+        for operation in body.operations() {
+            let stage = SchemaStage::decode_canonical(operation.payload())?;
+            if operation.collection_id() != stage.to().collection_id()
+                || operation.record_id() != stage.source_record_id()
+                || operation.field_id() != 0
+                || !envelope
+                    .header()
+                    .schema_ids()
+                    .contains(&stage.from().schema_id())
+                || !envelope
+                    .header()
+                    .schema_ids()
+                    .contains(&stage.to().schema_id())
+            {
+                return Err(DbError::InvalidRemoteCommit(
+                    "migration stage target or schema header is inconsistent".into(),
+                ));
+            }
+
+            stages.push(stage);
+        }
+        staging_digest(&stages)?;
+        return Ok(MigrationBody::Stages(stages));
+    }
+    if body.operations().len() == 1 && body.operations()[0].kind() == OperationKind::SchemaActivate
+    {
+        let operation = &body.operations()[0];
+        let activation = SchemaActivation::decode_canonical(operation.payload())?;
+        if operation.collection_id() != activation.to().collection_id()
+            || !operation.record_id().is_empty()
+            || operation.field_id() != 0
+            || !envelope
+                .header()
+                .schema_ids()
+                .contains(&activation.from().schema_id())
+            || !envelope
+                .header()
+                .schema_ids()
+                .contains(&activation.to().schema_id())
+        {
+            return Err(DbError::InvalidRemoteCommit(
+                "schema activation target or schema header is inconsistent".into(),
+            ));
+        }
+        return Ok(MigrationBody::Activation(Box::new(activation)));
+    }
+    Err(DbError::InvalidRemoteCommit(
+        "migration and record operations cannot share one commit".into(),
+    ))
+}
+
+fn validate_staged_records(
+    stages: &[SchemaStage],
+    adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
+) -> Result<(), DbError> {
+    for stage in stages {
+        if !adapters.contains_key(&(stage.from().collection_id(), stage.from().schema_id())) {
+            return Err(DbError::UnknownRecordSchema(stage.from().collection_id()));
+        }
+        let adapter = adapters
+            .get(&(stage.to().collection_id(), stage.to().schema_id()))
+            .ok_or(DbError::UnknownRecordSchema(stage.to().collection_id()))?;
+        let target = MaterializedRecord::decode_canonical(stage.target_record())?;
+        if (adapter.merge)(None, &target)? != target {
+            return Err(DbError::InvalidRemoteCommit(
+                "staged target is not canonical for its registered record type".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn materialization_changes(
     before: &[MaterializedRecord],
     after: &[MaterializedRecord],
@@ -2294,7 +3248,7 @@ fn present_records(values: &[MaterializedRecord]) -> BTreeMap<RecordTarget, &Mat
 fn validate_incoming_operations(
     envelope: &CommitEnvelope,
     body: &CommitBody,
-    adapters: &BTreeMap<CollectionId, RecordAdapter>,
+    adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
     dependency_context: &VersionVector,
 ) -> Result<BTreeMap<RecordTarget, RecordAdapter>, DbError> {
     let mut affected = BTreeMap::new();
@@ -2321,11 +3275,8 @@ fn validate_incoming_operations(
             ));
         }
         let adapter = *adapters
-            .get(&operation.collection_id())
+            .get(&(operation.collection_id(), mutation.schema().schema_id()))
             .ok_or(DbError::UnknownRecordSchema(operation.collection_id()))?;
-        if adapter.schema_id != mutation.schema().schema_id() {
-            return Err(DbError::InvalidRemoteCommit("schema ID mismatch".into()));
-        }
         if mutation.state().is_some() {
             let canonical = (adapter.canonicalize)(
                 &mutation,
@@ -2379,9 +3330,9 @@ fn collect_affected_operations(
 
 fn resolve_record_heads(
     key: &RecordTarget,
-    adapter: RecordAdapter,
     entries: &[(CommitId, MaterializedRecord)],
     graph: &BTreeMap<CommitId, Vec<CommitId>>,
+    adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
 ) -> Result<MaterializedRecord, DbError> {
     let mut heads: Vec<_> = entries
         .iter()
@@ -2392,6 +3343,24 @@ fn resolve_record_heads(
         })
         .collect();
     heads.sort_unstable_by_key(|(commit_id, _)| *commit_id);
+    let active_version = heads
+        .iter()
+        .map(|(_, mutation)| mutation.schema().version())
+        .max()
+        .ok_or_else(|| DbError::InvalidRemoteCommit("record has no causal head".into()))?;
+    heads.retain(|(_, mutation)| mutation.schema().version() == active_version);
+    let active_schema = heads[0].1.schema().schema_id();
+    if heads
+        .iter()
+        .any(|(_, mutation)| mutation.schema().schema_id() != active_schema)
+    {
+        return Err(DbError::InvalidRemoteCommit(
+            "concurrent schema descriptors share one version".into(),
+        ));
+    }
+    let adapter = *adapters
+        .get(&(key.0, active_schema))
+        .ok_or(DbError::UnknownRecordSchema(key.0))?;
     if heads.iter().any(|(_, mutation)| mutation.state().is_some()) {
         let mut merged: Option<MaterializedRecord> = None;
         for (_, mutation) in heads
