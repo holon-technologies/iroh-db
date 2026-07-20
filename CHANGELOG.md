@@ -13,3 +13,7 @@ All notable changes are documented here. The project follows semantic versioning
 - Full dependency-policy checks are release-blocking with exact reviewed
   license exceptions, reasoned upstream advisory exceptions, and third-party
   notices.
+- Adaptive multi-source blob scheduling adds weighted priority fairness,
+  latency/throughput provider scoring, bounded concurrency and jittered
+  backoff, high-priority hedging, moving cancellable prefetch, request
+  coalescing, provider-quality metrics, and an executable playback benchmark.

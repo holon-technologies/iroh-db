@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use iroh_blobs::{Hash, store::fs::FsStore};
 use iroh_db_core::BlobHash;
@@ -31,6 +32,12 @@ impl iroh::protocol::ProtocolHandler for BlobProtocol {
 #[derive(Debug, Clone)]
 pub struct IrohBlobStore {
     inner: FsStore,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TransferStats {
+    pub(crate) bytes: u64,
+    pub(crate) elapsed: Duration,
 }
 
 impl IrohBlobStore {
@@ -74,12 +81,24 @@ impl IrohBlobStore {
         connection: iroh::endpoint::Connection,
         hash: BlobHash,
     ) -> Result<(), BlobStoreError> {
-        self.inner
+        self.fetch_with_stats(connection, hash).await.map(|_| ())
+    }
+
+    pub(crate) async fn fetch_with_stats(
+        &self,
+        connection: iroh::endpoint::Connection,
+        hash: BlobHash,
+    ) -> Result<TransferStats, BlobStoreError> {
+        let stats = self
+            .inner
             .remote()
             .fetch(connection, Hash::from_bytes(hash.to_bytes()))
             .await
             .map_err(|error| BlobStoreError::new(error.to_string()))?;
-        Ok(())
+        Ok(TransferStats {
+            bytes: stats.total_bytes_read(),
+            elapsed: stats.elapsed,
+        })
     }
 
     /// Reads one locally complete immutable object by content hash.

@@ -14,7 +14,10 @@ pub use db::{
     OrderDirection, Page, Predicate, ProjectionReport, Query, RemoteApply, Subscription,
     SubscriptionError, SubscriptionEvent, Transaction,
 };
-pub use iroh_db_blobs::{BlobError, BlobPriority, BlobRef, BlobStream, FetchMetrics, FetchOptions};
+pub use iroh_db_blobs::{
+    BlobError, BlobPriority, BlobRef, BlobStream, FetchMetrics, FetchOptions, FetchScheduler,
+    ProviderMetrics,
+};
 pub use iroh_db_core::{
     AuthorId, BlobHash, CapabilityId, CollectionId, CommitBody, CommitEnvelope, CommitHeader,
     CommitId, CrdtError, CrdtKind, DomainId, Dot, EqualityFilter, FieldDescriptor, FieldState,

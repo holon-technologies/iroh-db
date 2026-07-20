@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     future::Future,
     io::{Error as IoError, ErrorKind, SeekFrom},
     pin::Pin,
@@ -15,11 +16,17 @@ use crate::{
     BlobError,
     engine::{MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, decrypt_chunk},
     model::{ChunkDescriptor, ManifestBody, ManifestEnvelope},
+    scheduler::BlobPriority,
 };
 
 type ChunkFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>, BlobError>> + Send + 'static>>;
 pub(crate) type ChunkFetcher = Arc<
-    dyn Fn(BlobHash) -> Pin<Box<dyn Future<Output = Result<(), BlobError>> + Send + 'static>>
+    dyn Fn(
+            BlobHash,
+            u64,
+            BlobPriority,
+            bool,
+        ) -> Pin<Box<dyn Future<Output = Result<(), BlobError>> + Send + 'static>>
         + Send
         + Sync,
 >;
@@ -34,6 +41,10 @@ pub struct BlobStream {
     cached: Option<(usize, Vec<u8>)>,
     pending: Option<(usize, ChunkFuture)>,
     fetcher: Option<ChunkFetcher>,
+    priority: BlobPriority,
+    prefetch_chunks: usize,
+    prefetch_anchor: Option<usize>,
+    prefetch_tasks: BTreeMap<usize, tokio::task::JoinHandle<()>>,
 }
 
 impl BlobStream {
@@ -52,11 +63,22 @@ impl BlobStream {
             cached: None,
             pending: None,
             fetcher: None,
+            priority: BlobPriority::Normal,
+            prefetch_chunks: 0,
+            prefetch_anchor: None,
+            prefetch_tasks: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn with_fetcher(mut self, fetcher: ChunkFetcher) -> Self {
+    pub(crate) fn with_fetcher(
+        mut self,
+        fetcher: ChunkFetcher,
+        priority: BlobPriority,
+        prefetch_chunks: u8,
+    ) -> Self {
         self.fetcher = Some(fetcher);
+        self.priority = priority;
+        self.prefetch_chunks = usize::from(prefetch_chunks.min(16));
         self
     }
 
@@ -83,25 +105,87 @@ impl BlobStream {
         let salt = self.envelope.salt;
         let descriptor = self.manifest.chunks[index].clone();
         let fetcher = self.fetcher.clone();
+        let priority = self.priority;
         let future = Box::pin(async move {
-            let mut ciphertext = store
+            if let Some(fetcher) = fetcher {
+                fetcher(
+                    descriptor.ciphertext_hash,
+                    u64::from(descriptor.plaintext_len) + 16,
+                    priority,
+                    priority == BlobPriority::High,
+                )
+                .await?;
+            }
+            let ciphertext = store
                 .get(descriptor.ciphertext_hash)
                 .await
-                .map_err(BlobError::from)?;
-            if ciphertext.is_none()
-                && let Some(fetcher) = fetcher
-            {
-                fetcher(descriptor.ciphertext_hash).await?;
-                ciphertext = store
-                    .get(descriptor.ciphertext_hash)
-                    .await
-                    .map_err(BlobError::from)?;
-            }
-            let ciphertext =
-                ciphertext.ok_or(BlobError::MissingBlob(descriptor.ciphertext_hash))?;
+                .map_err(BlobError::from)?
+                .ok_or(BlobError::MissingBlob(descriptor.ciphertext_hash))?;
             decrypt_chunk(&key, domain_id, epoch, &salt, &descriptor, &ciphertext)
         });
         self.pending = Some((index, future));
+    }
+
+    fn schedule_prefetch(&mut self, index: usize) {
+        if self.prefetch_chunks == 0 || self.prefetch_anchor == Some(index) {
+            return;
+        }
+        self.prefetch_anchor = Some(index);
+        let Some(fetcher) = self.fetcher.clone() else {
+            return;
+        };
+        let priority = self.priority.lower();
+        let window_end = index
+            .saturating_add(self.prefetch_chunks)
+            .min(self.manifest.chunks.len().saturating_sub(1));
+        self.prefetch_tasks.retain(|task_index, task| {
+            let keep = !task.is_finished() && *task_index >= index && *task_index <= window_end;
+            if !keep && !task.is_finished() {
+                task.abort();
+            }
+            keep
+        });
+        let descriptors = self
+            .manifest
+            .chunks
+            .iter()
+            .enumerate()
+            .skip(index.saturating_add(1))
+            .take(self.prefetch_chunks)
+            .map(|(task_index, descriptor)| (task_index, descriptor.clone()))
+            .collect::<Vec<_>>();
+        for (task_index, descriptor) in descriptors {
+            if self.prefetch_tasks.contains_key(&task_index) {
+                continue;
+            }
+            let fetcher = fetcher.clone();
+            let store = self.store.clone();
+            let task = tokio::spawn(async move {
+                if store
+                    .get(descriptor.ciphertext_hash)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    let _ = fetcher(
+                        descriptor.ciphertext_hash,
+                        u64::from(descriptor.plaintext_len) + 16,
+                        priority,
+                        false,
+                    )
+                    .await;
+                }
+            });
+            self.prefetch_tasks.insert(task_index, task);
+        }
+    }
+
+    fn cancel_prefetch(&mut self) {
+        for (_, task) in std::mem::take(&mut self.prefetch_tasks) {
+            task.abort();
+        }
+        self.prefetch_anchor = None;
     }
 }
 
@@ -120,6 +204,7 @@ impl AsyncRead for BlobStream {
             let chunk_index = usize::try_from(chunk_index_u64).map_err(|error| {
                 IoError::new(ErrorKind::InvalidData, BlobError::Codec(error.to_string()))
             })?;
+            self.schedule_prefetch(chunk_index);
             if let Some((cached_index, bytes)) = &self.cached
                 && *cached_index == chunk_index
             {
@@ -173,6 +258,7 @@ impl AsyncSeek for BlobStream {
             .map_err(|_| IoError::new(ErrorKind::InvalidInput, "seek before start"))?;
         self.position = position;
         self.pending = None;
+        self.cancel_prefetch();
         Ok(())
     }
 
@@ -181,6 +267,12 @@ impl AsyncSeek for BlobStream {
         _context: &mut Context<'_>,
     ) -> Poll<std::io::Result<u64>> {
         Poll::Ready(Ok(self.position))
+    }
+}
+
+impl Drop for BlobStream {
+    fn drop(&mut self) {
+        self.cancel_prefetch();
     }
 }
 
@@ -215,3 +307,93 @@ pub(crate) fn validate_manifest(manifest: &ManifestBody) -> Result<(), BlobError
 
 #[allow(dead_code)]
 fn _descriptor_is_send(_: &ChunkDescriptor) {}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use iroh_db_core::DomainId;
+    use iroh_db_store::{BlobFuture, BlobStoreError};
+    use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+    use super::*;
+
+    struct EmptyStore;
+
+    impl BlobStore for EmptyStore {
+        fn put(&self, _bytes: Vec<u8>) -> BlobFuture<'_, BlobHash> {
+            Box::pin(async { Err(BlobStoreError::new("put is unused")) })
+        }
+
+        fn get(&self, _hash: BlobHash) -> BlobFuture<'_, Option<Vec<u8>>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn list(&self) -> BlobFuture<'_, Vec<BlobHash>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_chunk_read_restarts_prefetch_after_seek() {
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let chunk_size = u32::try_from(CHUNK_SIZE).unwrap();
+        let chunks = (0_u8..3)
+            .map(|index| ChunkDescriptor {
+                index: u32::from(index),
+                plaintext_len: chunk_size,
+                ciphertext_hash: BlobHash::from_bytes([index + 1; 32]),
+                nonce: [index; 24],
+            })
+            .collect();
+        let envelope = ManifestEnvelope {
+            version: 1,
+            domain_id: DomainId::from_bytes([1; 32]),
+            epoch: 0,
+            salt: [2; 32],
+            nonce: [3; 24],
+            ciphertext: Vec::new(),
+        };
+        let body = ManifestBody {
+            plaintext_len: u64::try_from(CHUNK_SIZE * 3).unwrap(),
+            plaintext_hash: [4; 32],
+            chunk_size,
+            chunks,
+            media_type: None,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fetch_calls = calls.clone();
+        let fetcher: ChunkFetcher = Arc::new(move |_, _, _, _| {
+            let fetch_calls = fetch_calls.clone();
+            Box::pin(async move {
+                fetch_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+        });
+        let mut stream = BlobStream::new(
+            Arc::new(EmptyStore),
+            DomainKey::from_bytes([5; 32]),
+            envelope,
+            body,
+        )
+        .with_fetcher(fetcher, BlobPriority::High, 2);
+        stream.cached = Some((0, vec![7; CHUNK_SIZE]));
+
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).await.unwrap();
+        wait_for_calls(&calls, 2).await;
+        stream.seek(SeekFrom::Start(1024)).await.unwrap();
+        stream.read_exact(&mut byte).await.unwrap();
+        wait_for_calls(&calls, 4).await;
+    }
+
+    async fn wait_for_calls(calls: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while calls.load(Ordering::Relaxed) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+}

@@ -49,7 +49,7 @@ Sharing private state is an explicit typed projection into an independent destin
 
 ## Encrypted blob streaming
 
-Blob manifests and independent chunks are content-addressed and encrypted. `BlobStream` implements lazy `AsyncRead + AsyncSeek`. Remote open fetches only the manifest; reads and seeks request intersecting chunks plus bounded prefetch. The scheduler rotates across iroh-blobs providers, retries provider loss, caches ciphertext on disk, keeps one bounded plaintext RAM chunk, and exposes low-cardinality transfer metrics.
+Blob manifests and independent chunks are content-addressed and encrypted. `BlobStream` implements lazy `AsyncRead + AsyncSeek`. Remote open fetches only the manifest; reads and seeks request intersecting chunks plus bounded prefetch. A shared weighted scheduler learns provider latency and verified throughput, applies bounded concurrency/backoff, hedges stalled high-priority chunks, coalesces duplicate requests, and cancels obsolete read-ahead on seek. Ciphertext is cached on disk, one bounded plaintext chunk stays in RAM, and low-cardinality metrics expose transfer and provider quality without endpoint or content labels.
 
 ## Operations
 
@@ -72,6 +72,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo doc --workspace --no-deps
 cargo bench -p iroh-db-blobs --bench local_stream
+cargo bench -p iroh-db --bench multisource_stream
 ```
 
 The MSRV is Rust 1.91. Fuzz targets live in `fuzz/`; the extended reconnect soak is an ignored test controlled by `IROH_DB_SOAK_ROUNDS`.

@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use iroh_db_blobs::{BlobEngine, BlobError, BlobRef, BlobStream, IrohBlobStore};
+use iroh_db_blobs::{BlobEngine, BlobError, BlobRef, BlobStream, FetchScheduler, IrohBlobStore};
 use iroh_db_core::{
     AuthorId, BlobHash, CapabilityId, CollectionId, CommitBody, CommitCodecError, CommitEnvelope,
     CommitHeader, CommitId, Dot, EqualityFilter, IrohRecord, Operation, OperationKind, RangeFilter,
@@ -181,6 +181,7 @@ pub struct IrohDb {
 pub(crate) struct DbInner {
     pub(crate) store: Store,
     pub(crate) blobs: Arc<IrohBlobStore>,
+    pub(crate) blob_scheduler: FetchScheduler,
     pub(crate) credentials: LocalCredentials,
     pub(crate) writer: Mutex<()>,
     pub(crate) control_gate: AsyncRwLock<()>,
@@ -343,6 +344,7 @@ impl IrohDb {
             inner: Arc::new(DbInner {
                 store,
                 blobs,
+                blob_scheduler: FetchScheduler::default(),
                 credentials,
                 writer: Mutex::new(()),
                 control_gate: AsyncRwLock::new(()),
@@ -729,6 +731,7 @@ impl IrohDb {
             self.epoch(),
             self.domain_key(),
         )
+        .with_fetch_scheduler(self.inner.blob_scheduler.clone())
     }
 
     pub(crate) fn blob_engine_for_epoch(&self, epoch: u64) -> Result<BlobEngine, DbError> {
@@ -741,7 +744,8 @@ impl IrohDb {
             self.domain_id(),
             epoch,
             self.domain_key_for(epoch)?,
-        ))
+        )
+        .with_fetch_scheduler(self.inner.blob_scheduler.clone()))
     }
 
     /// Issues a targeted signed invitation carrying the current epoch key and capability chain.

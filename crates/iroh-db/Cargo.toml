@@ -31,5 +31,9 @@ tokio.workspace = true
 redb.workspace = true
 tempfile = "3.27.0"
 
+[[bench]]
+name = "multisource_stream"
+harness = false
+
 [lints]
 workspace = true

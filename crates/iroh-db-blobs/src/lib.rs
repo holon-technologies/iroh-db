@@ -5,11 +5,13 @@
 mod engine;
 mod local;
 mod model;
+mod scheduler;
 mod stream;
 
-pub use engine::{BlobEngine, BlobPriority, FetchMetrics, FetchOptions};
+pub use engine::{BlobEngine, FetchMetrics, FetchOptions};
 pub use local::{BlobProtocol, IrohBlobStore};
 pub use model::BlobRef;
+pub use scheduler::{BlobPriority, FetchScheduler, ProviderMetrics};
 pub use stream::BlobStream;
 
 /// Encrypted manifest, chunk, streaming or storage failure.
@@ -57,4 +59,13 @@ pub enum BlobError {
     /// A remote stream was opened without any usable provider.
     #[error("no blob providers are available")]
     NoProviders,
+    /// The configured process-wide remote object concurrency was zero.
+    #[error("remote blob concurrency must be non-zero, got {0}")]
+    InvalidFetchConcurrency(usize),
+    /// The in-process fetch scheduler could not admit work safely.
+    #[error("remote blob scheduler is unavailable")]
+    SchedulerUnavailable,
+    /// A coalesced remote fetch owner was cancelled before completing.
+    #[error("remote blob fetch was cancelled")]
+    FetchCancelled,
 }
