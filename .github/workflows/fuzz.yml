@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fuzz-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   fuzz:
     runs-on: ubuntu-latest
@@ -29,10 +33,14 @@ jobs:
     env:
       FUZZ_DURATION_SECONDS: ${{ inputs.duration_seconds || '600' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cargo-fuzz
       - name: Validate mutation duration
         run: |
           case "$FUZZ_DURATION_SECONDS" in
@@ -51,7 +59,7 @@ jobs:
           -max_total_time=${FUZZ_DURATION_SECONDS} -timeout=10 -rss_limit_mb=4096
       - name: Retain corpus and crash evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-${{ matrix.target }}-${{ github.run_id }}
           path: |
