@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use iroh_db_blobs::BlobRef;
 use iroh_db_core::{AuthorId, CapabilityId, CommitId, SchemaActivation};
 use iroh_db_security::{CapabilityCertificate, Permission, verify_snapshot_signature};
@@ -72,6 +74,7 @@ struct SignedSnapshot {
 
 impl IrohDb {
     /// Captures canonical materialized state and frontier in a signed encrypted blob.
+    #[tracing::instrument(name = "iroh_db.snapshot.create", skip_all)]
     pub async fn snapshot(&self) -> Result<Snapshot, DbError> {
         let _control_reader = self.inner.control_gate.read().await;
         let _writer = self.inner.writer.lock().await;
@@ -112,10 +115,15 @@ impl IrohDb {
         };
         let bytes = minicbor::to_vec(envelope).map_err(snapshot_codec)?;
         let blob = self.blob_engine().import_bytes(bytes, None).await?;
+        self.inner
+            .store
+            .record_snapshot_observed_at(domain_id, unix_seconds()?)?;
+        self.inner.telemetry.record_snapshot_created();
         Ok(Snapshot { blob, state_root })
     }
 
     /// Verifies and atomically installs a local snapshot's derived state.
+    #[tracing::instrument(name = "iroh_db.snapshot.install", skip_all)]
     pub async fn install_snapshot(&self, snapshot: Snapshot) -> Result<(), DbError> {
         let _control_reader = self.inner.control_gate.read().await;
         let _writer = self.inner.writer.lock().await;
@@ -145,6 +153,7 @@ impl IrohDb {
             content.author_sequences.clone(),
         )?;
         let activations = decode_activations(&content.schema_activations)?;
+        let observed_at = unix_seconds()?;
         if let Err(error) = self.inner.store.install_snapshot(
             content.domain_id,
             &records,
@@ -152,6 +161,7 @@ impl IrohDb {
             &content.frontier,
             &content.author_sequences,
             &activations,
+            observed_at,
             &baseline,
         ) {
             return match error {
@@ -161,6 +171,7 @@ impl IrohDb {
                 error => Err(DbError::Store(error)),
             };
         }
+        self.inner.telemetry.record_snapshot_installed();
         Ok(())
     }
 
@@ -509,4 +520,11 @@ where
 #[allow(clippy::needless_pass_by_value)]
 fn snapshot_codec(error: impl std::fmt::Display) -> DbError {
     DbError::InvalidSnapshot(error.to_string())
+}
+
+fn unix_seconds() -> Result<u64, DbError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| DbError::Operation("system clock is before the Unix epoch".into()))
 }

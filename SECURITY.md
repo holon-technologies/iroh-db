@@ -19,6 +19,11 @@ Report suspected vulnerabilities privately to the maintainers. Do not include ke
 - Review changes to signature contexts, canonical codecs, AEAD nonce/AAD construction, capability narrowing, control succession, epoch cuts, invitation targeting, and bounded protocol inputs.
 - Confirm secrets remain redacted and key-vault files are owner-only after create, backup, and restore.
 - Confirm repair and restore use a new/in-memory candidate and never overwrite the only known-good copy before verification.
+- Pin the expected backup signer for any restore whose archive provenance is a
+  security decision; a valid unpinned self-signature proves integrity but not
+  that the archive came from the intended device.
+- Confirm external `KeyProvider` backups use an explicitly selected signer and
+  that the provider's secret storage is backed up through its own procedure.
 - Confirm gossip and errors contain no keys, capabilities, record identifiers, collection values, or plaintext.
 
 The confidentiality boundary excludes compromised unlocked devices, traffic analysis, denial of service, and plaintext already obtained by a previously authorized member.

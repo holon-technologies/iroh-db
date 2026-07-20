@@ -9,6 +9,15 @@ All notable changes are documented here. The project follows semantic versioning
 - Signed capability domains, invitations, epoch rotation/revocation, device groups, and projection sharing.
 - Lazy multi-provider encrypted blob streaming with seek, retry, prefetch, and transfer counters.
 - Verification, repair, checksummed backup/restore, operational metrics, CLI, CI, fuzz targets, and churn/soak harnesses.
+- Canonical endpoint-signed backup catalogs add signer pinning, staged
+  crash-safe publication, symlink/path hardening, streaming verification, and
+  explicit support for application-managed key providers.
+- Operational visibility now includes static structured spans, apply/query
+  latency, index scans, quarantine/rebase counts, sync outcomes, snapshot age,
+  and repair results without content-bearing labels.
+- Queries support compound typed ordering, subscription batches carry the
+  resulting frontier, and standalone verification explicitly distinguishes
+  structural validation from application-registered typed replay.
 - Durable authenticated snapshot baselines make verification, repair, and equivocation quarantine reconstruct snapshot-plus-tail state without trusting mutable materialized tables.
 - Full dependency-policy checks are release-blocking with exact reviewed
   license exceptions, reasoned upstream advisory exceptions, and third-party

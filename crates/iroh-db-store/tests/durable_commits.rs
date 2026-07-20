@@ -191,6 +191,7 @@ fn snapshot_install_publishes_active_schema_cut_atomically() {
             &[],
             &[],
             std::slice::from_ref(&activation),
+            1,
             &baseline,
         )
         .unwrap();
@@ -201,6 +202,7 @@ fn snapshot_install_publishes_active_schema_cut_atomically() {
             .unwrap(),
         Some(activation)
     );
+    assert_eq!(store.snapshot_observed_at(domain).unwrap(), Some(1));
 }
 
 fn id(byte: u8) -> [u8; 32] {
@@ -583,6 +585,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[outside_coverage],
                 &[(signer.author(), 0)],
                 &[],
+                1,
                 &baseline(vec![outside_coverage], vec![(signer.author(), 0)]),
             )
             .is_err()
@@ -598,6 +601,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id],
                 &[(signer.author(), 0)],
                 &[],
+                1,
                 &baseline(vec![accepted_id], vec![(signer.author(), 0)]),
             )
             .is_err()
@@ -616,6 +620,7 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id],
                 &[(first_author, 0), (second_author, 0)],
                 &[],
+                1,
                 &baseline(vec![accepted_id], vec![(signer.author(), 0)]),
             )
             .is_err()
@@ -640,11 +645,13 @@ async fn snapshot_install_rejects_noncanonical_causal_baselines_atomically() {
                 &[accepted_id],
                 &[(signer.author(), 0)],
                 &[],
+                1,
                 &baseline(vec![accepted_id], vec![(signer.author(), 0)]),
             )
             .is_err()
     );
     assert_eq!(store.frontier(domain).unwrap(), vec![accepted_id]);
+    assert_eq!(store.snapshot_observed_at(domain).unwrap(), None);
 }
 
 #[tokio::test]
@@ -675,6 +682,7 @@ async fn snapshot_tail_preflight_uses_signed_domain_baseline() {
             &[opaque_frontier],
             &author_floor,
             &[],
+            1,
             &baseline,
         )
         .unwrap();
@@ -744,6 +752,7 @@ async fn retained_snapshot_frontier_remains_accepted_after_quarantine() {
             &[retained_id],
             &author_floor,
             &[],
+            1,
             &baseline,
         )
         .unwrap();

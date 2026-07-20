@@ -52,6 +52,11 @@ async fn one_real_iroh_session_reconciles_both_offline_peers_via_blobs() {
     let report = left_node.sync_with(right_node.addr()).await.unwrap();
     assert_eq!(report.received(), 1);
     assert_eq!(report.sent(), 1);
+    let metrics = left.operational_metrics().unwrap();
+    assert_eq!(metrics.sync_rounds(), 1);
+    assert_eq!(metrics.sync_failures(), 0);
+    assert_eq!(metrics.sync_commits_received(), 1);
+    assert_eq!(metrics.sync_commits_sent(), 1);
     assert_eq!(left.state_root().unwrap(), right.state_root().unwrap());
     assert_eq!(
         left_notes.get(&"same".to_owned()).await.unwrap(),
@@ -671,6 +676,9 @@ async fn sync_never_delivers_a_rotated_key_to_a_revoked_member() {
     let (rotated, _) = owner.rotate_epoch(&[member.author_id()]).unwrap();
     assert!(member_node.sync_with(owner_node.addr()).await.is_err());
     assert_eq!(member.domain_seed().epoch(), 0);
+    let metrics = member.operational_metrics().unwrap();
+    assert_eq!(metrics.sync_rounds(), 2);
+    assert_eq!(metrics.sync_failures(), 1);
 
     owner_node.shutdown().await.unwrap();
     member_node.shutdown().await.unwrap();

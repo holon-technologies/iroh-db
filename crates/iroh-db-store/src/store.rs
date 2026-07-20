@@ -83,6 +83,9 @@ const MIGRATION_CHECKPOINTS: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("migration_checkpoints_v1");
 const MIGRATION_FORKS: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("migration_forks_v1");
+const OPERATIONAL_METADATA: TableDefinition<'static, &[u8], u64> =
+    TableDefinition::new("operational_metadata_v1");
+const SNAPSHOT_OBSERVED_AT_TAG: u8 = 1;
 
 /// The result of durably recording an immutable commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,6 +635,39 @@ impl Store {
             table_keys_with_prefix(&stages, domain_id.as_bytes())?.len(),
             table_keys_with_prefix(&forks, domain_id.as_bytes())?.len(),
         ))
+    }
+
+    /// Records when this device last created or installed a verified snapshot.
+    pub fn record_snapshot_observed_at(
+        &self,
+        domain_id: DomainId,
+        unix_seconds: u64,
+    ) -> Result<(), StoreError> {
+        let write = self.inner.database.begin_write().map_err(database_error)?;
+        {
+            let mut table = write
+                .open_table(OPERATIONAL_METADATA)
+                .map_err(database_error)?;
+            table
+                .insert(
+                    operational_metadata_key(domain_id, SNAPSHOT_OBSERVED_AT_TAG).as_slice(),
+                    unix_seconds,
+                )
+                .map_err(database_error)?;
+        }
+        write.commit().map_err(database_error)
+    }
+
+    /// Returns the durable local observation time of the newest verified snapshot.
+    pub fn snapshot_observed_at(&self, domain_id: DomainId) -> Result<Option<u64>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let table = read
+            .open_table(OPERATIONAL_METADATA)
+            .map_err(database_error)?;
+        Ok(table
+            .get(operational_metadata_key(domain_id, SNAPSHOT_OBSERVED_AT_TAG).as_slice())
+            .map_err(database_error)?
+            .map(|value| value.value()))
     }
 
     /// Loads every durable stage for one migration in source-key order.
@@ -1405,6 +1441,7 @@ impl Store {
         frontier_commits: &[CommitId],
         author_sequences: &[(AuthorId, u64)],
         activations: &[SchemaActivation],
+        observed_at_unix_seconds: u64,
         baseline: &SnapshotBaseline,
     ) -> Result<(), StoreError> {
         validate_snapshot_metadata(records, covered_commits, frontier_commits, author_sequences)?;
@@ -1457,6 +1494,14 @@ impl Store {
                     .map_err(database_error)?;
             }
         }
+        write
+            .open_table(OPERATIONAL_METADATA)
+            .map_err(database_error)?
+            .insert(
+                operational_metadata_key(domain_id, SNAPSHOT_OBSERVED_AT_TAG).as_slice(),
+                observed_at_unix_seconds,
+            )
+            .map_err(database_error)?;
         write.commit().map_err(database_error)
     }
 
@@ -3026,6 +3071,9 @@ fn initialize_tables(database: &Database) -> Result<(), StoreError> {
         .open_table(MIGRATION_CHECKPOINTS)
         .map_err(database_error)?;
     write.open_table(MIGRATION_FORKS).map_err(database_error)?;
+    write
+        .open_table(OPERATIONAL_METADATA)
+        .map_err(database_error)?;
     write.commit().map_err(database_error)
 }
 
@@ -3844,6 +3892,13 @@ fn active_schema_key(domain_id: DomainId, collection_id: CollectionId) -> [u8; 6
     let mut key = [0_u8; 64];
     key[..32].copy_from_slice(domain_id.as_bytes());
     key[32..].copy_from_slice(collection_id.as_bytes());
+    key
+}
+
+fn operational_metadata_key(domain_id: DomainId, tag: u8) -> [u8; 33] {
+    let mut key = [0_u8; 33];
+    key[..32].copy_from_slice(domain_id.as_bytes());
+    key[32] = tag;
     key
 }
 

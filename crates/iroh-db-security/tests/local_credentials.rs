@@ -4,7 +4,9 @@ use iroh_db_security::{LocalCredentials, SecurityError};
 fn encrypted_local_credentials_are_stable_and_tamper_evident() {
     let directory = tempfile::tempdir().unwrap();
     let first = LocalCredentials::load_or_create(directory.path()).unwrap();
+    let loaded = LocalCredentials::load(directory.path()).unwrap();
     let reopened = LocalCredentials::load_or_create(directory.path()).unwrap();
+    assert_eq!(first.domain_id(), loaded.domain_id());
     assert_eq!(first.domain_id(), reopened.domain_id());
     assert_eq!(first.signer().author(), reopened.signer().author());
     assert_eq!(format!("{first:?}"), "LocalCredentials([redacted])");
@@ -17,6 +19,14 @@ fn encrypted_local_credentials_are_stable_and_tamper_evident() {
         LocalCredentials::load_or_create(directory.path()).unwrap_err(),
         SecurityError::InvalidKeyProviderData
     );
+}
+
+#[test]
+fn loading_missing_credentials_does_not_create_a_vault() {
+    let directory = tempfile::tempdir().unwrap();
+
+    assert!(LocalCredentials::load(directory.path()).is_err());
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
 #[cfg(unix)]

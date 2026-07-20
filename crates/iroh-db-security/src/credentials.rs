@@ -115,7 +115,54 @@ pub struct LocalCredentials {
     root: PathBuf,
 }
 
+/// Application-supplied durable device identity and encrypted domain-key storage.
+///
+/// Implementations must make catalog updates durable before returning and must
+/// never return a key for a different domain or epoch than requested.
+pub trait KeyProvider: Send + Sync {
+    /// Returns the signer used for immutable database protocol objects.
+    fn signer(&self) -> IrohSigner;
+    /// Returns the endpoint secret used by the iroh transport identity.
+    fn endpoint_secret_key(&self) -> iroh_base::SecretKey;
+    /// Returns the provider's default private domain identifier.
+    fn domain_id(&self) -> DomainId;
+    /// Returns the provider's default private domain seed.
+    fn domain_seed(&self) -> DomainSeed;
+    /// Returns the stable default-domain key used for local authenticated metadata.
+    fn domain_key(&self) -> DomainKey {
+        self.domain_seed().domain_key()
+    }
+    /// Persists a newly attached domain seed.
+    fn store_domain(&self, seed: &DomainSeed) -> Result<(), SecurityError>;
+    /// Durably stages an adjacent epoch without activating it.
+    fn stage_domain(&self, seed: &DomainSeed) -> Result<(), SecurityError>;
+    /// Atomically selects a retained domain epoch as active.
+    fn activate_domain(&self, seed: &DomainSeed) -> Result<(), SecurityError>;
+    /// Loads the active seed for one domain.
+    fn load_domain(&self, domain_id: DomainId) -> Result<DomainSeed, SecurityError>;
+    /// Loads one retained historical domain epoch.
+    fn load_domain_epoch(
+        &self,
+        domain_id: DomainId,
+        epoch: u64,
+    ) -> Result<DomainSeed, SecurityError>;
+    /// Lists the domains available to this device.
+    fn domains(&self) -> Result<Vec<DomainId>, SecurityError>;
+}
+
 impl LocalCredentials {
+    /// Loads an existing owner-only encrypted local key vault without creating files.
+    pub fn load(root: impl AsRef<Path>) -> Result<Self, SecurityError> {
+        let root = root.as_ref();
+        let master = load_master(&root.join(MASTER_FILE))?;
+        let credentials_path = root.join(CREDENTIALS_FILE);
+        check_owner_only(&credentials_path)?;
+        let bytes = std::fs::read(credentials_path).map_err(io_error)?;
+        let mut credentials = decode_credentials(&bytes, &master)?;
+        credentials.root = root.to_path_buf();
+        Ok(credentials)
+    }
+
     /// Loads or creates an owner-only encrypted local key vault.
     pub fn load_or_create(root: impl AsRef<Path>) -> Result<Self, SecurityError> {
         let root = root.as_ref();
@@ -360,19 +407,69 @@ impl std::fmt::Debug for LocalCredentials {
     }
 }
 
+impl KeyProvider for LocalCredentials {
+    fn signer(&self) -> IrohSigner {
+        Self::signer(self)
+    }
+
+    fn endpoint_secret_key(&self) -> iroh_base::SecretKey {
+        Self::endpoint_secret_key(self)
+    }
+
+    fn domain_id(&self) -> DomainId {
+        Self::domain_id(self)
+    }
+
+    fn domain_seed(&self) -> DomainSeed {
+        Self::domain_seed(self)
+    }
+
+    fn store_domain(&self, seed: &DomainSeed) -> Result<(), SecurityError> {
+        Self::store_domain(self, seed)
+    }
+
+    fn stage_domain(&self, seed: &DomainSeed) -> Result<(), SecurityError> {
+        Self::stage_domain(self, seed)
+    }
+
+    fn activate_domain(&self, seed: &DomainSeed) -> Result<(), SecurityError> {
+        Self::activate_domain(self, seed)
+    }
+
+    fn load_domain(&self, domain_id: DomainId) -> Result<DomainSeed, SecurityError> {
+        Self::load_domain(self, domain_id)
+    }
+
+    fn load_domain_epoch(
+        &self,
+        domain_id: DomainId,
+        epoch: u64,
+    ) -> Result<DomainSeed, SecurityError> {
+        Self::load_domain_epoch(self, domain_id, epoch)
+    }
+
+    fn domains(&self) -> Result<Vec<DomainId>, SecurityError> {
+        Self::domains(self)
+    }
+}
+
 fn load_or_create_master(path: &Path) -> Result<Zeroizing<[u8; 32]>, SecurityError> {
     if path.exists() {
-        check_owner_only(path)?;
-        let bytes = std::fs::read(path).map_err(io_error)?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| SecurityError::InvalidKeyProviderData)?;
-        return Ok(Zeroizing::new(bytes));
+        return load_master(path);
     }
     let mut bytes = Zeroizing::new([0_u8; 32]);
     getrandom::fill(&mut *bytes).map_err(|_| SecurityError::RandomnessUnavailable)?;
     write_owner_only(path, &*bytes)?;
     Ok(bytes)
+}
+
+fn load_master(path: &Path) -> Result<Zeroizing<[u8; 32]>, SecurityError> {
+    check_owner_only(path)?;
+    let bytes = std::fs::read(path).map_err(io_error)?;
+    let bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| SecurityError::InvalidKeyProviderData)?;
+    Ok(Zeroizing::new(bytes))
 }
 
 fn encode_credentials(

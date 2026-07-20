@@ -4,6 +4,7 @@ use std::{
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
+    time::Instant,
 };
 
 use iroh_db_blobs::{BlobEngine, BlobError, BlobRef, BlobStream, FetchScheduler, IrohBlobStore};
@@ -15,8 +16,8 @@ use iroh_db_core::{
 };
 use iroh_db_security::{
     AuthorityError, CapabilityCertificate, ConsistencyMode, ControlTransition, DomainDescriptor,
-    DomainSeed, Invitation, InvitationError, InvitationSecret, InvitationTicket, LocalCredentials,
-    Permission, PermissionSet, SecurityError, open_commit, seal_commit,
+    DomainSeed, Invitation, InvitationError, InvitationSecret, InvitationTicket, KeyProvider,
+    LocalCredentials, Permission, PermissionSet, SecurityError, open_commit, seal_commit,
 };
 use iroh_db_store::{
     ApplyOutcome, BlobFuture, BlobStore, BlobStoreError, IndexValue, MaterializedError,
@@ -24,6 +25,8 @@ use iroh_db_store::{
 };
 use tokio::io::AsyncRead;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock, broadcast};
+
+use crate::telemetry::Telemetry;
 
 const CHANGE_CAPACITY: usize = 1_024;
 const MAX_RECONCILE_COMMITS: usize = 65_536;
@@ -228,6 +231,7 @@ pub enum ChangeKind {
 pub struct ChangeBatch {
     commit_id: CommitId,
     sequence: u64,
+    frontier: Vec<CommitId>,
     changes: Vec<Change>,
 }
 
@@ -240,6 +244,11 @@ impl ChangeBatch {
     /// Returns the monotonically increasing local-author sequence.
     pub const fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Returns the complete local domain frontier after this batch was applied.
+    pub fn frontier(&self) -> &[CommitId] {
+        &self.frontier
     }
 
     /// Returns all record effects published atomically by the commit.
@@ -272,6 +281,7 @@ pub struct IrohDbBuilder {
     root: PathBuf,
     migrations: Vec<MigrationStep>,
     run_migrations_on_open: bool,
+    key_provider: Option<Arc<dyn KeyProvider>>,
 }
 
 #[derive(Clone)]
@@ -290,13 +300,14 @@ pub(crate) struct DbInner {
     pub(crate) store: Store,
     pub(crate) blobs: Arc<IrohBlobStore>,
     pub(crate) blob_scheduler: FetchScheduler,
-    pub(crate) credentials: LocalCredentials,
+    pub(crate) credentials: Arc<dyn KeyProvider>,
     pub(crate) writer: Mutex<()>,
     pub(crate) control_gate: AsyncRwLock<()>,
     domains: RwLock<BTreeMap<iroh_db_core::DomainId, Arc<RwLock<DomainSeed>>>>,
     changes: RwLock<BTreeMap<iroh_db_core::DomainId, broadcast::Sender<ChangeBatch>>>,
     adapters: RwLock<BTreeMap<(CollectionId, SchemaId), RecordAdapter>>,
     migrations: RwLock<Vec<MigrationStep>>,
+    pub(crate) telemetry: Arc<Telemetry>,
 }
 
 #[derive(Clone)]
@@ -364,6 +375,16 @@ struct QuarantineMetadata {
     author_heads: Vec<(AuthorId, u64, CommitId)>,
 }
 
+impl DbInner {
+    pub(crate) fn has_record_adapters(&self) -> bool {
+        !self
+            .adapters
+            .read()
+            .expect("record adapter lock is not poisoned")
+            .is_empty()
+    }
+}
+
 /// Result of feeding one authenticated immutable commit into the local apply kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteApply {
@@ -420,6 +441,14 @@ impl ProjectionReport {
 }
 
 impl IrohDbBuilder {
+    /// Uses an application-managed identity and domain-key provider instead of
+    /// the default file vault beneath the database directory.
+    #[must_use]
+    pub fn key_provider(mut self, provider: Arc<dyn KeyProvider>) -> Self {
+        self.key_provider = Some(provider);
+        self
+    }
+
     /// Defers migration work until [`IrohDb::run_migrations`] is called.
     #[must_use]
     pub const fn defer_migrations(mut self) -> Self {
@@ -501,7 +530,11 @@ impl IrohDbBuilder {
     pub async fn open_with_report(mut self) -> Result<(IrohDb, MigrationReport), DbError> {
         self.migrations
             .sort_by_key(|step| (step.from.collection_id(), step.from.version()));
-        let database = IrohDb::open(&self.root).await?;
+        let database = if let Some(provider) = self.key_provider {
+            IrohDb::open_with_key_provider(&self.root, provider).await?
+        } else {
+            IrohDb::open(&self.root).await?
+        };
         for step in &self.migrations {
             (step.register_from)(&database);
             (step.register_to)(&database);
@@ -527,6 +560,7 @@ impl IrohDb {
             root: root.as_ref().to_path_buf(),
             migrations: Vec::new(),
             run_migrations_on_open: true,
+            key_provider: None,
         }
     }
 
@@ -534,14 +568,24 @@ impl IrohDb {
     pub async fn open(root: impl AsRef<Path>) -> Result<Self, DbError> {
         let root = root.as_ref();
         std::fs::create_dir_all(root).map_err(|error| StoreError::Io(error.to_string()))?;
-        let credentials = LocalCredentials::load_or_create(root.join("keys"))?;
+        let credentials = Arc::new(LocalCredentials::load_or_create(root.join("keys"))?);
+        Self::open_with_key_provider(root, credentials).await
+    }
+
+    /// Opens a database with an application-managed durable key provider.
+    pub async fn open_with_key_provider(
+        root: impl AsRef<Path>,
+        credentials: Arc<dyn KeyProvider>,
+    ) -> Result<Self, DbError> {
+        let root = root.as_ref();
+        std::fs::create_dir_all(root).map_err(|error| StoreError::Io(error.to_string()))?;
         let blobs = Arc::new(
             IrohBlobStore::load(root.join("blobs"))
                 .await
                 .map_err(StoreError::from)?,
         );
         let store = Store::open(root, blobs.clone())?;
-        reconcile_domain_epochs(&credentials, &store)?;
+        reconcile_domain_epochs(credentials.as_ref(), &store)?;
         store.trust_author(credentials.domain_id(), credentials.signer().author())?;
         let domain = credentials.domain_seed();
         credentials.store_domain(&domain)?;
@@ -575,6 +619,7 @@ impl IrohDb {
                 changes: RwLock::new(domain_changes),
                 adapters: RwLock::new(BTreeMap::new()),
                 migrations: RwLock::new(Vec::new()),
+                telemetry: Arc::new(Telemetry::default()),
             }),
             domain,
         })
@@ -1239,7 +1284,10 @@ impl IrohDb {
                 .await?
             {
                 ApplyOutcome::Duplicate(id) => Ok(RemoteApply::Duplicate(id)),
-                ApplyOutcome::Applied(id) => Ok(RemoteApply::SchemaRebaseRequired { commit: id }),
+                ApplyOutcome::Applied(id) => {
+                    self.inner.telemetry.record_schema_rebase();
+                    Ok(RemoteApply::SchemaRebaseRequired { commit: id })
+                }
             };
         }
         let mutations = self
@@ -1268,6 +1316,7 @@ impl IrohDb {
                 let batch = ChangeBatch {
                     commit_id: id,
                     sequence: header.author_sequence(),
+                    frontier: self.inner.store.frontier(self.domain_id())?,
                     changes,
                 };
                 let _no_subscribers = self.changes().send(batch);
@@ -1353,6 +1402,7 @@ impl IrohDb {
                             let _no_subscribers = self.changes().send(ChangeBatch {
                                 commit_id: id,
                                 sequence: header.author_sequence(),
+                                frontier: self.inner.store.frontier(self.domain_id())?,
                                 changes,
                             });
                         }
@@ -1584,11 +1634,13 @@ impl IrohDb {
                 &mutations,
             )
             .await?;
+        self.inner.telemetry.record_equivocation_quarantine();
         let changes = materialization_changes(&previous_records, &mutations);
         if !changes.is_empty() {
             let _no_subscribers = self.changes().send(ChangeBatch {
                 commit_id: evidence.commit_id(),
                 sequence,
+                frontier: metadata.frontier,
                 changes,
             });
         }
@@ -2115,6 +2167,7 @@ impl IrohDb {
             let _no_subscribers = self.changes().send(ChangeBatch {
                 commit_id: envelope.commit_id(),
                 sequence: envelope.header().author_sequence(),
+                frontier: self.inner.store.frontier(self.domain_id())?,
                 changes,
             });
         }
@@ -2185,7 +2238,17 @@ impl IrohDb {
         seal_commit(header, &body, &self.domain_key(), &signer).map_err(DbError::from)
     }
 
+    #[tracing::instrument(name = "iroh_db.apply", skip_all)]
     async fn apply(&self, prepared: Vec<PreparedRecord>) -> Result<ChangeBatch, DbError> {
+        let started = Instant::now();
+        let result = self.apply_inner(prepared).await;
+        self.inner
+            .telemetry
+            .observe_local_apply(started.elapsed(), result.is_err());
+        result
+    }
+
+    async fn apply_inner(&self, prepared: Vec<PreparedRecord>) -> Result<ChangeBatch, DbError> {
         if prepared.is_empty() {
             return Err(DbError::EmptyTransaction);
         }
@@ -2275,6 +2338,7 @@ impl IrohDb {
         let batch = ChangeBatch {
             commit_id: envelope.commit_id(),
             sequence,
+            frontier: self.inner.store.frontier(domain_id)?,
             changes: prepared.into_iter().map(|entry| entry.change).collect(),
         };
         let _no_subscribers = self.changes().send(batch.clone());
@@ -2443,7 +2507,7 @@ impl<Record: IrohRecord> Collection<Record> {
         Query {
             db: self.db.clone(),
             filter: None,
-            order: None,
+            order: Vec::new(),
             limit: None,
             after: None,
             marker: PhantomData,
@@ -2476,7 +2540,7 @@ impl<Record: IrohRecord> Collection<Record> {
 pub struct Query<Record> {
     db: IrohDb,
     filter: Option<Predicate<Record>>,
-    order: Option<OrderClause<Record>>,
+    order: Vec<OrderClause<Record>>,
     limit: Option<usize>,
     after: Option<Cursor>,
     marker: PhantomData<fn() -> Record>,
@@ -2577,7 +2641,7 @@ impl<Record: IrohRecord> Query<Record> {
         self
     }
 
-    /// Orders by the smallest visible value of a typed ordered field, then primary key.
+    /// Sets the primary typed ordering clause, replacing any earlier ordering.
     #[must_use]
     pub fn order_by<Value>(
         mut self,
@@ -2587,7 +2651,27 @@ impl<Record: IrohRecord> Query<Record> {
     where
         Value: RecordKey + Ord + Send + Sync + 'static,
     {
-        self.order = Some(OrderClause {
+        self.order.clear();
+        self.order.push(OrderClause {
+            field_id: field.field_id(),
+            direction,
+            compare: Arc::new(compare_visible::<Value>),
+            marker: PhantomData,
+        });
+        self
+    }
+
+    /// Adds a typed tie-breaking clause after all existing ordering clauses.
+    #[must_use]
+    pub fn then_by<Value>(
+        mut self,
+        field: TypedField<Record, Value>,
+        direction: OrderDirection,
+    ) -> Self
+    where
+        Value: RecordKey + Ord + Send + Sync + 'static,
+    {
+        self.order.push(OrderClause {
             field_id: field.field_id(),
             direction,
             compare: Arc::new(compare_visible::<Value>),
@@ -2618,13 +2702,26 @@ impl<Record: IrohRecord> Query<Record> {
 
     /// Executes a stable page against one local redb read snapshot.
     #[allow(clippy::unused_async)]
+    #[tracing::instrument(name = "iroh_db.query", skip_all)]
     pub async fn fetch_page(self) -> Result<Page<Record>, DbError> {
+        let telemetry = self.db.inner.telemetry.clone();
+        let started = Instant::now();
+        let result = self.fetch_page_inner();
+        telemetry.observe_query(started.elapsed(), result.is_err());
+        result
+    }
+
+    fn fetch_page_inner(self) -> Result<Page<Record>, DbError> {
         let schema = Record::schema()?;
         self.db
             .ensure_collection_available(schema.collection_id())?;
         let domain = self.db.domain_id();
-        let fingerprint = self.fingerprint(schema.collection_id())?;
+        let fingerprint = self.fingerprint(&schema)?;
         let candidates = self.candidates(domain, schema.collection_id(), &schema)?;
+        self.db
+            .inner
+            .telemetry
+            .add_index_records_scanned(candidates.len());
         let mut records = Vec::new();
         for (record_id, bytes) in candidates {
             let record = Record::decode_record(&bytes)?;
@@ -2632,10 +2729,10 @@ impl<Record: IrohRecord> Query<Record> {
                 records.push(QueryRecord { record_id, record });
             }
         }
-        if let Some(order) = &self.order {
+        if !self.order.is_empty() {
             let mut sort_error = None;
             records.sort_by(|left, right| {
-                let result = compare_records(left, right, order);
+                let result = compare_records(left, right, &self.order);
                 match result {
                     Ok(value) => value,
                     Err(error) => {
@@ -2742,10 +2839,11 @@ impl<Record: IrohRecord> Query<Record> {
         }
     }
 
-    fn fingerprint(&self, collection: CollectionId) -> Result<[u8; 32], DbError> {
+    fn fingerprint(&self, schema: &iroh_db_core::SchemaDescriptor) -> Result<[u8; 32], DbError> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"iroh-db/query/v1");
-        hasher.update(collection.as_bytes());
+        hasher.update(schema.collection_id().as_bytes());
+        hasher.update(schema.schema_id().as_bytes());
         match &self.filter {
             None => {
                 hasher.update(&[0]);
@@ -2769,11 +2867,14 @@ impl<Record: IrohRecord> Query<Record> {
                 );
             }
         }
-        if let Some(order) = &self.order {
-            hasher.update(&[1, order.direction as u8]);
+        hasher.update(
+            &u64::try_from(self.order.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for order in &self.order {
+            hasher.update(&[order.direction as u8]);
             hasher.update(&order.field_id.to_be_bytes());
-        } else {
-            hasher.update(&[0]);
         }
         Ok(*hasher.finalize().as_bytes())
     }
@@ -2856,16 +2957,21 @@ struct QueryRecord<Record> {
 fn compare_records<Record: IrohRecord>(
     left: &QueryRecord<Record>,
     right: &QueryRecord<Record>,
-    order: &OrderClause<Record>,
+    orders: &[OrderClause<Record>],
 ) -> Result<Ordering, DbError> {
-    let left_values = left.record.field_values(order.field_id)?;
-    let right_values = right.record.field_values(order.field_id)?;
-    let value_order = (order.compare)(&left_values, &right_values)?;
-    let value_order = match order.direction {
-        OrderDirection::Ascending => value_order,
-        OrderDirection::Descending => value_order.reverse(),
-    };
-    Ok(value_order.then_with(|| left.record_id.cmp(&right.record_id)))
+    for order in orders {
+        let left_values = left.record.field_values(order.field_id)?;
+        let right_values = right.record.field_values(order.field_id)?;
+        let value_order = (order.compare)(&left_values, &right_values)?;
+        let value_order = match order.direction {
+            OrderDirection::Ascending => value_order,
+            OrderDirection::Descending => value_order.reverse(),
+        };
+        if value_order != Ordering::Equal {
+            return Ok(value_order);
+        }
+    }
+    Ok(left.record_id.cmp(&right.record_id))
 }
 
 fn compare_visible<Value: RecordKey + Ord>(
@@ -3530,7 +3636,7 @@ fn canonicalize_materialized<Record: IrohRecord>(
     .map_err(DbError::from)
 }
 
-fn reconcile_domain_epochs(credentials: &LocalCredentials, store: &Store) -> Result<(), DbError> {
+fn reconcile_domain_epochs(credentials: &dyn KeyProvider, store: &Store) -> Result<(), DbError> {
     for domain_id in credentials.domains()? {
         if store.domain_descriptor(domain_id)?.is_none() {
             continue;

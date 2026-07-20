@@ -20,7 +20,7 @@ let massive_attack = tracks
     .await?;
 ```
 
-Transactions are atomic inside exactly one domain. Queries support primary-key lookup, equality, ranges, ordering, MAC-bound cursor pagination, and subscriptions. Materialized records and indexes are rebuildable from signed commits and snapshots.
+Transactions are atomic inside exactly one domain. Queries support primary-key lookup, equality, ranges, compound ordering, MAC-bound cursor pagination, and subscriptions whose change batches include the resulting frontier. Materialized records and indexes are rebuildable from signed commits and snapshots.
 
 ## Domains, sharing, and sync
 
@@ -53,14 +53,22 @@ Blob manifests and independent chunks are content-addressed and encrypted. `Blob
 
 ## Operations
 
-Live verification checks immutable hashes, canonical codecs, signatures, epoch decryption, dependencies, orphans, and typed rebuild equality. Repair builds candidate state before an atomic metadata swap. Closed-store backup is checksummed, optionally includes the separately encrypted key vault, and restore verifies all paths and hashes before creating a new destination.
+Live verification checks immutable hashes, canonical codecs, signatures, epoch decryption, dependencies, orphans, and typed rebuild equality. A standalone CLI cannot contain application record adapters, so it reports `typed_rebuild=false`; applications register their Rust types before claiming full replay equivalence. Repair builds candidate state before an atomic metadata swap. Closed-store backup uses a canonical endpoint-signed catalog, optionally includes the separately encrypted key vault, and restore verifies all paths, signatures, and hashes before atomically publishing a new destination.
 
 ```console
+iroh-db-cli inspect ./app.irohdb
 iroh-db-cli verify ./app.irohdb
 iroh-db-cli repair-indexes ./app.irohdb
 iroh-db-cli backup ./app.irohdb ./backup --include-keys
-iroh-db-cli restore ./backup ./restored.irohdb
+iroh-db-cli restore ./backup ./restored.irohdb --expect-signer <endpoint-id>
 ```
+
+`restore_backup` verifies an archive's embedded self-signature. Use
+`restore_backup_from` (or `--expect-signer`) whenever the expected source
+identity is part of the trust decision. Applications can replace the default
+owner-only file vault through `IrohDbBuilder::key_provider`; backups for an
+external provider use `backup_closed_with_signer`, while the provider's own
+secret storage remains an independent backup responsibility.
 
 See [compatibility policy](docs/compatibility.md) and [security policy](SECURITY.md). Already downloaded plaintext cannot be revoked. Compromised unlocked devices, traffic analysis, and denial of service remain outside the confidentiality boundary.
 

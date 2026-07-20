@@ -467,6 +467,7 @@ async fn offline_old_schema_commit_is_retained_but_invisible_in_both_receipt_ord
             .unwrap(),
         RemoteApply::SchemaRebaseRequired { .. }
     ));
+    assert_eq!(left.operational_metrics().unwrap().schema_rebases(), 1);
 
     let left_tracks = left.collection::<TrackV2>();
     let right_tracks = right.collection::<TrackV2>();

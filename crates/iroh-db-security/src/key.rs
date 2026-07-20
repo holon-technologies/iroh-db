@@ -94,6 +94,13 @@ impl IrohSigner {
             .to_bytes()
     }
 
+    /// Signs a canonical backup catalog under a backup-specific context.
+    pub fn sign_backup_catalog(&self, canonical_catalog_bytes: &[u8]) -> [u8; 64] {
+        self.secret_key
+            .sign(&backup_signature_message(canonical_catalog_bytes))
+            .to_bytes()
+    }
+
     /// Signs a bounded gossip hint under a gossip-specific protocol context.
     pub fn sign_gossip(&self, canonical_hint_bytes: &[u8]) -> [u8; 64] {
         self.secret_key
@@ -160,6 +167,13 @@ pub(crate) fn snapshot_signature_message(canonical_snapshot_bytes: &[u8]) -> Vec
     let mut message = Vec::with_capacity(29 + canonical_snapshot_bytes.len());
     message.extend_from_slice(b"iroh-db/snapshot-signature/v1");
     message.extend_from_slice(canonical_snapshot_bytes);
+    message
+}
+
+pub(crate) fn backup_signature_message(canonical_catalog_bytes: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(27 + canonical_catalog_bytes.len());
+    message.extend_from_slice(b"iroh-db/backup-signature/v1");
+    message.extend_from_slice(canonical_catalog_bytes);
     message
 }
 

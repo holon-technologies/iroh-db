@@ -360,6 +360,20 @@ async fn replicas_quarantine_equivocation_independently_of_receipt_order() {
     assert_eq!(first.state_root().unwrap(), empty_root);
     assert_eq!(second.state_root().unwrap(), empty_root);
     assert_eq!(first.state_root().unwrap(), second.state_root().unwrap());
+    assert_eq!(
+        first
+            .operational_metrics()
+            .unwrap()
+            .equivocation_quarantines(),
+        1
+    );
+    assert_eq!(
+        second
+            .operational_metrics()
+            .unwrap()
+            .equivocation_quarantines(),
+        1
+    );
     assert!(first.commit_envelopes().await.unwrap().is_empty());
     assert!(second.commit_envelopes().await.unwrap().is_empty());
     assert!(matches!(

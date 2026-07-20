@@ -1,6 +1,6 @@
 use iroh_db::{
     AuthorId, BackupOptions, ConsistencyMode, DomainId, Dot, IrohDb, IrohRecord, Lww, Permission,
-    PermissionSet, VersionVector, backup_closed, restore_backup,
+    PermissionSet, VersionVector, backup_closed, restore_backup, restore_backup_from,
 };
 use redb::{ReadableTable as _, TableDefinition};
 
@@ -9,13 +9,15 @@ const SNAPSHOT_COVERAGE: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("snapshot_coverage_v1");
 const SNAPSHOT_BASELINES: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("snapshot_baselines_v1");
+const SECONDARY_INDEX: TableDefinition<'static, &[u8], u8> =
+    TableDefinition::new("secondary_index_v1");
 
 #[derive(Debug, Clone, PartialEq, Eq, IrohRecord)]
 #[iroh_db(collection = "operations-notes", version = 1)]
 struct Note {
     #[iroh_db(id, field_id = 1)]
     id: String,
-    #[iroh_db(field_id = 2)]
+    #[iroh_db(field_id = 2, index)]
     text: Lww<String>,
 }
 
@@ -103,17 +105,35 @@ async fn verify_repair_backup_and_restore_preserve_state_root() {
     let database = IrohDb::open(source.path()).await.unwrap();
     let notes = database.collection::<Note>();
     notes.put(note(database.author_id())).await.unwrap();
+    assert_eq!(notes.query().fetch().await.unwrap().len(), 1);
     let before = database.verify().await.unwrap();
     assert!(before.derived_consistent());
     let repaired = database.repair().await.unwrap();
     assert_eq!(repaired.state_root(), before.state_root());
+    let snapshot = database.snapshot().await.unwrap();
+    assert_ne!(snapshot.state_root(), [0; 32]);
+    let metrics = database.operational_metrics().unwrap();
+    assert_eq!(metrics.local_apply_latency().samples(), 1);
+    assert_eq!(metrics.local_apply_latency().failures(), 0);
+    assert!(!metrics.local_apply_latency().total().is_zero());
+    assert_eq!(metrics.query_latency().samples(), 1);
+    assert_eq!(metrics.query_latency().failures(), 0);
+    assert_eq!(metrics.index_records_scanned(), 1);
+    assert_eq!(metrics.repairs_succeeded(), 1);
+    assert_eq!(metrics.repairs_failed(), 0);
+    assert_eq!(metrics.snapshots_created(), 1);
+    assert!(metrics.snapshot_age().is_some());
+    assert_eq!(metrics.last_repair_derived_consistent(), Some(true));
+    let signer = database.author_id();
     drop(notes);
     database.close().await.unwrap();
 
     let backup_report =
         backup_closed(source.path(), &backup, BackupOptions { include_keys: true }).unwrap();
     assert!(backup_report.files() > 3);
-    restore_backup(&backup, &restored).unwrap();
+    assert_eq!(backup_report.signer(), signer);
+    let restore_report = restore_backup_from(&backup, &restored, signer).unwrap();
+    assert_eq!(restore_report.signer(), signer);
     let restored_database = IrohDb::open(&restored).await.unwrap();
     let restored_notes = restored_database.collection::<Note>();
     assert!(
@@ -125,24 +145,117 @@ async fn verify_repair_backup_and_restore_preserve_state_root() {
     );
     let after = restored_database.verify().await.unwrap();
     assert_eq!(after.state_root(), before.state_root());
+    assert!(
+        restored_database
+            .operational_metrics()
+            .unwrap()
+            .snapshot_age()
+            .is_some()
+    );
     drop(restored_notes);
     restored_database.close().await.unwrap();
 }
 
-#[test]
-fn restore_rejects_tampered_backup_before_creating_destination() {
+#[tokio::test]
+async fn restore_rejects_tampered_backup_before_creating_destination() {
     let source = tempfile::tempdir().unwrap();
-    std::fs::write(source.path().join("FORMAT"), "iroh-db 4.0\n").unwrap();
-    std::fs::create_dir(source.path().join("locks")).unwrap();
-    std::fs::write(source.path().join("locks/writer.lock"), b"").unwrap();
+    let database = IrohDb::open(source.path()).await.unwrap();
+    let signer = database.author_id();
+    database.close().await.unwrap();
     std::fs::write(source.path().join("payload"), b"original").unwrap();
     let parent = tempfile::tempdir().unwrap();
     let backup = parent.path().join("backup");
     let restored = parent.path().join("restored");
     backup_closed(source.path(), &backup, BackupOptions::default()).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let other_database = IrohDb::open(other.path()).await.unwrap();
+    let wrong_signer = other_database.author_id();
+    other_database.close().await.unwrap();
+    assert_ne!(wrong_signer, signer);
+    assert!(restore_backup_from(&backup, &restored, wrong_signer).is_err());
+    assert!(!restored.exists());
+
     std::fs::write(backup.join("payload"), b"tampered").unwrap();
     assert!(restore_backup(&backup, &restored).is_err());
     assert!(!restored.exists());
+
+    std::fs::write(backup.join("payload"), b"original").unwrap();
+    let catalog = backup.join("BACKUP-CATALOG.v2");
+    let mut bytes = std::fs::read(&catalog).unwrap();
+    let last = bytes.last_mut().unwrap();
+    *last ^= 1;
+    std::fs::write(&catalog, bytes).unwrap();
+    assert!(restore_backup(&backup, &restored).is_err());
+    assert!(!restored.exists());
+}
+
+#[tokio::test]
+async fn standalone_verification_reports_when_typed_replay_is_unavailable() {
+    let source = tempfile::tempdir().unwrap();
+    let database = IrohDb::open(source.path()).await.unwrap();
+    database
+        .collection::<Note>()
+        .put(note(database.author_id()))
+        .await
+        .unwrap();
+    database.close().await.unwrap();
+
+    let standalone = IrohDb::open(source.path()).await.unwrap();
+    let structural = standalone.verify().await.unwrap();
+    assert_eq!(structural.commits(), 1);
+    assert!(!structural.typed_rebuild_performed());
+    assert!(!structural.derived_consistent());
+
+    standalone.collection::<Note>();
+    let typed = standalone.verify().await.unwrap();
+    assert!(typed.typed_rebuild_performed());
+    assert!(typed.derived_consistent());
+    standalone.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn standalone_index_repair_rebuilds_secondary_entries_from_durable_record_keys() {
+    let source = tempfile::tempdir().unwrap();
+    let database = IrohDb::open(source.path()).await.unwrap();
+    database
+        .collection::<Note>()
+        .put(note(database.author_id()))
+        .await
+        .unwrap();
+    database.close().await.unwrap();
+
+    let metadata = redb::Database::create(source.path().join("meta-v6.redb")).unwrap();
+    let write = metadata.begin_write().unwrap();
+    {
+        let mut index = write.open_table(SECONDARY_INDEX).unwrap();
+        let keys = index
+            .iter()
+            .unwrap()
+            .map(|entry| entry.unwrap().0.value().to_vec())
+            .collect::<Vec<_>>();
+        for key in keys {
+            index.remove(key.as_slice()).unwrap();
+        }
+    }
+    write.commit().unwrap();
+    drop(metadata);
+
+    let standalone = IrohDb::open(source.path()).await.unwrap();
+    let repaired = standalone.repair_indexes().await.unwrap();
+    assert!(!repaired.typed_rebuild_performed());
+    let notes = standalone.collection::<Note>();
+    assert_eq!(
+        notes
+            .query()
+            .filter(Note::text.eq("survives"))
+            .fetch()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(notes);
+    standalone.close().await.unwrap();
 }
 
 #[tokio::test]

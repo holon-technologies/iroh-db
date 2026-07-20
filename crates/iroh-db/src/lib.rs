@@ -8,6 +8,7 @@ mod db;
 mod network;
 mod operations;
 mod snapshot;
+mod telemetry;
 
 pub use db::{
     Blobs, Change, ChangeBatch, ChangeKind, Collection, Cursor, DbError, DeviceGroup, IrohDb,
@@ -30,14 +31,16 @@ pub use iroh_db_core::{
 pub use iroh_db_derive::IrohRecord;
 pub use iroh_db_security::{
     CapabilityCertificate, ConsistencyMode, ControlTransition, DomainDescriptor, DomainSeed,
-    Invitation, InvitationSecret, InvitationTicket, Permission, PermissionSet,
+    Invitation, InvitationSecret, InvitationTicket, IrohSigner, KeyProvider, Permission,
+    PermissionSet,
 };
 pub use network::{GossipSession, SYNC_ALPN, SyncNode, SyncReport};
 pub use operations::{
     BackupOptions, BackupReport, OperationalMetrics, VerificationReport, backup_closed,
-    restore_backup,
+    backup_closed_with_signer, restore_backup, restore_backup_from,
 };
 pub use snapshot::Snapshot;
+pub use telemetry::LatencyMetrics;
 
 /// Implementation details referenced by generated code; not a stable API.
 #[doc(hidden)]

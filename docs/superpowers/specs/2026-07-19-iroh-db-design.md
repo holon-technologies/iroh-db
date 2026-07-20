@@ -308,7 +308,9 @@ ManifestBodyV1 {
 }
 ```
 
-Default chunk size is 1 MiB and is configurable from 64 KiB through 8 MiB before import. Each independently encrypted chunk is one ordinary iroh blob, so iroh-blobs owns transfer and BLAKE3 verification. The manifest is normally small and must authenticate before chunks are requested. Domain projection decrypts and re-encrypts into a new manifest; ciphertext links are never shared across security domains.
+The original proposed default was 1 MiB; measured Milestone 4 work superseded
+it with the 4 MiB default recorded in ADR 0009. Chunk size remains configurable
+from 64 KiB through 8 MiB before import. Each independently encrypted chunk is one ordinary iroh blob, so iroh-blobs owns transfer and BLAKE3 verification. The manifest is normally small and must authenticate before chunks are requested. Domain projection decrypts and re-encrypts into a new manifest; ciphertext links are never shared across security domains.
 
 `BlobStream` implements asynchronous read and seek. Opening fetches/decrypts the manifest, then requests only chunks intersecting the read range. Read-ahead is adaptive and bounded. Seeking cancels unneeded queued chunks but keeps verified ciphertext in cache. Plaintext is streamed through bounded buffers and is not persisted unless explicitly exported.
 

@@ -16,6 +16,10 @@ The current release is pre-1.0 but its durable and wire formats are explicitly v
   is intentionally incompatible because it cannot fail closed for schema
   activation operations. Frames use strict canonical CBOR.
 - Commit, snapshot, manifest, gossip, authority, invitation, control, key-vault, and backup objects each carry independent versions or magic values.
+- Backup catalog v2 is canonical CBOR signed under the endpoint identity's
+  backup-specific context. Restore rejects the earlier unsigned development
+  manifest. Provenance-sensitive restores additionally pin the expected
+  signer; self-signature alone proves archive integrity, not external trust.
 - Control transitions use control format v3, which signs both the designated
   successor controller and its exact successor capability ID. Pre-release v1
   and v2 control objects are rejected rather than replayed under mutable active
@@ -54,6 +58,8 @@ The current release is pre-1.0 but its durable and wire formats are explicitly v
 | Sync/object range without overlap | Rejected before domain exchange |
 | Snapshot v3 | Accepted after signature, authority, state, and activation validation |
 | Snapshot v1/v2 or future unknown | Rejected |
+| Signed backup catalog v2 | Accepted after canonical, signature, path, hash, and size validation |
+| Unsigned backup manifest v1 or future unknown | Rejected |
 
 All future durable upgrades must keep the same shadow-copy rule. In-place
 reinterpretation of the only good metadata copy is forbidden.

@@ -26,6 +26,7 @@ minicbor.workspace = true
 n0-future.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 redb.workspace = true

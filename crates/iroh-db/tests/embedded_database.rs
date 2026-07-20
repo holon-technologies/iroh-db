@@ -1,8 +1,12 @@
 use iroh_db::{
-    AuthorId, ChangeKind, Cursor, DbError, Dot, IrohDb, IrohRecord, Lww, OrderDirection,
-    SubscriptionEvent, VersionVector,
+    AuthorId, BackupOptions, ChangeKind, Cursor, DbError, Dot, IrohDb, IrohRecord, Lww,
+    OrderDirection, SubscriptionEvent, VersionVector, backup_closed_with_signer,
+    restore_backup_from,
 };
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+
+use iroh_db_security::LocalCredentials;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq, minicbor::Encode, minicbor::Decode)]
 #[cbor(transparent)]
@@ -62,6 +66,7 @@ async fn typed_put_get_query_subscription_transaction_and_reopen() {
     };
     assert_eq!(batch.changes().len(), 1);
     assert_eq!(batch.changes()[0].kind(), ChangeKind::Upserted);
+    assert_eq!(batch.frontier(), &[batch.commit_id()]);
     let stored_teardrop = tracks.get(&TrackId("one".into())).await.unwrap().unwrap();
     assert_eq!(stored_teardrop.id, teardrop.id);
     assert_eq!(stored_teardrop.title.get(), teardrop.title.get());
@@ -125,6 +130,77 @@ async fn typed_put_get_query_subscription_transaction_and_reopen() {
 }
 
 #[tokio::test]
+async fn compound_ordering_uses_every_typed_clause_before_primary_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = IrohDb::open(directory.path()).await.unwrap();
+    let tracks = db.collection::<Track>();
+    for value in [
+        track("3", "C", "Same"),
+        track("1", "A", "Same"),
+        track("4", "D", "Other"),
+        track("2", "B", "Same"),
+    ] {
+        tracks.put(value).await.unwrap();
+    }
+
+    let ordered = tracks
+        .query()
+        .order_by(Track::artist, OrderDirection::Ascending)
+        .then_by(Track::title, OrderDirection::Descending)
+        .fetch()
+        .await
+        .unwrap();
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|item| item.id.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["4", "3", "2", "1"]
+    );
+
+    drop(tracks);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_application_supplied_key_provider_is_independent_of_the_store_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider_directory = tempfile::tempdir().unwrap();
+    let backup_directory = tempfile::tempdir().unwrap();
+    let restored = backup_directory.path().join("restored");
+    let backup = backup_directory.path().join("backup");
+    let provider = Arc::new(LocalCredentials::load_or_create(provider_directory.path()).unwrap());
+    let expected_author = provider.signer().author();
+
+    let database = IrohDb::builder(directory.path())
+        .key_provider(provider.clone())
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(database.author_id(), expected_author);
+    assert!(!directory.path().join("keys").exists());
+    database.close().await.unwrap();
+
+    backup_closed_with_signer(
+        directory.path(),
+        &backup,
+        BackupOptions::default(),
+        &provider.signer(),
+    )
+    .unwrap();
+    restore_backup_from(&backup, &restored, expected_author).unwrap();
+
+    let reopened = IrohDb::builder(&restored)
+        .key_provider(provider)
+        .open()
+        .await
+        .unwrap();
+    assert_eq!(reopened.author_id(), expected_author);
+    assert!(!restored.join("keys").exists());
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn local_transaction_rejects_multiple_mutations_of_one_record() {
     let directory = tempfile::tempdir().unwrap();
     let db = IrohDb::open(directory.path()).await.unwrap();
@@ -143,6 +219,9 @@ async fn local_transaction_rejects_multiple_mutations_of_one_record() {
     assert_eq!(db.state_root().unwrap(), root_before);
     assert!(tracks.get(&TrackId("same".into())).await.unwrap().is_none());
     assert!(db.commit_envelopes().await.unwrap().is_empty());
+    let metrics = db.operational_metrics().unwrap();
+    assert_eq!(metrics.local_apply_latency().samples(), 1);
+    assert_eq!(metrics.local_apply_latency().failures(), 1);
 
     drop(tracks);
     db.close().await.unwrap();
@@ -237,6 +316,10 @@ async fn range_order_and_mac_bound_cursor_pagination_are_stable() {
         .fetch_page()
         .await;
     assert!(matches!(result, Err(DbError::InvalidCursor(_))));
+    assert_eq!(
+        db.operational_metrics().unwrap().query_latency().failures(),
+        2
+    );
 
     drop(tracks);
     db.close().await.unwrap();

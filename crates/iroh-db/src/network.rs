@@ -403,7 +403,20 @@ impl ProtocolHandler for SyncProtocol {
 }
 
 impl SyncCore {
+    #[tracing::instrument(name = "iroh_db.sync", skip_all)]
     async fn sync_with(&self, remote: EndpointAddr) -> Result<SyncReport, DbError> {
+        let result = self.sync_with_inner(remote).await;
+        let (received, sent) = result
+            .as_ref()
+            .map_or((0, 0), |report| (report.received(), report.sent()));
+        self.db
+            .inner
+            .telemetry
+            .record_sync(received, sent, result.is_err());
+        result
+    }
+
+    async fn sync_with_inner(&self, remote: EndpointAddr) -> Result<SyncReport, DbError> {
         let peer = author_id(remote.id);
         self.require_local_blob_fetch()?;
         self.require_trusted(peer)?;

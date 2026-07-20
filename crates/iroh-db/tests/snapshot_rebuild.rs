@@ -43,6 +43,10 @@ async fn snapshot_install_and_full_commit_rebuild_are_equivalent() {
     assert_eq!(notes.query().fetch().await.unwrap().len(), 2);
 
     db.install_snapshot(snapshot).await.unwrap();
+    let metrics = db.operational_metrics().unwrap();
+    assert_eq!(metrics.snapshots_created(), 1);
+    assert_eq!(metrics.snapshots_installed(), 1);
+    assert!(metrics.snapshot_age().is_some());
     assert_eq!(notes.query().fetch().await.unwrap().len(), 1);
     assert_eq!(db.state_root().unwrap(), snapshot_root);
 
