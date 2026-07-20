@@ -1,0 +1,52 @@
+name: production soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Minimum wall-clock soak duration
+        required: true
+        default: "259200"
+      restart_every:
+        description: Completed rounds between durable peer restarts
+        required: true
+        default: "97"
+      operation_timeout_seconds:
+        description: Deadline for each lifecycle or sync operation
+        required: true
+        default: "30"
+  schedule:
+    - cron: "0 0 1 * *"
+
+permissions:
+  contents: read
+
+jobs:
+  churn:
+    # GitHub-hosted jobs cannot run for 72 hours. Qualification runners must
+    # deliberately carry this label and retain enough disk for three stores.
+    runs-on: [self-hosted, linux, x64, iroh-db-soak]
+    timeout-minutes: 4380
+    env:
+      IROH_DB_SOAK_DURATION_SECS: ${{ inputs.duration_seconds || '259200' }}
+      IROH_DB_SOAK_RESTART_EVERY: ${{ inputs.restart_every || '97' }}
+      IROH_DB_SOAK_OPERATION_TIMEOUT_SECS: ${{ inputs.operation_timeout_seconds || '30' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.91.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Run exact-duration partition/reconnect/restart soak
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --nocapture 2>&1 | tee iroh-db-soak.log
+      - name: Retain qualification log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iroh-db-soak-${{ github.run_id }}
+          path: iroh-db-soak.log
+          if-no-files-found: error
+          retention-days: 90

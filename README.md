@@ -75,7 +75,20 @@ cargo bench -p iroh-db-blobs --bench local_stream
 cargo bench -p iroh-db --bench multisource_stream
 ```
 
-The MSRV is Rust 1.91. Fuzz targets live in `fuzz/`; the extended reconnect soak is an ignored test controlled by `IROH_DB_SOAK_ROUNDS`.
+The MSRV is Rust 1.91. Fuzz targets live in `fuzz/`. The reusable
+`iroh-db-testkit` crate creates real-iroh temporary clusters with bounded sync,
+node stop/start, durable restart, deterministic fault schedules, and canonical
+convergence reports. The extended qualification soak accepts an exact duration:
+
+```console
+IROH_DB_SOAK_DURATION_SECS=259200 \
+IROH_DB_SOAK_RESTART_EVERY=97 \
+IROH_DB_SOAK_OPERATION_TIMEOUT_SECS=30 \
+  cargo test -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --nocapture
+```
+
+The monthly/manual `production soak` workflow runs that 72-hour gate on an
+explicitly labelled self-hosted runner and retains its log.
 
 ## License
 

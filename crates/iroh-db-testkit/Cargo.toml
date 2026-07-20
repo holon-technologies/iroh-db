@@ -9,8 +9,12 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+iroh.workspace = true
 iroh-db = { path = "../iroh-db", version = "0.1.0" }
 iroh-db-core.workspace = true
+tempfile = "3.27.0"
+thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

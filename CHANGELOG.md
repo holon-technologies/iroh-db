@@ -17,3 +17,6 @@ All notable changes are documented here. The project follows semantic versioning
   latency/throughput provider scoring, bounded concurrency and jittered
   backoff, high-priority hedging, moving cancellable prefetch, request
   coalescing, provider-quality metrics, and an executable playback benchmark.
+- The production testkit now owns real-iroh temporary clusters, bounded sync
+  deadlines, deterministic link/node faults, durable peer restart, convergence
+  reports, and exact-duration soak qualification with retained CI logs.

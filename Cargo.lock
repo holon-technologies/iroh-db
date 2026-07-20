@@ -1865,8 +1865,12 @@ dependencies = [
 name = "iroh-db-testkit"
 version = "0.1.0"
 dependencies = [
+ "iroh",
  "iroh-db",
  "iroh-db-core",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
