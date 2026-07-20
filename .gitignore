@@ -2,4 +2,5 @@
 **/*.irohdb/
 *.profraw
 *.proptest-regressions
+/fuzz/artifacts/
 .DS_Store

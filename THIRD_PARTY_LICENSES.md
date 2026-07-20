@@ -10,6 +10,7 @@ corresponding dependency code or data.
 | `minicbor 2.2.2`, `minicbor-derive 0.19.4` | Blue Oak Model License 1.0.0 | <https://blueoakcouncil.org/license/1.0.0.html> |
 | `async_io_stream 0.3.3`, `pharos 0.5.3`, `ws_stream_wasm 0.7.5` | The Unlicense | <https://opensource.org/license/unlicense> |
 | `webpki-root-certs 1.0.9`, `webpki-roots 1.0.9` | Community Data License Agreement Permissive 2.0 | Full text below |
+| `libfuzzer-sys 0.4.13` | University of Illinois/NCSA Open Source License | <https://opensource.org/license/ncsa> |
 
 The exact package versions are enforced through package-scoped cargo-deny
 exceptions. An upgrade or a new package using any listed license requires a fresh

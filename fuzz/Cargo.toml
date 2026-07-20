@@ -3,14 +3,17 @@ name = "iroh-db-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
+license = "MIT OR Apache-2.0"
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-iroh-db-core = { path = "../crates/iroh-db-core" }
-iroh-db-sync = { path = "../crates/iroh-db-sync" }
+iroh-db-core = { path = "../crates/iroh-db-core", version = "0.1.0" }
+iroh-db-security = { path = "../crates/iroh-db-security", version = "0.1.0" }
+iroh-db-store = { path = "../crates/iroh-db-store", version = "0.1.0" }
+iroh-db-sync = { path = "../crates/iroh-db-sync", version = "0.1.0" }
 
 [[bin]]
 name = "commit_decode"
@@ -22,6 +25,27 @@ bench = false
 [[bin]]
 name = "sync_frame_decode"
 path = "fuzz_targets/sync_frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "security_decode"
+path = "fuzz_targets/security_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_decode"
+path = "fuzz_targets/state_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "crdt_merge"
+path = "fuzz_targets/crdt_merge.rs"
 test = false
 doc = false
 bench = false

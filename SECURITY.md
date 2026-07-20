@@ -5,10 +5,14 @@ Report suspected vulnerabilities privately to the maintainers. Do not include ke
 ## Release Checklist
 
 - Run format, strict Clippy, all workspace tests, documentation, MSRV, and dependency/advisory checks.
-- Run all fuzz targets against their retained corpora and the exact-duration
-  reconnect/partition/restart soak. Production qualification uses
+- Replay every retained fuzz corpus, inspect the latest scheduled mutation
+  artifacts, and run the exact-duration reconnect/partition/restart soak.
+  Production qualification uses
   `IROH_DB_SOAK_DURATION_SECS=259200`; accelerated rounds are not equivalent
   evidence.
+- Minimize every crashing fuzz input, fix it without weakening strict
+  validation, and promote the minimized input into `fuzz/corpus/<target>/`
+  before closing the regression.
 - Review every package-scoped license or advisory exception in `deny.toml`;
   exceptions must identify an exact package/version or advisory ID, explain the
   current upstream path, and be removed as soon as it no longer applies.

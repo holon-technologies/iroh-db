@@ -75,7 +75,28 @@ cargo bench -p iroh-db-blobs --bench local_stream
 cargo bench -p iroh-db --bench multisource_stream
 ```
 
-The MSRV is Rust 1.91. Fuzz targets live in `fuzz/`. The reusable
+The MSRV is Rust 1.91. Five fuzz targets and their retained corpora live in
+`fuzz/`. Stable release checks replay every retained seed:
+
+```console
+cargo test --manifest-path fuzz/Cargo.toml --test corpus
+```
+
+Mutation runs require nightly cargo-fuzz. For example:
+
+```console
+cargo +nightly fuzz run security_decode fuzz/corpus/security_decode -- \
+  -max_total_time=600 -timeout=10 -rss_limit_mb=4096
+```
+
+The retained corpus combines hostile boundary inputs with structure-aware
+valid seeds whose mutable suffixes produce canonical commit, signed security,
+sync/gossip, schema, and materialized-state objects. The weekly/manual `fuzz
+qualification` workflow runs all five targets in parallel and retains evolved
+corpora and crash artifacts. Minimized crashing inputs are promoted into the
+corresponding checked-in corpus after the fix.
+
+The reusable
 `iroh-db-testkit` crate creates real-iroh temporary clusters with bounded sync,
 node stop/start, durable restart, deterministic fault schedules, and canonical
 convergence reports. The extended qualification soak accepts an exact duration:

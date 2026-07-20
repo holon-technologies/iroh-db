@@ -1,0 +1,61 @@
+name: fuzz qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Mutation seconds per target (1-18000)
+        required: true
+        default: "600"
+  schedule:
+    - cron: "0 3 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - commit_decode
+          - sync_frame_decode
+          - security_decode
+          - state_decode
+          - crdt_merge
+    env:
+      FUZZ_DURATION_SECONDS: ${{ inputs.duration_seconds || '600' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Validate mutation duration
+        run: |
+          case "$FUZZ_DURATION_SECONDS" in
+            ""|*[!0-9]*|??????*)
+              echo "duration_seconds must be an integer from 1 through 18000" >&2
+              exit 2
+              ;;
+          esac
+          if [ "$FUZZ_DURATION_SECONDS" -lt 1 ] || [ "$FUZZ_DURATION_SECONDS" -gt 18000 ]; then
+            echo "duration_seconds must be an integer from 1 through 18000" >&2
+            exit 2
+          fi
+      - name: Fuzz ${{ matrix.target }}
+        run: >-
+          cargo fuzz run ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} --
+          -max_total_time=${FUZZ_DURATION_SECONDS} -timeout=10 -rss_limit_mb=4096
+      - name: Retain corpus and crash evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: warn
+          retention-days: 30

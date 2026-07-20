@@ -1720,6 +1720,8 @@ name = "iroh-db-fuzz"
 version = "0.0.0"
 dependencies = [
  "iroh-db-core",
+ "iroh-db-security",
+ "iroh-db-store",
  "iroh-db-sync",
  "libfuzzer-sys",
 ]

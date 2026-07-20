@@ -20,3 +20,6 @@ All notable changes are documented here. The project follows semantic versioning
 - The production testkit now owns real-iroh temporary clusters, bounded sync
   deadlines, deterministic link/node faults, durable peer restart, convergence
   reports, and exact-duration soak qualification with retained CI logs.
+- Fuzz qualification now covers commit, sync/gossip, security, durable state,
+  and every built-in CRDT family, with checked-in corpora, stable replay, and
+  scheduled mutation artifacts.
