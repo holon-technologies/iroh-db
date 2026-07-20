@@ -9,7 +9,7 @@ use fs2::FileExt as _;
 use iroh_db_core::{
     AuthorId, BlobHash, CapabilityId, CollectionId, CommitCodecError, CommitEnvelope, CommitId,
     DomainId, MigrationCodecError, MigrationId, SchemaActivation, SchemaDescriptor, SchemaError,
-    SchemaStage, staging_digest,
+    SchemaStage, VersionVector, staging_digest,
 };
 use iroh_db_security::{
     AuthorityCheckpoint, CapabilityCertificate, ControlTransition, DomainDescriptor, Invitation,
@@ -26,6 +26,12 @@ const MAX_SNAPSHOT_BASELINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SNAPSHOT_BASELINE_ENTRIES: usize = 65_536;
 const COMMIT_METADATA: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("commit_metadata_v1");
+const COMMIT_CONTEXTS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("commit_contexts_v1");
+const RECORD_HEADS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("record_heads_v1");
+const RECONCILIATION_READY: TableDefinition<'static, &[u8], u8> =
+    TableDefinition::new("reconciliation_ready_v1");
 const SNAPSHOT_COVERAGE: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("snapshot_coverage_v1");
 const SNAPSHOT_BASELINES: TableDefinition<'static, &[u8], &[u8]> =
@@ -34,6 +40,8 @@ const BLOB_OWNERSHIP: TableDefinition<'static, &[u8], u8> =
     TableDefinition::new("blob_ownership_v1");
 const AUTHOR_SEQUENCES: TableDefinition<'static, &[u8], u64> =
     TableDefinition::new("author_sequences_v1");
+const AUTHOR_COMMITS: TableDefinition<'static, &[u8], &[u8]> =
+    TableDefinition::new("author_commits_v1");
 const AUTHOR_HEADS: TableDefinition<'static, &[u8], &[u8]> =
     TableDefinition::new("author_heads_v1");
 const FRONTIER: TableDefinition<'static, &[u8], u8> = TableDefinition::new("frontier_v1");
@@ -94,6 +102,92 @@ pub enum ApplyOutcome {
     Applied(CommitId),
     /// The exact commit was already durable; no metadata changed.
     Duplicate(CommitId),
+}
+
+/// One immutable operation that remains a causal head for a record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordHead {
+    commit_id: CommitId,
+    author: AuthorId,
+    sequence: u64,
+    mutation: MaterializedRecord,
+}
+
+impl RecordHead {
+    /// Constructs a durable record-head entry from an authenticated commit operation.
+    pub fn new(
+        commit_id: CommitId,
+        author: AuthorId,
+        sequence: u64,
+        mutation: MaterializedRecord,
+    ) -> Self {
+        Self {
+            commit_id,
+            author,
+            sequence,
+            mutation,
+        }
+    }
+
+    pub const fn commit_id(&self) -> CommitId {
+        self.commit_id
+    }
+
+    pub const fn author(&self) -> AuthorId {
+        self.author
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub const fn mutation(&self) -> &MaterializedRecord {
+        &self.mutation
+    }
+}
+
+/// Complete replacement set for one record's rebuildable causal heads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordHeadSet {
+    collection_id: CollectionId,
+    record_id: Vec<u8>,
+    heads: Vec<RecordHead>,
+}
+
+impl RecordHeadSet {
+    pub fn new(
+        collection_id: CollectionId,
+        record_id: Vec<u8>,
+        heads: Vec<RecordHead>,
+    ) -> Result<Self, StoreError> {
+        if heads.is_empty()
+            || heads.iter().any(|head| {
+                head.mutation.schema().collection_id() != collection_id
+                    || head.mutation.record_id() != record_id
+            })
+        {
+            return Err(StoreError::CorruptDerivedMetadata(
+                "record head replacement has inconsistent targets".into(),
+            ));
+        }
+        Ok(Self {
+            collection_id,
+            record_id,
+            heads,
+        })
+    }
+
+    pub const fn collection_id(&self) -> CollectionId {
+        self.collection_id
+    }
+
+    pub fn record_id(&self) -> &[u8] {
+        &self.record_id
+    }
+
+    pub fn heads(&self) -> &[RecordHead] {
+        &self.heads
+    }
 }
 
 enum CommitPreflight {
@@ -391,6 +485,30 @@ impl Store {
         envelope: &CommitEnvelope,
         records: &[MaterializedRecord],
     ) -> Result<ApplyOutcome, StoreError> {
+        self.persist_commit_components(envelope, records, &[], None, None)
+            .await
+    }
+
+    /// Persists a record commit and atomically advances its incremental causal index.
+    pub async fn persist_commit_with_reconciliation(
+        &self,
+        envelope: &CommitEnvelope,
+        records: &[MaterializedRecord],
+        context: &VersionVector,
+        record_heads: &[RecordHeadSet],
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.persist_commit_components(envelope, records, &[], None, Some((context, record_heads)))
+            .await
+    }
+
+    async fn persist_commit_components(
+        &self,
+        envelope: &CommitEnvelope,
+        records: &[MaterializedRecord],
+        stages: &[SchemaStage],
+        activation: Option<&SchemaActivation>,
+        reconciliation: Option<(&VersionVector, &[RecordHeadSet])>,
+    ) -> Result<ApplyOutcome, StoreError> {
         let commit_id = envelope.commit_id();
         let previous_author_head = match self.commit_preflight(envelope).await? {
             CommitPreflight::Duplicate(commit_id) => {
@@ -406,7 +524,14 @@ impl Store {
             return Err(StoreError::BlobHashMismatch);
         }
 
-        self.publish_commit_components(envelope, records, &[], None, previous_author_head)
+        self.publish_commit_components(
+            envelope,
+            records,
+            stages,
+            activation,
+            previous_author_head,
+            reconciliation,
+        )
     }
 
     /// Persists an invisible bounded set of migration stages with its immutable commit.
@@ -431,7 +556,7 @@ impl Store {
         if self.inner.blobs.put(envelope.encode_canonical()).await? != expected {
             return Err(StoreError::BlobHashMismatch);
         }
-        self.publish_commit_components(envelope, &[], stages, None, previous_author_head)
+        self.publish_commit_components(envelope, &[], stages, None, previous_author_head, None)
     }
 
     /// Atomically publishes a completely staged schema transition with its commit.
@@ -451,9 +576,44 @@ impl Store {
         if self.inner.blobs.put(envelope.encode_canonical()).await? != expected {
             return Err(StoreError::BlobHashMismatch);
         }
-        self.publish_commit_components(envelope, &[], &[], Some(activation), previous_author_head)
+        self.publish_commit_components(
+            envelope,
+            &[],
+            &[],
+            Some(activation),
+            previous_author_head,
+            None,
+        )
     }
 
+    /// Persists schema stages while atomically advancing the causal commit index.
+    pub async fn persist_schema_stages_with_context(
+        &self,
+        envelope: &CommitEnvelope,
+        stages: &[SchemaStage],
+        context: &VersionVector,
+    ) -> Result<ApplyOutcome, StoreError> {
+        if stages.is_empty() {
+            return Err(StoreError::InvalidMigration(
+                "a staging commit must contain at least one stage".into(),
+            ));
+        }
+        self.persist_commit_components(envelope, &[], stages, None, Some((context, &[])))
+            .await
+    }
+
+    /// Persists schema activation while atomically advancing the causal commit index.
+    pub async fn persist_schema_activation_with_context(
+        &self,
+        envelope: &CommitEnvelope,
+        activation: &SchemaActivation,
+        context: &VersionVector,
+    ) -> Result<ApplyOutcome, StoreError> {
+        self.persist_commit_components(envelope, &[], &[], Some(activation), Some((context, &[])))
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn publish_commit_components(
         &self,
         envelope: &CommitEnvelope,
@@ -461,6 +621,7 @@ impl Store {
         stages: &[SchemaStage],
         activation: Option<&SchemaActivation>,
         previous_author_head: Option<CommitId>,
+        reconciliation: Option<(&VersionVector, &[RecordHeadSet])>,
     ) -> Result<ApplyOutcome, StoreError> {
         let commit_id = envelope.commit_id();
         let write = self.inner.database.begin_write().map_err(database_error)?;
@@ -541,6 +702,19 @@ impl Store {
             sequences
                 .insert(author_key.as_slice(), envelope.header().author_sequence())
                 .map_err(database_error)?;
+            write
+                .open_table(AUTHOR_COMMITS)
+                .map_err(database_error)?
+                .insert(
+                    author_commit_key(
+                        envelope.header().domain_id(),
+                        envelope.header().author(),
+                        envelope.header().author_sequence(),
+                    )
+                    .as_slice(),
+                    commit_id.as_bytes().as_slice(),
+                )
+                .map_err(database_error)?;
             author_heads
                 .insert(author_key.as_slice(), commit_id.as_bytes().as_slice())
                 .map_err(database_error)?;
@@ -548,6 +722,12 @@ impl Store {
             publish_frontier(&write, envelope.header().domain_id(), envelope, commit_id)?;
 
             apply_materialized_records(&write, envelope.header().domain_id(), records)?;
+            match reconciliation {
+                Some((context, record_heads)) => {
+                    apply_reconciliation_update(&write, envelope, context, record_heads)?;
+                }
+                None => mark_reconciliation_stale(&write, envelope.header().domain_id())?,
+            }
             migration_fork = apply_schema_stages(&write, envelope.header().domain_id(), stages)?;
             if migration_fork.is_none()
                 && let Some(activation) = activation
@@ -880,6 +1060,7 @@ impl Store {
         }
         let domain_id = evidence.header().domain_id();
         let write = self.inner.database.begin_write().map_err(database_error)?;
+        clear_reconciliation_domain(&write, domain_id)?;
         clear_materialized_domain(&write, domain_id)?;
         apply_materialized_records(&write, domain_id, records)?;
         {
@@ -959,7 +1140,29 @@ impl Store {
         author: AuthorId,
         sequence: u64,
     ) -> Result<Option<CommitId>, StoreError> {
+        if self
+            .last_sequence(domain_id, author)?
+            .is_none_or(|last| sequence > last)
+        {
+            return Ok(None);
+        }
         let read = self.inner.database.begin_read().map_err(database_error)?;
+        let author_commits = read.open_table(AUTHOR_COMMITS).map_err(database_error)?;
+        let author_key = author_commit_key(domain_id, author, sequence);
+        if let Some(value) = author_commits
+            .get(author_key.as_slice())
+            .map_err(database_error)?
+        {
+            let bytes: [u8; 32] = value.value().try_into().map_err(|_| {
+                StoreError::CorruptDerivedMetadata("author commit ID is invalid".into())
+            })?;
+            let commit_id = CommitId::from_bytes(bytes);
+            return if self.is_commit_quarantined(commit_id)? {
+                Ok(None)
+            } else {
+                Ok(Some(commit_id))
+            };
+        }
         let commits = read.open_table(COMMIT_METADATA).map_err(database_error)?;
         let quarantined = read
             .open_table(QUARANTINED_COMMITS)
@@ -999,6 +1202,58 @@ impl Store {
         dependencies: &[CommitId],
         ancestor: CommitId,
     ) -> Result<bool, StoreError> {
+        if self.reconciliation_index_ready(domain_id)? {
+            if dependencies.contains(&ancestor) {
+                return Ok(true);
+            }
+            let read = self.inner.database.begin_read().map_err(database_error)?;
+            let commits = read.open_table(COMMIT_METADATA).map_err(database_error)?;
+            let Some(metadata) = commits
+                .get(ancestor.as_bytes().as_slice())
+                .map_err(database_error)?
+            else {
+                return Ok(false);
+            };
+            if metadata.value().len() != 112 || !metadata.value().starts_with(domain_id.as_bytes())
+            {
+                return Err(StoreError::CorruptDerivedMetadata(
+                    "ancestor commit metadata is invalid".into(),
+                ));
+            }
+            let author: [u8; 32] = metadata.value()[32..64].try_into().map_err(|_| {
+                StoreError::CorruptDerivedMetadata("ancestor author is invalid".into())
+            })?;
+            let sequence =
+                u64::from_be_bytes(metadata.value()[72..80].try_into().map_err(|_| {
+                    StoreError::CorruptDerivedMetadata("ancestor sequence is invalid".into())
+                })?);
+            let dot = iroh_db_core::Dot::new(AuthorId::from_bytes(author), sequence, 0);
+            drop(metadata);
+            drop(commits);
+            drop(read);
+            let baseline = self.snapshot_baseline(domain_id)?;
+            for dependency in dependencies {
+                if self
+                    .commit_context(domain_id, *dependency)?
+                    .is_some_and(|context| context.covers(&dot))
+                {
+                    return Ok(true);
+                }
+                if self.contains_commit(domain_id, *dependency)?
+                    && baseline.as_ref().is_some_and(|baseline| {
+                        baseline
+                            .author_sequences()
+                            .iter()
+                            .any(|(author, sequence)| {
+                                *author == dot.author() && *sequence >= dot.sequence()
+                            })
+                    })
+                {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
         let mut pending = dependencies.to_vec();
         let mut visited = std::collections::BTreeSet::new();
         while let Some(commit_id) = pending.pop() {
@@ -1041,6 +1296,106 @@ impl Store {
         }
         commits.sort_unstable();
         Ok(commits)
+    }
+
+    /// Returns whether the rebuildable causal and record-head indexes are complete.
+    pub fn reconciliation_index_ready(&self, domain_id: DomainId) -> Result<bool, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let ready = read
+            .open_table(RECONCILIATION_READY)
+            .map_err(database_error)?;
+        Ok(ready
+            .get(domain_id.as_bytes().as_slice())
+            .map_err(database_error)?
+            .is_some())
+    }
+
+    /// Loads the inclusive causal context cached for one accepted commit.
+    pub fn commit_context(
+        &self,
+        domain_id: DomainId,
+        commit_id: CommitId,
+    ) -> Result<Option<VersionVector>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let contexts = read.open_table(COMMIT_CONTEXTS).map_err(database_error)?;
+        let key = commit_context_key(domain_id, commit_id);
+        contexts
+            .get(key.as_slice())
+            .map_err(database_error)?
+            .map(|value| decode_version_vector(value.value()))
+            .transpose()
+    }
+
+    /// Loads only the current causal heads for one materialized record.
+    pub fn record_heads(
+        &self,
+        domain_id: DomainId,
+        collection_id: CollectionId,
+        record_id: &[u8],
+    ) -> Result<Vec<RecordHead>, StoreError> {
+        let read = self.inner.database.begin_read().map_err(database_error)?;
+        let heads = read.open_table(RECORD_HEADS).map_err(database_error)?;
+        let prefix = record_head_prefix(domain_id, collection_id, record_id)?;
+        let mut result = Vec::new();
+        for entry in heads.range(prefix.as_slice()..).map_err(database_error)? {
+            let (key, value) = entry.map_err(database_error)?;
+            if !key.value().starts_with(&prefix) {
+                break;
+            }
+            if key.value().len() != prefix.len() + 32 {
+                return Err(StoreError::CorruptDerivedMetadata(
+                    "record head key has an invalid commit ID".into(),
+                ));
+            }
+            let commit: [u8; 32] = key.value()[prefix.len()..].try_into().map_err(|_| {
+                StoreError::CorruptDerivedMetadata(
+                    "record head commit ID has an invalid length".into(),
+                )
+            })?;
+            result.push(decode_record_head(
+                CommitId::from_bytes(commit),
+                value.value(),
+            )?);
+        }
+        result.sort_unstable_by_key(RecordHead::commit_id);
+        Ok(result)
+    }
+
+    /// Atomically replaces the complete rebuildable reconciliation index for a domain.
+    pub fn replace_reconciliation_index(
+        &self,
+        domain_id: DomainId,
+        contexts: &[(CommitId, VersionVector)],
+        heads: &[RecordHead],
+    ) -> Result<(), StoreError> {
+        let write = self.inner.database.begin_write().map_err(database_error)?;
+        clear_reconciliation_domain(&write, domain_id)?;
+        {
+            let mut table = write.open_table(COMMIT_CONTEXTS).map_err(database_error)?;
+            for (commit_id, context) in contexts {
+                let key = commit_context_key(domain_id, *commit_id);
+                let encoded = encode_version_vector(context)?;
+                table
+                    .insert(key.as_slice(), encoded.as_slice())
+                    .map_err(database_error)?;
+            }
+        }
+        {
+            let mut table = write.open_table(RECORD_HEADS).map_err(database_error)?;
+            for head in heads {
+                let key = record_head_key(domain_id, head)?;
+                let value = encode_record_head(head)?;
+                table
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(database_error)?;
+            }
+        }
+        write
+            .open_table(RECONCILIATION_READY)
+            .map_err(database_error)?
+            .insert(domain_id.as_bytes().as_slice(), 1)
+            .map_err(database_error)?;
+        write.commit().map_err(database_error)
     }
 
     /// Loads one canonical materialized record state by primary key.
@@ -1455,6 +1810,7 @@ impl Store {
         }
         let baseline_bytes = baseline.encode_canonical()?;
         let write = self.inner.database.begin_write().map_err(database_error)?;
+        clear_reconciliation_domain(&write, domain_id)?;
         clear_materialized_domain(&write, domain_id)?;
         clear_domain_migration_metadata(&write, domain_id)?;
         clear_domain_snapshot_metadata(&write, domain_id)?;
@@ -1501,6 +1857,11 @@ impl Store {
                 operational_metadata_key(domain_id, SNAPSHOT_OBSERVED_AT_TAG).as_slice(),
                 observed_at_unix_seconds,
             )
+            .map_err(database_error)?;
+        write
+            .open_table(RECONCILIATION_READY)
+            .map_err(database_error)?
+            .insert(domain_id.as_bytes().as_slice(), 1)
             .map_err(database_error)?;
         write.commit().map_err(database_error)
     }
@@ -2962,6 +3323,72 @@ fn publish_frontier(
     Ok(())
 }
 
+fn apply_reconciliation_update(
+    write: &redb::WriteTransaction,
+    envelope: &CommitEnvelope,
+    context: &VersionVector,
+    record_heads: &[RecordHeadSet],
+) -> Result<(), StoreError> {
+    let own_dot = iroh_db_core::Dot::new(
+        envelope.header().author(),
+        envelope.header().author_sequence(),
+        0,
+    );
+    if !context.covers(&own_dot) {
+        return Err(StoreError::CorruptDerivedMetadata(
+            "commit context does not include its own author sequence".into(),
+        ));
+    }
+    let domain_id = envelope.header().domain_id();
+    {
+        let key = commit_context_key(domain_id, envelope.commit_id());
+        let encoded = encode_version_vector(context)?;
+        write
+            .open_table(COMMIT_CONTEXTS)
+            .map_err(database_error)?
+            .insert(key.as_slice(), encoded.as_slice())
+            .map_err(database_error)?;
+    }
+    {
+        let mut table = write.open_table(RECORD_HEADS).map_err(database_error)?;
+        for replacement in record_heads {
+            let prefix = record_head_prefix(
+                domain_id,
+                replacement.collection_id(),
+                replacement.record_id(),
+            )?;
+            for key in table_keys_with_prefix(&table, &prefix)? {
+                table.remove(key.as_slice()).map_err(database_error)?;
+            }
+            for head in replacement.heads() {
+                let key = record_head_key(domain_id, head)?;
+                let value = encode_record_head(head)?;
+                table
+                    .insert(key.as_slice(), value.as_slice())
+                    .map_err(database_error)?;
+            }
+        }
+    }
+    write
+        .open_table(RECONCILIATION_READY)
+        .map_err(database_error)?
+        .insert(domain_id.as_bytes().as_slice(), 1)
+        .map_err(database_error)?;
+    Ok(())
+}
+
+fn mark_reconciliation_stale(
+    write: &redb::WriteTransaction,
+    domain_id: DomainId,
+) -> Result<(), StoreError> {
+    write
+        .open_table(RECONCILIATION_READY)
+        .map_err(database_error)?
+        .remove(domain_id.as_bytes().as_slice())
+        .map_err(database_error)?;
+    Ok(())
+}
+
 fn validate_snapshot_metadata(
     records: &[MaterializedRecord],
     covered_commits: &[CommitId],
@@ -3015,6 +3442,11 @@ fn strictly_sorted<T: Ord>(values: &[T]) -> bool {
 fn initialize_tables(database: &Database) -> Result<(), StoreError> {
     let write = database.begin_write().map_err(database_error)?;
     write.open_table(COMMIT_METADATA).map_err(database_error)?;
+    write.open_table(COMMIT_CONTEXTS).map_err(database_error)?;
+    write.open_table(RECORD_HEADS).map_err(database_error)?;
+    write
+        .open_table(RECONCILIATION_READY)
+        .map_err(database_error)?;
     write
         .open_table(SNAPSHOT_COVERAGE)
         .map_err(database_error)?;
@@ -3023,6 +3455,7 @@ fn initialize_tables(database: &Database) -> Result<(), StoreError> {
         .map_err(database_error)?;
     write.open_table(BLOB_OWNERSHIP).map_err(database_error)?;
     write.open_table(AUTHOR_SEQUENCES).map_err(database_error)?;
+    write.open_table(AUTHOR_COMMITS).map_err(database_error)?;
     write.open_table(AUTHOR_HEADS).map_err(database_error)?;
     write.open_table(FRONTIER).map_err(database_error)?;
     write
@@ -3747,6 +4180,25 @@ fn clear_materialized_domain(
     Ok(())
 }
 
+fn clear_reconciliation_domain(
+    write: &redb::WriteTransaction,
+    domain_id: DomainId,
+) -> Result<(), StoreError> {
+    {
+        let mut table = write.open_table(COMMIT_CONTEXTS).map_err(database_error)?;
+        for key in table_keys_with_prefix(&table, domain_id.as_bytes())? {
+            table.remove(key.as_slice()).map_err(database_error)?;
+        }
+    }
+    {
+        let mut table = write.open_table(RECORD_HEADS).map_err(database_error)?;
+        for key in table_keys_with_prefix(&table, domain_id.as_bytes())? {
+            table.remove(key.as_slice()).map_err(database_error)?;
+        }
+    }
+    mark_reconciliation_stale(write, domain_id)
+}
+
 fn clear_domain_snapshot_metadata(
     write: &redb::WriteTransaction,
     domain_id: DomainId,
@@ -3806,11 +4258,12 @@ fn table_keys_with_prefix(
     prefix: &[u8],
 ) -> Result<Vec<Vec<u8>>, StoreError> {
     let mut keys = Vec::new();
-    for entry in table.iter().map_err(database_error)? {
+    for entry in table.range(prefix..).map_err(database_error)? {
         let (key, _) = entry.map_err(database_error)?;
-        if key.value().starts_with(prefix) {
-            keys.push(key.value().to_vec());
+        if !key.value().starts_with(prefix) {
+            break;
         }
+        keys.push(key.value().to_vec());
     }
     Ok(keys)
 }
@@ -3820,11 +4273,12 @@ fn table_u8_keys_with_prefix(
     prefix: &[u8],
 ) -> Result<Vec<Vec<u8>>, StoreError> {
     let mut keys = Vec::new();
-    for entry in table.iter().map_err(database_error)? {
+    for entry in table.range(prefix..).map_err(database_error)? {
         let (key, _) = entry.map_err(database_error)?;
-        if key.value().starts_with(prefix) {
-            keys.push(key.value().to_vec());
+        if !key.value().starts_with(prefix) {
+            break;
         }
+        keys.push(key.value().to_vec());
     }
     Ok(keys)
 }
@@ -3834,11 +4288,12 @@ fn table_u64_keys_with_prefix(
     prefix: &[u8],
 ) -> Result<Vec<Vec<u8>>, StoreError> {
     let mut keys = Vec::new();
-    for entry in table.iter().map_err(database_error)? {
+    for entry in table.range(prefix..).map_err(database_error)? {
         let (key, _) = entry.map_err(database_error)?;
-        if key.value().starts_with(prefix) {
-            keys.push(key.value().to_vec());
+        if !key.value().starts_with(prefix) {
+            break;
         }
+        keys.push(key.value().to_vec());
     }
     Ok(keys)
 }
@@ -4044,6 +4499,13 @@ fn author_sequence_key(domain_id: DomainId, author: AuthorId) -> [u8; 64] {
     key
 }
 
+fn author_commit_key(domain_id: DomainId, author: AuthorId, sequence: u64) -> [u8; 72] {
+    let mut key = [0_u8; 72];
+    key[..64].copy_from_slice(&author_sequence_key(domain_id, author));
+    key[64..].copy_from_slice(&sequence.to_be_bytes());
+    key
+}
+
 fn blob_ownership_key(domain_id: DomainId, hash: BlobHash) -> [u8; 64] {
     let mut key = [0_u8; 64];
     key[..32].copy_from_slice(domain_id.as_bytes());
@@ -4056,6 +4518,85 @@ fn frontier_key(domain_id: DomainId, commit_id: CommitId) -> [u8; 64] {
     key[..32].copy_from_slice(domain_id.as_bytes());
     key[32..].copy_from_slice(commit_id.as_bytes());
     key
+}
+
+fn commit_context_key(domain_id: DomainId, commit_id: CommitId) -> [u8; 64] {
+    frontier_key(domain_id, commit_id)
+}
+
+fn record_head_prefix(
+    domain_id: DomainId,
+    collection_id: CollectionId,
+    record_id: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    let record_length = u32::try_from(record_id.len()).map_err(|_| {
+        StoreError::CorruptDerivedMetadata("record head ID length exceeds u32".into())
+    })?;
+    let mut key = Vec::with_capacity(68 + record_id.len());
+    key.extend_from_slice(domain_id.as_bytes());
+    key.extend_from_slice(collection_id.as_bytes());
+    key.extend_from_slice(&record_length.to_be_bytes());
+    key.extend_from_slice(record_id);
+    Ok(key)
+}
+
+fn record_head_key(domain_id: DomainId, head: &RecordHead) -> Result<Vec<u8>, StoreError> {
+    let mut key = record_head_prefix(
+        domain_id,
+        head.mutation().schema().collection_id(),
+        head.mutation().record_id(),
+    )?;
+    key.extend_from_slice(head.commit_id().as_bytes());
+    Ok(key)
+}
+
+fn encode_version_vector(context: &VersionVector) -> Result<Vec<u8>, StoreError> {
+    minicbor::to_vec(context).map_err(|error| {
+        StoreError::CorruptDerivedMetadata(format!("commit context encoding failed: {error}"))
+    })
+}
+
+fn decode_version_vector(bytes: &[u8]) -> Result<VersionVector, StoreError> {
+    let mut decoder = minicbor::Decoder::new(bytes);
+    let context: VersionVector = decoder.decode().map_err(|error| {
+        StoreError::CorruptDerivedMetadata(format!("commit context is invalid: {error}"))
+    })?;
+    if decoder.position() != bytes.len() || encode_version_vector(&context)? != bytes {
+        return Err(StoreError::CorruptDerivedMetadata(
+            "commit context is not canonical".into(),
+        ));
+    }
+    Ok(context)
+}
+
+fn encode_record_head(head: &RecordHead) -> Result<Vec<u8>, StoreError> {
+    let mutation = head.mutation().encode_canonical().map_err(|error| {
+        StoreError::CorruptDerivedMetadata(format!("record head mutation is invalid: {error}"))
+    })?;
+    let mut encoded = Vec::with_capacity(40 + mutation.len());
+    encoded.extend_from_slice(head.author().as_bytes());
+    encoded.extend_from_slice(&head.sequence().to_be_bytes());
+    encoded.extend_from_slice(&mutation);
+    Ok(encoded)
+}
+
+fn decode_record_head(commit_id: CommitId, bytes: &[u8]) -> Result<RecordHead, StoreError> {
+    if bytes.len() < 40 {
+        return Err(StoreError::CorruptDerivedMetadata(
+            "record head value is truncated".into(),
+        ));
+    }
+    let author: [u8; 32] = bytes[..32].try_into().expect("exact author length");
+    let sequence: [u8; 8] = bytes[32..40].try_into().expect("exact sequence length");
+    let mutation = MaterializedRecord::decode_canonical(&bytes[40..]).map_err(|error| {
+        StoreError::CorruptDerivedMetadata(format!("record head mutation is invalid: {error}"))
+    })?;
+    Ok(RecordHead::new(
+        commit_id,
+        AuthorId::from_bytes(author),
+        u64::from_be_bytes(sequence),
+        mutation,
+    ))
 }
 
 fn encode_metadata(envelope: &CommitEnvelope) -> Vec<u8> {

@@ -68,6 +68,7 @@ pub(crate) struct Telemetry {
     local_apply: LatencyRecorder,
     query: LatencyRecorder,
     index_records_scanned: AtomicU64,
+    reconciliation_commits_scanned: AtomicU64,
     equivocation_quarantines: AtomicU64,
     schema_rebases: AtomicU64,
     sync_rounds: AtomicU64,
@@ -94,6 +95,13 @@ impl Telemetry {
         saturating_add(
             &self.index_records_scanned,
             u64::try_from(records).unwrap_or(u64::MAX),
+        );
+    }
+
+    pub(crate) fn add_reconciliation_commits_scanned(&self, commits: usize) {
+        saturating_add(
+            &self.reconciliation_commits_scanned,
+            u64::try_from(commits).unwrap_or(u64::MAX),
         );
     }
 
@@ -141,6 +149,9 @@ impl Telemetry {
             local_apply: self.local_apply.snapshot(),
             query: self.query.snapshot(),
             index_records_scanned: self.index_records_scanned.load(Ordering::Relaxed),
+            reconciliation_commits_scanned: self
+                .reconciliation_commits_scanned
+                .load(Ordering::Relaxed),
             equivocation_quarantines: self.equivocation_quarantines.load(Ordering::Relaxed),
             schema_rebases: self.schema_rebases.load(Ordering::Relaxed),
             sync_rounds: self.sync_rounds.load(Ordering::Relaxed),
@@ -174,6 +185,7 @@ pub(crate) struct RuntimeMetrics {
     pub(crate) local_apply: LatencyMetrics,
     pub(crate) query: LatencyMetrics,
     pub(crate) index_records_scanned: u64,
+    pub(crate) reconciliation_commits_scanned: u64,
     pub(crate) equivocation_quarantines: u64,
     pub(crate) schema_rebases: u64,
     pub(crate) sync_rounds: u64,

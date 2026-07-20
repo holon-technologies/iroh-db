@@ -106,6 +106,8 @@ async fn run_schedule(config: RunConfig) {
         if config.round_limit.is_some_and(|limit| rounds >= limit) {
             break;
         }
+        let round_started = Instant::now();
+        let writes_started = Instant::now();
         for peer in 0..cluster.len() {
             let database = cluster.peer(peer).unwrap();
             database
@@ -114,14 +116,35 @@ async fn run_schedule(config: RunConfig) {
                 .await
                 .unwrap();
         }
+        let writes_elapsed = writes_started.elapsed();
         let schedule = rotating_partition(rounds, cluster.len()).unwrap();
-        syncs += cluster.apply_schedule(&schedule).await.unwrap().syncs();
+        let sync_started = Instant::now();
+        let report = cluster
+            .apply_schedule(&schedule)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "soak round {rounds} failed after {:.3}s with schedule {schedule:?}: {error}",
+                    round_started.elapsed().as_secs_f64()
+                )
+            });
+        let sync_elapsed = sync_started.elapsed();
+        syncs += report.syncs();
         rounds += 1;
         if rounds.is_multiple_of(config.restart_every) {
             let peer = (rounds / config.restart_every - 1) % cluster.len();
             cluster.restart_peer(peer).await.unwrap();
             drop(cluster.peer(peer).unwrap().collection::<Note>());
             restarts += 1;
+        }
+        if rounds.is_multiple_of(25) {
+            println!(
+                "iroh-db soak progress: rounds={rounds} elapsed_secs={:.3} last_round_secs={:.3} writes_secs={:.3} sync_secs={:.3} syncs={syncs} restarts={restarts}",
+                started.elapsed().as_secs_f64(),
+                round_started.elapsed().as_secs_f64(),
+                writes_elapsed.as_secs_f64(),
+                sync_elapsed.as_secs_f64()
+            );
         }
     }
 

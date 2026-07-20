@@ -100,6 +100,7 @@ pub struct OperationalMetrics {
     local_apply_latency: LatencyMetrics,
     query_latency: LatencyMetrics,
     index_records_scanned: u64,
+    reconciliation_commits_scanned: u64,
     equivocation_quarantines: u64,
     schema_rebases: u64,
     sync_rounds: u64,
@@ -153,6 +154,11 @@ impl OperationalMetrics {
 
     pub const fn index_records_scanned(self) -> u64 {
         self.index_records_scanned
+    }
+
+    /// Immutable commits read while maintaining the incremental CRDT materialization index.
+    pub const fn reconciliation_commits_scanned(self) -> u64 {
+        self.reconciliation_commits_scanned
     }
 
     pub const fn equivocation_quarantines(self) -> u64 {
@@ -264,6 +270,7 @@ impl IrohDb {
             local_apply_latency: runtime.local_apply,
             query_latency: runtime.query,
             index_records_scanned: runtime.index_records_scanned,
+            reconciliation_commits_scanned: runtime.reconciliation_commits_scanned,
             equivocation_quarantines: runtime.equivocation_quarantines,
             schema_rebases: runtime.schema_rebases,
             sync_rounds: runtime.sync_rounds,

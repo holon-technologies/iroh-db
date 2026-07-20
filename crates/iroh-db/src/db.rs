@@ -21,7 +21,8 @@ use iroh_db_security::{
 };
 use iroh_db_store::{
     ApplyOutcome, BlobFuture, BlobStore, BlobStoreError, IndexValue, MaterializedError,
-    MaterializedRecord, SnapshotBaseline, Store, StoreError, StoredRecord,
+    MaterializedRecord, RecordHead, RecordHeadSet, SnapshotBaseline, Store, StoreError,
+    StoredRecord,
 };
 use tokio::io::AsyncRead;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock, broadcast};
@@ -1277,10 +1278,11 @@ impl IrohDb {
         }
         self.validate_consistency(header.author(), &body)?;
         if self.commit_requires_schema_rebase(&body)? {
+            let context = self.inclusive_commit_context(&envelope).await?;
             return match self
                 .inner
                 .store
-                .persist_commit_with_records(&envelope, &[])
+                .persist_commit_with_reconciliation(&envelope, &[], &context, &[])
                 .await?
             {
                 ApplyOutcome::Duplicate(id) => Ok(RemoteApply::Duplicate(id)),
@@ -1290,10 +1292,11 @@ impl IrohDb {
                 }
             };
         }
-        let mutations = self
+        let converged = self
             .converged_mutations(&envelope, &body, &adapters)
             .await?;
-        let changes = mutations
+        let changes = converged
+            .mutations
             .iter()
             .map(|mutation| Change {
                 collection_id: mutation.schema().collection_id(),
@@ -1308,7 +1311,12 @@ impl IrohDb {
         match self
             .inner
             .store
-            .persist_commit_with_records(&envelope, &mutations)
+            .persist_commit_with_reconciliation(
+                &envelope,
+                &converged.mutations,
+                &converged.context,
+                &converged.record_heads,
+            )
             .await?
         {
             ApplyOutcome::Duplicate(id) => Ok(RemoteApply::Duplicate(id)),
@@ -1374,10 +1382,11 @@ impl IrohDb {
             MigrationBody::Stages(stage_batch) => {
                 self.validate_remote_migration_authority(header)?;
                 validate_staged_records(&stage_batch, adapters)?;
+                let context = self.inclusive_commit_context(envelope).await?;
                 let outcome = self
                     .inner
                     .store
-                    .persist_schema_stages(envelope, &stage_batch)
+                    .persist_schema_stages_with_context(envelope, &stage_batch, &context)
                     .await?;
                 Ok(Some(match outcome {
                     ApplyOutcome::Duplicate(id) => RemoteApply::Duplicate(id),
@@ -1388,10 +1397,11 @@ impl IrohDb {
                 self.validate_remote_migration_authority(header)?;
                 self.validate_activation_cut(envelope, &activation).await?;
                 let before = self.inner.store.export_materialized(self.domain_id())?;
+                let context = self.inclusive_commit_context(envelope).await?;
                 let outcome = self
                     .inner
                     .store
-                    .persist_schema_activation(envelope, &activation)
+                    .persist_schema_activation_with_context(envelope, &activation, &context)
                     .await?;
                 Ok(Some(match outcome {
                     ApplyOutcome::Duplicate(id) => RemoteApply::Duplicate(id),
@@ -1652,14 +1662,8 @@ impl IrohDb {
         incoming: &CommitEnvelope,
         incoming_body: &CommitBody,
         adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
-    ) -> Result<Vec<MaterializedRecord>, DbError> {
+    ) -> Result<ConvergedCommit, DbError> {
         let domain = self.domain_id();
-        let existing_ids = self.inner.store.list_stored_commit_ids(domain)?;
-        if existing_ids.len() >= MAX_RECONCILE_COMMITS {
-            return Err(DbError::InvalidRemoteCommit(
-                "reconciliation commit budget exceeded".into(),
-            ));
-        }
         for dependency in incoming.header().dependencies() {
             if !self.inner.store.contains_commit(domain, *dependency)? {
                 return Err(DbError::InvalidRemoteCommit(
@@ -1673,82 +1677,215 @@ impl IrohDb {
             .await?;
         let affected =
             validate_incoming_operations(incoming, incoming_body, adapters, &dependency_context)?;
-        let mut graph = BTreeMap::<CommitId, Vec<CommitId>>::new();
-        let mut candidates =
-            BTreeMap::<(CollectionId, Vec<u8>), Vec<(CommitId, MaterializedRecord)>>::new();
-        for commit_id in existing_ids {
-            let envelope = self.inner.store.load_commit(commit_id).await?;
-            graph.insert(commit_id, envelope.header().dependencies().to_vec());
-            let body = open_commit(&envelope, &self.domain_key_for(envelope.header().epoch())?)?;
-            if matches!(
-                decode_migration_body(&envelope, &body)?,
-                MigrationBody::Ordinary
-            ) {
-                collect_affected_operations(commit_id, &body, &affected, &mut candidates)?;
-            }
-        }
         let incoming_id = incoming.commit_id();
-        graph.insert(incoming_id, incoming.header().dependencies().to_vec());
-        collect_affected_operations(incoming_id, incoming_body, &affected, &mut candidates)?;
-
         let mut mutations = Vec::with_capacity(affected.len());
-        for key in affected.into_keys() {
-            let entries = candidates
-                .remove(&key)
-                .ok_or_else(|| DbError::InvalidRemoteCommit("missing record operation".into()))?;
-            mutations.push(resolve_record_heads(&key, &entries, &graph, adapters)?);
+        let mut replacements = Vec::with_capacity(affected.len());
+        for (key, _) in affected {
+            let incoming_mutation = incoming_body
+                .operations()
+                .iter()
+                .find(|operation| {
+                    operation.collection_id() == key.0 && operation.record_id() == key.1
+                })
+                .ok_or_else(|| DbError::InvalidRemoteCommit("missing record operation".into()))
+                .and_then(|operation| {
+                    MaterializedRecord::decode_canonical(operation.payload()).map_err(DbError::from)
+                })?;
+            let mut heads = self.inner.store.record_heads(domain, key.0, &key.1)?;
+            heads.retain(|head| {
+                !dependency_context.covers(&Dot::new(head.author(), head.sequence(), 0))
+            });
+            heads.push(RecordHead::new(
+                incoming_id,
+                incoming.header().author(),
+                incoming.header().author_sequence(),
+                incoming_mutation,
+            ));
+            heads.sort_unstable_by_key(RecordHead::commit_id);
+            let entries: Vec<_> = heads
+                .iter()
+                .map(|head| (head.commit_id(), head.mutation().clone()))
+                .collect();
+            mutations.push(resolve_causal_record_heads(&key, &entries, adapters)?);
+            replacements.push(RecordHeadSet::new(key.0, key.1, heads)?);
         }
-        Ok(mutations)
+        let mut context = dependency_context;
+        context.observe(Dot::new(
+            incoming.header().author(),
+            incoming.header().author_sequence(),
+            0,
+        ));
+        Ok(ConvergedCommit {
+            mutations,
+            context,
+            record_heads: replacements,
+        })
     }
 
     async fn dependency_context(
         &self,
         dependencies: &[CommitId],
     ) -> Result<VersionVector, DbError> {
+        self.ensure_reconciliation_index().await?;
         let mut context = VersionVector::new();
-        let mut pending = dependencies.to_vec();
-        let mut visited = BTreeSet::new();
-        while let Some(commit_id) = pending.pop() {
-            if !visited.insert(commit_id) {
-                continue;
-            }
-            match self.inner.store.load_commit(commit_id).await {
-                Ok(envelope) => {
-                    if envelope.header().domain_id() != self.domain_id() {
-                        return Err(DbError::InvalidRemoteCommit(
-                            "dependency belongs to another domain".into(),
-                        ));
-                    }
-                    context.observe(Dot::new(
-                        envelope.header().author(),
-                        envelope.header().author_sequence(),
-                        0,
-                    ));
-                    pending.extend_from_slice(envelope.header().dependencies());
+        let baseline = self.inner.store.snapshot_baseline(self.domain_id())?;
+        for &commit_id in dependencies {
+            if let Some(dependency) = self
+                .inner
+                .store
+                .commit_context(self.domain_id(), commit_id)?
+            {
+                context.merge(&dependency);
+            } else if self
+                .inner
+                .store
+                .contains_commit(self.domain_id(), commit_id)?
+            {
+                let baseline = baseline.as_ref().ok_or_else(|| {
+                    DbError::InvalidSnapshot(
+                        "accepted dependency has no indexed or snapshot causal context".into(),
+                    )
+                })?;
+                for &(author, sequence) in baseline.author_sequences() {
+                    context.observe(Dot::new(author, sequence, 0));
                 }
-                Err(StoreError::MissingCommitBlob(_))
-                    if self
-                        .inner
-                        .store
-                        .contains_commit(self.domain_id(), commit_id)? =>
-                {
-                    let baseline = self
-                        .inner
-                        .store
-                        .snapshot_baseline(self.domain_id())?
-                        .ok_or_else(|| {
-                            DbError::InvalidSnapshot(
-                                "snapshot-covered dependency has no recovery baseline".into(),
-                            )
-                        })?;
-                    for &(author, sequence) in baseline.author_sequences() {
-                        context.observe(Dot::new(author, sequence, 0));
-                    }
-                }
-                Err(error) => return Err(error.into()),
+            } else {
+                return Err(DbError::InvalidRemoteCommit(
+                    "commit dependency is missing".into(),
+                ));
             }
         }
         Ok(context)
+    }
+
+    async fn inclusive_commit_context(
+        &self,
+        envelope: &CommitEnvelope,
+    ) -> Result<VersionVector, DbError> {
+        let mut context = self
+            .dependency_context(envelope.header().dependencies())
+            .await?;
+        context.observe(Dot::new(
+            envelope.header().author(),
+            envelope.header().author_sequence(),
+            0,
+        ));
+        Ok(context)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn ensure_reconciliation_index(&self) -> Result<(), DbError> {
+        let domain_id = self.domain_id();
+        if self.inner.store.reconciliation_index_ready(domain_id)? {
+            return Ok(());
+        }
+        let commit_ids = self.inner.store.list_stored_commit_ids(domain_id)?;
+        if commit_ids.len() > MAX_RECONCILE_COMMITS {
+            return Err(DbError::InvalidRemoteCommit(
+                "reconciliation index rebuild budget exceeded".into(),
+            ));
+        }
+        self.inner
+            .telemetry
+            .add_reconciliation_commits_scanned(commit_ids.len());
+
+        let mut commits = BTreeMap::<CommitId, (CommitEnvelope, CommitBody)>::new();
+        for commit_id in commit_ids {
+            let envelope = self.inner.store.load_commit(commit_id).await?;
+            if envelope.header().domain_id() != domain_id {
+                return Err(DbError::InvalidRemoteCommit(
+                    "indexed commit belongs to another domain".into(),
+                ));
+            }
+            let body = open_commit(&envelope, &self.domain_key_for(envelope.header().epoch())?)?;
+            commits.insert(commit_id, (envelope, body));
+        }
+
+        let baseline = self.inner.store.snapshot_baseline(domain_id)?;
+        let mut baseline_context = VersionVector::new();
+        if let Some(baseline) = &baseline {
+            for &(author, sequence) in baseline.author_sequences() {
+                baseline_context.observe(Dot::new(author, sequence, 0));
+            }
+        }
+        let mut pending: BTreeSet<_> = commits.keys().copied().collect();
+        let mut contexts = BTreeMap::<CommitId, VersionVector>::new();
+        let mut record_heads = BTreeMap::<RecordTarget, Vec<RecordHead>>::new();
+        while !pending.is_empty() {
+            let next = pending.iter().copied().find(|commit_id| {
+                commits[commit_id]
+                    .0
+                    .header()
+                    .dependencies()
+                    .iter()
+                    .all(|dependency| {
+                        contexts.contains_key(dependency) || !commits.contains_key(dependency)
+                    })
+            });
+            let Some(commit_id) = next else {
+                return Err(DbError::InvalidRemoteCommit(
+                    "commit history contains a dependency cycle".into(),
+                ));
+            };
+            let (envelope, body) = &commits[&commit_id];
+            let mut dependency_context = VersionVector::new();
+            for dependency in envelope.header().dependencies() {
+                if let Some(context) = contexts.get(dependency) {
+                    dependency_context.merge(context);
+                } else if self.inner.store.contains_commit(domain_id, *dependency)?
+                    && baseline.is_some()
+                {
+                    dependency_context.merge(&baseline_context);
+                } else {
+                    return Err(DbError::InvalidRemoteCommit(
+                        "commit history has an unindexed dependency".into(),
+                    ));
+                }
+            }
+
+            if matches!(
+                decode_migration_body(envelope, body)?,
+                MigrationBody::Ordinary
+            ) {
+                for operation in body.operations() {
+                    if !matches!(
+                        operation.kind(),
+                        OperationKind::FieldStateMerge | OperationKind::RecordDelete
+                    ) {
+                        return Err(DbError::InvalidRemoteCommit(
+                            "accepted record commit contains an unsupported operation".into(),
+                        ));
+                    }
+                    let mutation = MaterializedRecord::decode_canonical(operation.payload())?;
+                    let key = (operation.collection_id(), operation.record_id().to_vec());
+                    let heads = record_heads.entry(key).or_default();
+                    heads.retain(|head| {
+                        !dependency_context.covers(&Dot::new(head.author(), head.sequence(), 0))
+                    });
+                    heads.push(RecordHead::new(
+                        commit_id,
+                        envelope.header().author(),
+                        envelope.header().author_sequence(),
+                        mutation,
+                    ));
+                }
+            }
+            let mut context = dependency_context;
+            context.observe(Dot::new(
+                envelope.header().author(),
+                envelope.header().author_sequence(),
+                0,
+            ));
+            contexts.insert(commit_id, context);
+            pending.remove(&commit_id);
+        }
+
+        let contexts: Vec<_> = contexts.into_iter().collect();
+        let heads: Vec<_> = record_heads.into_values().flatten().collect();
+        self.inner
+            .store
+            .replace_reconciliation_index(domain_id, &contexts, &heads)?;
+        Ok(())
     }
 
     pub(crate) async fn rebuild_mutations(&self) -> Result<Vec<MaterializedRecord>, DbError> {
@@ -2132,9 +2269,10 @@ impl IrohDb {
             .collect::<Result<Vec<_>, _>>()?;
         let schemas = vec![stages[0].from().schema_id(), stages[0].to().schema_id()];
         let envelope = self.seal_migration_commit_locked(operations, schemas, Permission::Admin)?;
+        let context = self.inclusive_commit_context(&envelope).await?;
         self.inner
             .store
-            .persist_schema_stages(&envelope, stages)
+            .persist_schema_stages_with_context(&envelope, stages, &context)
             .await?;
         Ok(envelope.commit_id())
     }
@@ -2157,9 +2295,10 @@ impl IrohDb {
         )?;
         self.validate_activation_cut(&envelope, activation).await?;
         let before = self.inner.store.export_materialized(self.domain_id())?;
+        let context = self.inclusive_commit_context(&envelope).await?;
         self.inner
             .store
-            .persist_schema_activation(&envelope, activation)
+            .persist_schema_activation_with_context(&envelope, activation, &context)
             .await?;
         let after = self.inner.store.export_materialized(self.domain_id())?;
         let changes = materialization_changes(&before, &after);
@@ -2328,12 +2467,17 @@ impl IrohDb {
             nonce,
         )?;
         let envelope = seal_commit(header, &body, &self.domain_key(), &signer)?;
-        let mutations = self
+        let converged = self
             .converged_mutations(&envelope, &body, &adapters)
             .await?;
         self.inner
             .store
-            .persist_commit_with_records(&envelope, &mutations)
+            .persist_commit_with_reconciliation(
+                &envelope,
+                &converged.mutations,
+                &converged.context,
+                &converged.record_heads,
+            )
             .await?;
         let batch = ChangeBatch {
             commit_id: envelope.commit_id(),
@@ -3216,6 +3360,12 @@ fn prepare_delete<Record: IrohRecord>(id: &Record::Id) -> Result<PreparedRecord,
 type RecordTarget = (CollectionId, Vec<u8>);
 type RecordCandidates = BTreeMap<RecordTarget, Vec<(CommitId, MaterializedRecord)>>;
 
+struct ConvergedCommit {
+    mutations: Vec<MaterializedRecord>,
+    context: VersionVector,
+    record_heads: Vec<RecordHeadSet>,
+}
+
 enum MigrationBody {
     Ordinary,
     Stages(Vec<SchemaStage>),
@@ -3447,7 +3597,18 @@ fn resolve_record_heads(
                 .iter()
                 .any(|(other, _)| candidate != other && is_ancestor(*candidate, *other, graph))
         })
+        .cloned()
         .collect();
+    heads.sort_unstable_by_key(|(commit_id, _)| *commit_id);
+    resolve_causal_record_heads(key, &heads, adapters)
+}
+
+fn resolve_causal_record_heads(
+    key: &RecordTarget,
+    entries: &[(CommitId, MaterializedRecord)],
+    adapters: &BTreeMap<(CollectionId, SchemaId), RecordAdapter>,
+) -> Result<MaterializedRecord, DbError> {
+    let mut heads: Vec<_> = entries.iter().collect();
     heads.sort_unstable_by_key(|(commit_id, _)| *commit_id);
     let active_version = heads
         .iter()

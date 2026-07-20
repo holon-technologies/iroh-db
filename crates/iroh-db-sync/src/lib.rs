@@ -12,11 +12,11 @@ pub const MAX_CONTROL_FRAME: usize = 1024 * 1024;
 pub const MAX_REFERENCES: usize = 4_096;
 /// Maximum aggregate immutable references accepted during one reconciliation round.
 pub const MAX_SESSION_REFERENCES: usize = 65_536;
-const WIRE_FORMAT_VERSION: u16 = 3;
+const WIRE_FORMAT_VERSION: u16 = 4;
 /// Oldest commit/sync protocol understood by this release.
-pub const MIN_PROTOCOL_VERSION: u16 = 3;
+pub const MIN_PROTOCOL_VERSION: u16 = 4;
 /// Newest commit/sync protocol understood by this release.
-pub const MAX_PROTOCOL_VERSION: u16 = 3;
+pub const MAX_PROTOCOL_VERSION: u16 = 4;
 const GOSSIP_VERSION: u16 = 1;
 /// Maximum encoded gossip announcement size.
 pub const MAX_GOSSIP_HINT: usize = 512;
@@ -174,7 +174,7 @@ pub enum SyncFrame {
         /// Canonical signed [`iroh_db_security::ControlTransition`] bytes.
         transition: Vec<u8>,
     },
-    /// Advertises a bounded local commit frontier or accepted set.
+    /// Advertises the bounded causal frontier used as dependency-discovery roots.
     Frontier {
         /// Canonically sorted unique commit IDs.
         commits: Vec<CommitId>,

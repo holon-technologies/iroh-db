@@ -34,7 +34,7 @@ use n0_future::StreamExt as _;
 use crate::{DbError, IrohDb, Snapshot};
 
 /// The sole iroh-db control-plane ALPN.
-pub const SYNC_ALPN: &[u8] = b"/iroh-db/sync/3";
+pub const SYNC_ALPN: &[u8] = b"/iroh-db/sync/4";
 
 /// Result counters for one complete bidirectional reconciliation round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -515,13 +515,14 @@ impl SyncCore {
             return Err(protocol_error("peer requested an invalid reference set"));
         }
 
-        self.fetch_blobs(blobs_connection, &receive).await?;
-        self.apply_downloaded(peer, &receive).await?;
+        let received = self
+            .fetch_and_apply_closure(blobs_connection, peer, &receive)
+            .await?;
         send_commit_pages(send, FrameKind::Refs, &to_send).await?;
         send_frame(send, &SyncFrame::Done).await?;
         expect_done(recv).await?;
         Ok(SyncReport {
-            received: receive.len(),
+            received,
             sent: to_send.len(),
         })
     }
@@ -596,13 +597,28 @@ impl SyncCore {
         }
     }
 
-    async fn fetch_blobs(
+    async fn fetch_and_apply_closure(
         &self,
         connection: Connection,
-        receive: &[CommitId],
-    ) -> Result<(), DbError> {
+        peer: AuthorId,
+        roots: &[CommitId],
+    ) -> Result<usize, DbError> {
         self.require_local_blob_fetch()?;
-        for commit_id in receive {
+        let mut queued: std::collections::BTreeSet<_> = roots.iter().copied().collect();
+        let mut pending = BTreeMap::<CommitId, CommitEnvelope>::new();
+        while let Some(commit_id) = queued.pop_first() {
+            if self
+                .db
+                .inner
+                .store
+                .contains_commit(self.domain_id(), commit_id)?
+                || pending.contains_key(&commit_id)
+            {
+                continue;
+            }
+            if pending.len() >= MAX_SESSION_REFERENCES {
+                return Err(protocol_error("dependency closure exceeds session budget"));
+            }
             self.db
                 .inner
                 .blobs
@@ -612,8 +628,59 @@ impl SyncCore {
                 )
                 .await
                 .map_err(network_error)?;
+            let bytes = self
+                .read_transferred(
+                    commit_id,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                )
+                .await?;
+            let envelope = CommitEnvelope::decode_canonical(&bytes)?;
+            if envelope.commit_id() != commit_id
+                || envelope.header().domain_id() != self.domain_id()
+            {
+                return Err(protocol_error("transferred commit identity mismatch"));
+            }
+            for dependency in envelope.header().dependencies() {
+                if !self
+                    .db
+                    .inner
+                    .store
+                    .contains_commit(self.domain_id(), *dependency)?
+                    && !pending.contains_key(dependency)
+                {
+                    queued.insert(*dependency);
+                }
+            }
+            pending.insert(commit_id, envelope);
         }
-        Ok(())
+        let mut applied = 0_usize;
+        while !pending.is_empty() {
+            let ready = pending.iter().find_map(|(&commit_id, envelope)| {
+                envelope
+                    .header()
+                    .dependencies()
+                    .iter()
+                    .all(|dependency| {
+                        self.db
+                            .inner
+                            .store
+                            .contains_commit(self.domain_id(), *dependency)
+                            .unwrap_or(false)
+                    })
+                    .then_some(commit_id)
+            });
+            let commit_id = ready.ok_or_else(|| protocol_error("dependency graph is cyclic"))?;
+            let envelope = pending
+                .remove(&commit_id)
+                .expect("selected pending commit exists");
+            if matches!(
+                self.db.accept_remote_commit(peer, envelope).await?,
+                crate::RemoteApply::Applied(_)
+            ) {
+                applied = applied.saturating_add(1);
+            }
+        }
+        Ok(applied)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -784,8 +851,8 @@ impl SyncCore {
         if pushed != need {
             return Err(protocol_error("pushed reference set mismatch"));
         }
-        self.fetch_blobs(blobs_connection, &pushed).await?;
-        self.apply_downloaded(peer, &pushed).await?;
+        self.fetch_and_apply_closure(blobs_connection, peer, &pushed)
+            .await?;
         expect_done(recv).await?;
         send_frame(send, &SyncFrame::Done).await
     }
@@ -1258,7 +1325,7 @@ impl SyncCore {
             self.db
                 .inner
                 .store
-                .list_commit_ids(self.domain_id())
+                .frontier(self.domain_id())
                 .map_err(DbError::from)
         } else {
             self.db
@@ -1273,7 +1340,7 @@ impl SyncCore {
         self.db
             .inner
             .store
-            .list_commit_ids(self.domain_id())
+            .frontier(self.domain_id())
             .map_err(DbError::from)
     }
 
@@ -1283,46 +1350,6 @@ impl SyncCore {
             .domain_key()
             .derive_subkey(self.domain_id().as_bytes(), b"iroh-db/gossip-topic/v1")?;
         Ok(TopicId::from_bytes(*topic))
-    }
-
-    async fn apply_downloaded(
-        &self,
-        peer: AuthorId,
-        commit_ids: &[CommitId],
-    ) -> Result<(), DbError> {
-        let mut pending = BTreeMap::new();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        for commit_id in commit_ids {
-            let bytes = self.read_transferred(*commit_id, deadline).await?;
-            let envelope = CommitEnvelope::decode_canonical(&bytes)?;
-            if envelope.commit_id() != *commit_id {
-                return Err(protocol_error("transferred commit hash mismatch"));
-            }
-            pending.insert(*commit_id, envelope);
-        }
-        while !pending.is_empty() {
-            let ready = pending.iter().find_map(|(&commit_id, envelope)| {
-                envelope
-                    .header()
-                    .dependencies()
-                    .iter()
-                    .all(|dependency| {
-                        self.db
-                            .inner
-                            .store
-                            .contains_commit(self.domain_id(), *dependency)
-                            .unwrap_or(false)
-                            || !pending.contains_key(dependency)
-                    })
-                    .then_some(commit_id)
-            });
-            let commit_id = ready.ok_or_else(|| protocol_error("dependency graph is cyclic"))?;
-            let envelope = pending
-                .remove(&commit_id)
-                .expect("selected pending commit exists");
-            self.db.accept_remote_commit(peer, envelope).await?;
-        }
-        Ok(())
     }
 
     async fn read_transferred(

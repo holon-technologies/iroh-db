@@ -250,6 +250,35 @@ async fn local_put_reissues_causal_metadata_from_the_signed_commit() {
 }
 
 #[tokio::test]
+async fn unrelated_writes_do_not_rescan_immutable_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = IrohDb::open(directory.path()).await.unwrap();
+    let tracks = db.collection::<Track>();
+
+    for sequence in 0..16 {
+        tracks
+            .put(track(
+                &format!("track-{sequence}"),
+                &format!("Title {sequence}"),
+                "Independent",
+            ))
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        db.operational_metrics()
+            .unwrap()
+            .reconciliation_commits_scanned(),
+        0,
+        "incremental reconciliation must not read unrelated commit bodies"
+    );
+
+    drop(tracks);
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn range_order_and_mac_bound_cursor_pagination_are_stable() {
     let directory = tempfile::tempdir().unwrap();
     let db = IrohDb::open(directory.path()).await.unwrap();

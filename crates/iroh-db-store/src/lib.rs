@@ -8,4 +8,4 @@ mod store;
 
 pub use blob::{BlobFuture, BlobStore, BlobStoreError};
 pub use materialized::{IndexValue, MaterializedError, MaterializedRecord, StoredRecord};
-pub use store::{ApplyOutcome, SnapshotBaseline, Store, StoreError};
+pub use store::{ApplyOutcome, RecordHead, RecordHeadSet, SnapshotBaseline, Store, StoreError};

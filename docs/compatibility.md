@@ -10,9 +10,9 @@ The current release is pre-1.0 but its durable and wire formats are explicitly v
   `meta.redb` remain available as rollback evidence. Interrupted candidates
   are discarded and rebuilt from the preserved v5 source. Formats 1 through 4
   remain intentionally unsupported.
-- Sync ALPN: `/iroh-db/sync/3`; hello frames advertise an inclusive supported
+- Sync ALPN: `/iroh-db/sync/4`; hello frames advertise an inclusive supported
   object-protocol range and select the highest overlap. This release supports
-  range `3..=3`; non-overlap fails before authority or commit exchange. Sync v2
+  range `4..=4`; non-overlap fails before authority or commit exchange. Sync v3
   is intentionally incompatible because it cannot fail closed for schema
   activation operations. Frames use strict canonical CBOR.
 - Commit, snapshot, manifest, gossip, authority, invitation, control, key-vault, and backup objects each carry independent versions or magic values.
@@ -54,7 +54,7 @@ The current release is pre-1.0 but its durable and wire formats are explicitly v
 | Valid v5 directory | Shadow-copied, integrity-checked, retained, upgraded to v6 |
 | Interrupted v5→v6 artifacts | Rebuilt from retained v5 metadata |
 | Store formats 1–4 or future unknown | Rejected |
-| Sync/object range overlapping `3..=3` | Highest overlap selected |
+| Sync/object range overlapping `4..=4` | Highest overlap selected |
 | Sync/object range without overlap | Rejected before domain exchange |
 | Snapshot v3 | Accepted after signature, authority, state, and activation validation |
 | Snapshot v1/v2 or future unknown | Rejected |

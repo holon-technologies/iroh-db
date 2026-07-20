@@ -16,9 +16,9 @@ fn hello_has_stable_canonical_bytes() {
     assert_eq!(
         hex::encode(&bytes),
         concat!(
-            "900300f65820",
+            "900400f65820",
             "0000000000000000000000000000000000000000000000000000000000000000",
-            "801a00100000f6f6f6f6f6f680f60303"
+            "801a00100000f6f6f6f6f6f680f60404"
         )
     );
     assert_eq!(SyncFrame::decode_canonical(&bytes).unwrap(), frame);
