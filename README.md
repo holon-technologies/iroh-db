@@ -1,5 +1,9 @@
 # iroh-db
 
+[![CI](https://github.com/holon-technologies/iroh-db/actions/workflows/ci.yml/badge.svg)](https://github.com/holon-technologies/iroh-db/actions/workflows/ci.yml)
+[![Rustdocs](https://img.shields.io/badge/docs-rustdoc-4d76ae)](https://holon-technologies.github.io/iroh-db/iroh_db/)
+[![License: MIT OR Apache--2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 `iroh-db` is a Rust-native, local-first distributed database built as a semantic layer over iroh. Local reads and writes never require a network; immutable encrypted commits synchronize asynchronously over authenticated iroh QUIC and iroh-blobs.
 
 The implemented M0–M5 architecture is documented in [the design specification](docs/superpowers/specs/2026-07-19-iroh-db-design.md), with reproducible evidence in [the milestone gates](docs/milestones).
@@ -76,9 +80,9 @@ See [compatibility policy](docs/compatibility.md) and [security policy](SECURITY
 
 ```console
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo doc --workspace --no-deps
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 cargo bench -p iroh-db-blobs --bench local_stream
 cargo bench -p iroh-db --bench multisource_stream
 ```
@@ -113,7 +117,7 @@ convergence reports. The extended qualification soak accepts an exact duration:
 IROH_DB_SOAK_DURATION_SECS=259200 \
 IROH_DB_SOAK_RESTART_EVERY=97 \
 IROH_DB_SOAK_OPERATION_TIMEOUT_SECS=30 \
-  cargo test -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --nocapture
+  cargo test --locked -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --exact --nocapture
 ```
 
 The monthly/manual `production soak` workflow runs that 72-hour gate on an
@@ -121,6 +125,6 @@ explicitly labelled self-hosted runner and retains its log.
 
 ## License
 
-Licensed under either Apache-2.0 or MIT, at your option.
+Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at your option.
 Reviewed dependency license notices are listed in
 [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).

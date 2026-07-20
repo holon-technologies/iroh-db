@@ -21,6 +21,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: production-soak
+  cancel-in-progress: false
+
 jobs:
   churn:
     # GitHub-hosted jobs cannot run for 72 hours. Qualification runners must
@@ -32,19 +36,19 @@ jobs:
       IROH_DB_SOAK_RESTART_EVERY: ${{ inputs.restart_every || '97' }}
       IROH_DB_SOAK_OPERATION_TIMEOUT_SECS: ${{ inputs.operation_timeout_seconds || '30' }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.91.0"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
       - name: Run exact-duration partition/reconnect/restart soak
         shell: bash
         run: |
           set -o pipefail
-          cargo test -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --nocapture 2>&1 | tee iroh-db-soak.log
+          cargo test --locked -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --exact --nocapture 2>&1 | tee iroh-db-soak.log
       - name: Retain qualification log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: iroh-db-soak-${{ github.run_id }}
           path: iroh-db-soak.log
