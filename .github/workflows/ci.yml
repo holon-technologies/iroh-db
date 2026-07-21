@@ -46,4 +46,5 @@ jobs:
       - run: cargo test --manifest-path fuzz/Cargo.toml --locked
       - run: cargo deny check
       - run: cargo deny --manifest-path fuzz/Cargo.toml check
+      - run: bash scripts/verify-packages.sh
       - run: bash scripts/test-verify-release-ready.sh

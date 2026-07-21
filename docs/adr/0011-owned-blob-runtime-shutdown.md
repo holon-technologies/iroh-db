@@ -19,10 +19,11 @@ no-leak qualification gate.
 ## Decision
 
 `iroh-db` temporarily pins the audited `iroh-blobs` 0.103.0 source commit
-`b202d8ab28e05040360a7ce494e15063b5d47865`. That commit uses Tokio's
+`9bc09dc83ab637ba46ae6d7f4f8ad7825b9b0a26`. That fork history uses Tokio's
 non-blocking runtime shutdown path after the filesystem actor has drained its
-handles and joined its tasks. The change and its upstream regression are under
-review in [iroh-blobs PR #246](https://github.com/n0-computer/iroh-blobs/pull/246).
+handles and joined its tasks, and exposes an explicit redb cache bound. The
+runtime change was proposed in
+[iroh-blobs PR #246](https://github.com/n0-computer/iroh-blobs/pull/246).
 
 `IrohBlobStore::shutdown` drains the filesystem actor, and dropping its final
 owner then invokes the corrected non-blocking runtime shutdown. `IrohDb::close`

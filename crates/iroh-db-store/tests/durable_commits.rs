@@ -62,6 +62,19 @@ impl BlobStore for MemoryBlobs {
 }
 
 #[test]
+fn metadata_store_accepts_an_explicit_cache_bound() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_with_cache_size(
+        directory.path(),
+        Arc::new(MemoryBlobs::default()),
+        8 * 1024 * 1024,
+    )
+    .unwrap();
+
+    drop(store);
+}
+
+#[test]
 fn format_four_is_rejected_instead_of_implicitly_migrated() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("FORMAT"), "iroh-db 4.0\n").unwrap();

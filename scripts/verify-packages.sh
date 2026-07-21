@@ -10,6 +10,9 @@ metadata=$(cargo metadata \
   --manifest-path "$workspace_root/Cargo.toml" \
   --format-version 1 \
   --no-deps)
+resolved_metadata=$(cargo metadata \
+  --manifest-path "$workspace_root/Cargo.toml" \
+  --format-version 1)
 mapfile -t package_specs < <(
   jq -r '(.workspace_members[]) as $member
     | .packages[]
@@ -54,6 +57,34 @@ for package_spec in "${package_specs[@]}"; do
   patch_arguments+=(
     --config
     "patch.crates-io.$package_name.path='${package_directories[$package_name]}'"
+  )
+done
+
+# Cargo normalizes versioned Git dependencies to registry dependencies in a
+# package archive. Compile development artifacts against the exact resolved Git
+# source; verify-release-ready.sh separately keeps publication fail-closed until
+# those dependencies have audited registry releases.
+declare -A git_dependency_directories=()
+while IFS=$'\t' read -r dependency_name dependency_manifest; do
+  [[ -n $dependency_name ]] || continue
+  dependency_directory=$(dirname "$dependency_manifest")
+  if [[ -n ${git_dependency_directories[$dependency_name]:-} \
+    && ${git_dependency_directories[$dependency_name]} != "$dependency_directory" ]]; then
+    echo "cannot patch multiple Git sources named $dependency_name" >&2
+    exit 1
+  fi
+  git_dependency_directories["$dependency_name"]=$dependency_directory
+done < <(
+  jq -r '.packages[]
+    | select(.source != null and (.source | startswith("git+")))
+    | [.name, .manifest_path]
+    | @tsv' <<<"$resolved_metadata" | sort -u
+)
+
+for dependency_name in "${!git_dependency_directories[@]}"; do
+  patch_arguments+=(
+    --config
+    "patch.crates-io.$dependency_name.path='${git_dependency_directories[$dependency_name]}'"
   )
 done
 

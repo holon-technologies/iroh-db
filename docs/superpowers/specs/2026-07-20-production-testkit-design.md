@@ -57,12 +57,16 @@ production soak accepts:
 - `IROH_DB_SOAK_DURATION_SECS` for an exact minimum wall-clock duration;
 - `IROH_DB_SOAK_ROUNDS` as a deterministic bounded alternative;
 - `IROH_DB_SOAK_RESTART_EVERY` to inject periodic durable peer restarts;
+- `IROH_DB_SOAK_RECORD_SLOTS` to bound live records independently of history;
+- `IROH_DB_SOAK_METRICS_PATH` to retain Linux resource samples;
+- `IROH_DB_SOAK_MAX_RSS_ANON_KIB` to fail before anonymous-memory exhaustion;
 - `IROH_DB_SOAK_OPERATION_TIMEOUT_SECS` for each network/lifecycle action.
 
 Duration takes precedence over rounds. The loop records the actual completed
 rounds, elapsed time, sync count, and restart count, then performs a full-mesh
 convergence and verifies identical state roots and the exact application record
-count. The 72-hour release command uses `259200` seconds and retains stdout.
+count. The 72-hour release command uses `259200` seconds, 256 record slots per
+peer, and a 256 MiB anonymous-RSS budget, and retains stdout plus TSV metrics.
 
 ## Failure and Recovery
 

@@ -11,6 +11,14 @@ on:
         description: Completed rounds between durable peer restarts
         required: true
         default: "97"
+      record_slots:
+        description: Bounded live record slots per peer
+        required: true
+        default: "256"
+      max_rss_anon_kib:
+        description: Fail-closed anonymous RSS budget in KiB
+        required: true
+        default: "262144"
       operation_timeout_seconds:
         description: Deadline for each lifecycle or sync operation
         required: true
@@ -34,6 +42,8 @@ jobs:
     env:
       IROH_DB_SOAK_DURATION_SECS: ${{ inputs.duration_seconds || '259200' }}
       IROH_DB_SOAK_RESTART_EVERY: ${{ inputs.restart_every || '97' }}
+      IROH_DB_SOAK_RECORD_SLOTS: ${{ inputs.record_slots || '256' }}
+      IROH_DB_SOAK_MAX_RSS_ANON_KIB: ${{ inputs.max_rss_anon_kib || '262144' }}
       IROH_DB_SOAK_OPERATION_TIMEOUT_SECS: ${{ inputs.operation_timeout_seconds || '30' }}
       IROH_DB_SOAK_METRICS_PATH: iroh-db-soak-metrics.tsv
     steps:

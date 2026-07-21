@@ -19,7 +19,7 @@ hex = "0.4.3"
 hkdf = "0.13.0"
 iroh = "1.0.2"
 iroh-base = { version = "1.0.1", features = ["key"] }
-iroh-blobs = { version = "0.103.0", git = "https://github.com/holon-technologies/iroh-blobs", rev = "b202d8ab28e05040360a7ce494e15063b5d47865", default-features = false, features = ["fs-store"] }
+iroh-blobs = { version = "0.103.0", git = "https://github.com/holon-technologies/iroh-blobs", rev = "9bc09dc83ab637ba46ae6d7f4f8ad7825b9b0a26", default-features = false, features = ["fs-store"] }
 iroh-gossip = "0.101.0"
 iroh-db-blobs = { path = "crates/iroh-db-blobs", version = "0.1.0" }
 iroh-db-core = { path = "crates/iroh-db-core", version = "0.1.0" }

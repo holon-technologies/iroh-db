@@ -106,6 +106,8 @@ Then run from that exact committed tree:
 ```console
 IROH_DB_SOAK_DURATION_SECS=259200 \
 IROH_DB_SOAK_RESTART_EVERY=97 \
+IROH_DB_SOAK_RECORD_SLOTS=256 \
+IROH_DB_SOAK_MAX_RSS_ANON_KIB=262144 \
 IROH_DB_SOAK_OPERATION_TIMEOUT_SECS=30 \
 IROH_DB_SOAK_METRICS_PATH=iroh-db-soak-metrics.tsv \
   cargo test -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --nocapture
@@ -114,9 +116,11 @@ IROH_DB_SOAK_METRICS_PATH=iroh-db-soak-metrics.tsv \
 Only a completed wall-clock run with no divergence, leak, deadlock, timeout, or
 unexpected process exit closes the final gate. Run it on a dedicated Linux host
 without unrelated memory- or I/O-intensive workloads, and retain the TSV
-resource evidence alongside the test log. The metrics capture process RSS,
-thread and descriptor counts plus host available memory and memory-pressure
-stall data every 25 rounds and at a synchronization failure.
+resource evidence alongside the test log. The metrics capture total,
+anonymous, file-backed, and shared process RSS; thread and descriptor counts;
+host available memory; and memory-pressure stall data every 25 rounds and at a
+synchronization failure. Anonymous RSS above the configured 256 MiB budget
+fails the test immediately.
 
 The qualification attempt started on 2026-07-20 was invalidated after 4,744.93
 seconds. It completed 20,000 rounds and 206 durable restarts before a sync
@@ -129,13 +133,36 @@ sampler produced no rows, resource sampling now runs inside the test process
 and the official workflow retains its TSV output. This invalidated attempt is
 not production-readiness evidence and does not reduce the next 72-hour gate.
 
+A second attempt from commit `a431ab2282f58048ed0178aae7a1c873eee6e510`
+was deliberately stopped on 2026-07-21 after 78,450 rounds, 156,900 syncs, and
+808 restarts in approximately 5.87 hours. Total RSS rose from 13,108 KiB to
+4,051,832 KiB at approximately 689,922 KiB/hour while threads and descriptors
+remained stable. The workload also created three permanent record IDs per
+round, so it conflated live-data growth with lifecycle retention. The run is
+invalid and cannot qualify a release.
+
+Focused bounded-keyspace diagnostics identified redb's 1 GiB default userspace
+cache in both the iroh-db metadata store and the iroh-blobs metadata store. A
+three-peer process therefore had six caches able to retain roughly 6 GiB. Both
+owners now default to explicit 8 MiB bounds and expose lower-level cache-size
+overrides. The qualification keyspace is bounded at 256 records per peer and
+telemetry separates anonymous from file-backed RSS. A 2,000-round regression
+completed 4,006 syncs and 64 restarts; after warm-up anonymous RSS stayed
+between 74,220 and 93,768 KiB, ended at 84,608 KiB, and had a negative fitted
+slope over rounds 1,000 through 2,000.
+
 The new telemetry also exposed a separate linear worker retention issue across
 same-process database reopens. Focused tests isolated it to the upstream
 `iroh-blobs` filesystem runtime rather than iroh networking. `iroh-db` pins the
-audited fix commit and carries regressions for database-only, network-only, and
+audited fork commit and carries regressions for database-only, network-only, and
 combined peer restarts; the fix is proposed upstream in
 [iroh-blobs PR #246](https://github.com/n0-computer/iroh-blobs/pull/246). The
 temporary Git source and dependency-policy exception must be removed in favor
 of the first crates.io release containing that fix before publishing
 `iroh-db` crates. The release workflow enforces this by running
 `scripts/verify-release-ready.sh` before any publish dry-run.
+
+Package-archive verification patches Cargo's normalized `iroh-blobs` registry
+dependency back to this exact resolved development source, so it can validate
+the archive contents and current dependency graph. This does not relax the
+release gate: publication remains blocked while any Git dependency is present.
