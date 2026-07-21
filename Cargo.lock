@@ -1692,7 +1692,7 @@ dependencies = [
 [[package]]
 name = "iroh-blobs"
 version = "0.103.0"
-source = "git+https://github.com/holon-technologies/iroh-blobs?rev=b202d8ab28e05040360a7ce494e15063b5d47865#b202d8ab28e05040360a7ce494e15063b5d47865"
+source = "git+https://github.com/holon-technologies/iroh-blobs?rev=9bc09dc83ab637ba46ae6d7f4f8ad7825b9b0a26#9bc09dc83ab637ba46ae6d7f4f8ad7825b9b0a26"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -3825,7 +3825,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

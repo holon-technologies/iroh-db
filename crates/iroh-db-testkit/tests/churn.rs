@@ -21,7 +21,9 @@ struct Note {
     value: Lww<String>,
 }
 
-fn note(peer: usize, round: usize, author: AuthorId) -> Note {
+fn note(peer: usize, round: usize, record_slots: usize, author: AuthorId) -> Note {
+    assert!(record_slots > 0);
+    let slot = round % record_slots;
     let mut value = Lww::new();
     value
         .assign(
@@ -31,18 +33,28 @@ fn note(peer: usize, round: usize, author: AuthorId) -> Note {
         )
         .unwrap();
     Note {
-        id: format!("{peer}-{round}"),
+        id: format!("{peer}-{slot}"),
         value,
     }
+}
+
+#[test]
+fn qualification_record_ids_are_bounded_per_peer() {
+    let author = AuthorId::from_bytes([7; 32]);
+
+    assert_eq!(note(2, 0, 4, author).id, note(2, 4, 4, author).id);
+    assert_ne!(note(1, 0, 4, author).id, note(2, 0, 4, author).id);
 }
 
 #[derive(Debug, Clone)]
 struct RunConfig {
     round_limit: Option<usize>,
     minimum_duration: Option<Duration>,
+    record_slots: usize,
     restart_every: usize,
     operation_timeout: Duration,
     metrics_path: Option<PathBuf>,
+    max_rss_anon_kib: Option<u64>,
 }
 
 #[tokio::test]
@@ -50,9 +62,11 @@ async fn repeated_partition_reconnect_schedule_converges() {
     run_schedule(RunConfig {
         round_limit: Some(8),
         minimum_duration: None,
+        record_slots: 4,
         restart_every: 4,
         operation_timeout: Duration::from_secs(10),
         metrics_path: None,
+        max_rss_anon_kib: None,
     })
     .await;
 }
@@ -75,18 +89,28 @@ async fn extended_partition_reconnect_soak() {
     let restart_every = positive_env_usize("IROH_DB_SOAK_RESTART_EVERY")
         .unwrap()
         .unwrap_or(97);
+    let record_slots = positive_env_usize("IROH_DB_SOAK_RECORD_SLOTS")
+        .unwrap()
+        .unwrap_or(256);
     let operation_timeout = Duration::from_secs(
         positive_env_u64("IROH_DB_SOAK_OPERATION_TIMEOUT_SECS")
             .unwrap()
             .unwrap_or(10),
     );
     let metrics_path = std::env::var_os("IROH_DB_SOAK_METRICS_PATH").map(PathBuf::from);
+    let max_rss_anon_kib = metrics_path.as_ref().map(|_| {
+        positive_env_u64("IROH_DB_SOAK_MAX_RSS_ANON_KIB")
+            .unwrap()
+            .unwrap_or(256 * 1024)
+    });
     run_schedule(RunConfig {
         round_limit,
         minimum_duration,
+        record_slots,
         restart_every,
         operation_timeout,
         metrics_path,
+        max_rss_anon_kib,
     })
     .await;
 }
@@ -94,6 +118,7 @@ async fn extended_partition_reconnect_soak() {
 #[allow(clippy::too_many_lines)]
 async fn run_schedule(config: RunConfig) {
     assert!(config.round_limit.is_some() || config.minimum_duration.is_some());
+    assert!(config.record_slots > 0);
     assert!(config.restart_every > 0);
     let started = Instant::now();
     if let Some(path) = &config.metrics_path {
@@ -128,7 +153,12 @@ async fn run_schedule(config: RunConfig) {
             let database = cluster.peer(peer).unwrap();
             database
                 .collection::<Note>()
-                .put(note(peer, rounds, database.author_id()))
+                .put(note(
+                    peer,
+                    rounds,
+                    config.record_slots,
+                    database.author_id(),
+                ))
                 .await
                 .unwrap();
         }
@@ -161,7 +191,11 @@ async fn run_schedule(config: RunConfig) {
         }
         if rounds.is_multiple_of(25) {
             if let Some(path) = &config.metrics_path {
-                append_resource_metrics(path, started, rounds).unwrap();
+                let sample = append_resource_metrics(path, started, rounds).unwrap();
+                if let Some(max_rss_anon_kib) = config.max_rss_anon_kib {
+                    enforce_anonymous_memory_budget(sample, max_rss_anon_kib)
+                        .unwrap_or_else(|error| panic!("soak round {rounds}: {error}"));
+                }
             }
             println!(
                 "iroh-db soak progress: rounds={rounds} elapsed_secs={:.3} last_round_secs={:.3} writes_secs={:.3} sync_secs={:.3} syncs={syncs} restarts={restarts}",
@@ -186,7 +220,7 @@ async fn run_schedule(config: RunConfig) {
             .await
             .unwrap()
             .len(),
-        rounds * 3
+        rounds.min(config.record_slots) * 3
     );
     println!(
         "iroh-db soak: rounds={rounds} elapsed_secs={:.3} syncs={syncs} restarts={restarts} state_root={}",
@@ -194,7 +228,11 @@ async fn run_schedule(config: RunConfig) {
         hex(&convergence.state_root())
     );
     if let Some(path) = &config.metrics_path {
-        append_resource_metrics(path, started, rounds).unwrap();
+        let sample = append_resource_metrics(path, started, rounds).unwrap();
+        if let Some(max_rss_anon_kib) = config.max_rss_anon_kib {
+            enforce_anonymous_memory_budget(sample, max_rss_anon_kib)
+                .unwrap_or_else(|error| panic!("soak final sample: {error}"));
+        }
     }
     cluster.shutdown().await.unwrap();
 }
@@ -235,10 +273,20 @@ fn qualification_inputs_reject_zero_and_malformed_values() {
 
 #[test]
 fn qualification_resource_samples_parse_linux_process_status() {
-    let status = "Name:\tiroh-db\nVmRSS:\t  24700 kB\nThreads:\t13\n";
+    let status = concat!(
+        "Name:\tiroh-db\n",
+        "VmRSS:\t  24700 kB\n",
+        "RssAnon:\t  4700 kB\n",
+        "RssFile:\t  19000 kB\n",
+        "RssShmem:\t  1000 kB\n",
+        "Threads:\t13\n",
+    );
     let sample = parse_linux_process_status(status).unwrap();
 
     assert_eq!(sample.rss_kib, 24_700);
+    assert_eq!(sample.rss_anon_kib, 4_700);
+    assert_eq!(sample.rss_file_kib, 19_000);
+    assert_eq!(sample.rss_shmem_kib, 1_000);
     assert_eq!(sample.threads, 13);
 }
 
@@ -246,6 +294,20 @@ fn qualification_resource_samples_parse_linux_process_status() {
 fn qualification_resource_samples_reject_incomplete_process_status() {
     assert!(parse_linux_process_status("Name:\tiroh-db\nThreads:\t3\n").is_err());
     assert!(parse_linux_process_status("Name:\tiroh-db\nVmRSS:\t100 kB\n").is_err());
+}
+
+#[test]
+fn qualification_rejects_anonymous_memory_budget_breaches() {
+    let sample = ProcessResourceSample {
+        rss_kib: 100_000,
+        rss_anon_kib: 70_000,
+        rss_file_kib: 30_000,
+        rss_shmem_kib: 0,
+        threads: 14,
+    };
+
+    assert!(enforce_anonymous_memory_budget(sample, 70_000).is_ok());
+    assert!(enforce_anonymous_memory_budget(sample, 69_999).is_err());
 }
 
 #[cfg(target_os = "linux")]
@@ -261,9 +323,9 @@ fn qualification_resource_metrics_are_durable_tsv() {
     let contents = fs::read_to_string(path).unwrap();
     let lines: Vec<_> = contents.lines().collect();
     assert_eq!(lines.len(), 3);
-    assert_eq!(lines[0].split('\t').count(), 7);
-    assert_eq!(lines[1].split('\t').count(), 7);
-    assert_eq!(lines[2].split('\t').count(), 7);
+    assert_eq!(lines[0].split('\t').count(), 10);
+    assert_eq!(lines[1].split('\t').count(), 10);
+    assert_eq!(lines[2].split('\t').count(), 10);
     assert_eq!(lines[2].split('\t').nth(1), Some("25"));
 }
 
@@ -278,15 +340,36 @@ fn qualification_resource_metrics_parse_host_pressure() {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProcessResourceSample {
     rss_kib: u64,
+    rss_anon_kib: u64,
+    rss_file_kib: u64,
+    rss_shmem_kib: u64,
     threads: u64,
 }
 
 fn parse_linux_process_status(status: &str) -> Result<ProcessResourceSample, String> {
     let mut rss_kib = None;
+    let mut rss_anon_kib = None;
+    let mut rss_file_kib = None;
+    let mut rss_shmem_kib = None;
     let mut threads = None;
     for line in status.lines() {
         if let Some(value) = line.strip_prefix("VmRSS:") {
             rss_kib = value
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse().ok());
+        } else if let Some(value) = line.strip_prefix("RssAnon:") {
+            rss_anon_kib = value
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse().ok());
+        } else if let Some(value) = line.strip_prefix("RssFile:") {
+            rss_file_kib = value
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse().ok());
+        } else if let Some(value) = line.strip_prefix("RssShmem:") {
+            rss_shmem_kib = value
                 .split_whitespace()
                 .next()
                 .and_then(|value| value.parse().ok());
@@ -296,8 +379,25 @@ fn parse_linux_process_status(status: &str) -> Result<ProcessResourceSample, Str
     }
     Ok(ProcessResourceSample {
         rss_kib: rss_kib.ok_or_else(|| "process status is missing VmRSS".to_owned())?,
+        rss_anon_kib: rss_anon_kib.ok_or_else(|| "process status is missing RssAnon".to_owned())?,
+        rss_file_kib: rss_file_kib.ok_or_else(|| "process status is missing RssFile".to_owned())?,
+        rss_shmem_kib: rss_shmem_kib
+            .ok_or_else(|| "process status is missing RssShmem".to_owned())?,
         threads: threads.ok_or_else(|| "process status is missing Threads".to_owned())?,
     })
+}
+
+fn enforce_anonymous_memory_budget(
+    sample: ProcessResourceSample,
+    max_rss_anon_kib: u64,
+) -> Result<(), String> {
+    if sample.rss_anon_kib > max_rss_anon_kib {
+        return Err(format!(
+            "anonymous RSS {} KiB exceeds qualification budget {max_rss_anon_kib} KiB",
+            sample.rss_anon_kib
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -310,15 +410,19 @@ fn initialize_resource_metrics(path: &Path, started: Instant) -> Result<(), Stri
         .map_err(|error| format!("create soak metrics file: {error}"))?;
     writeln!(
         file,
-        "elapsed_secs\trounds\trss_kib\tthreads\topen_fds\thost_mem_available_kib\tmemory_pressure_avg10"
+        "elapsed_secs\trounds\trss_kib\trss_anon_kib\trss_file_kib\trss_shmem_kib\tthreads\topen_fds\thost_mem_available_kib\tmemory_pressure_avg10"
     )
     .map_err(|error| format!("write soak metrics header: {error}"))?;
     drop(file);
-    append_resource_metrics(path, started, 0)
+    append_resource_metrics(path, started, 0).map(drop)
 }
 
 #[cfg(target_os = "linux")]
-fn append_resource_metrics(path: &Path, started: Instant, rounds: usize) -> Result<(), String> {
+fn append_resource_metrics(
+    path: &Path,
+    started: Instant,
+    rounds: usize,
+) -> Result<ProcessResourceSample, String> {
     let process = fs::read_to_string("/proc/self/status")
         .map_err(|error| format!("read process status: {error}"))
         .and_then(|status| parse_linux_process_status(&status))?;
@@ -337,12 +441,16 @@ fn append_resource_metrics(path: &Path, started: Instant, rounds: usize) -> Resu
         .map_err(|error| format!("open soak metrics file: {error}"))?;
     writeln!(
         file,
-        "{:.3}\t{rounds}\t{}\t{}\t{open_fds}\t{host_mem_available_kib}\t{memory_pressure_avg10:.2}",
+        "{:.3}\t{rounds}\t{}\t{}\t{}\t{}\t{}\t{open_fds}\t{host_mem_available_kib}\t{memory_pressure_avg10:.2}",
         started.elapsed().as_secs_f64(),
         process.rss_kib,
+        process.rss_anon_kib,
+        process.rss_file_kib,
+        process.rss_shmem_kib,
         process.threads,
     )
-    .map_err(|error| format!("append soak metrics sample: {error}"))
+    .map_err(|error| format!("append soak metrics sample: {error}"))?;
+    Ok(process)
 }
 
 #[cfg(target_os = "linux")]
@@ -376,7 +484,11 @@ fn initialize_resource_metrics(_path: &Path, _started: Instant) -> Result<(), St
 }
 
 #[cfg(not(target_os = "linux"))]
-fn append_resource_metrics(_path: &Path, _started: Instant, _rounds: usize) -> Result<(), String> {
+fn append_resource_metrics(
+    _path: &Path,
+    _started: Instant,
+    _rounds: usize,
+) -> Result<ProcessResourceSample, String> {
     Err("soak resource metrics require Linux /proc".to_owned())
 }
 

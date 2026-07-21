@@ -1648,7 +1648,7 @@ dependencies = [
 [[package]]
 name = "iroh-blobs"
 version = "0.103.0"
-source = "git+https://github.com/holon-technologies/iroh-blobs?rev=b202d8ab28e05040360a7ce494e15063b5d47865#b202d8ab28e05040360a7ce494e15063b5d47865"
+source = "git+https://github.com/holon-technologies/iroh-blobs?rev=9bc09dc83ab637ba46ae6d7f4f8ad7825b9b0a26#9bc09dc83ab637ba46ae6d7f4f8ad7825b9b0a26"
 dependencies = [
  "arrayvec",
  "bao-tree",

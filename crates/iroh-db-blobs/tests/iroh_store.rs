@@ -29,6 +29,17 @@ async fn iroh_blob_store_is_content_addressed_and_reopenable() {
 }
 
 #[tokio::test]
+async fn iroh_blob_store_accepts_an_explicit_metadata_cache_bound() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = IrohBlobStore::load_with_cache_size(directory.path(), 8 * 1024 * 1024)
+        .await
+        .unwrap();
+
+    store.put(b"bounded cache".to_vec()).await.unwrap();
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn metadata_and_real_commit_blob_survive_a_clean_restart() {
     let directory = tempfile::tempdir().unwrap();
     let blobs_path = directory.path().join("blobs");

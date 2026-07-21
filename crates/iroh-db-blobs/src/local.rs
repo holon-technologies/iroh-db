@@ -6,6 +6,9 @@ use iroh_db_core::BlobHash;
 use iroh_db_store::{BlobFuture, BlobStore, BlobStoreError};
 use tokio::io::AsyncReadExt;
 
+/// Default upper bound for the iroh-blobs metadata userspace page cache.
+pub const DEFAULT_METADATA_CACHE_SIZE: usize = 8 * 1024 * 1024;
+
 /// Non-owning iroh-blobs provider handler that leaves the shared local store running on shutdown.
 #[derive(Debug, Clone)]
 pub struct BlobProtocol {
@@ -43,7 +46,18 @@ pub(crate) struct TransferStats {
 impl IrohBlobStore {
     /// Opens or creates an iroh-blobs filesystem store at `root`.
     pub async fn load(root: impl AsRef<Path>) -> Result<Self, BlobStoreError> {
-        let inner = FsStore::load(root)
+        Self::load_with_cache_size(root, DEFAULT_METADATA_CACHE_SIZE).await
+    }
+
+    /// Opens an iroh-blobs filesystem store with an explicit metadata cache bound.
+    pub async fn load_with_cache_size(
+        root: impl AsRef<Path>,
+        cache_size: usize,
+    ) -> Result<Self, BlobStoreError> {
+        let root = root.as_ref();
+        let mut options = iroh_blobs::store::fs::options::Options::new(root);
+        options.redb_cache_size = cache_size;
+        let inner = FsStore::load_with_opts(root.join("blobs.db"), options)
             .await
             .map_err(|error| BlobStoreError::new(error.to_string()))?;
         Ok(Self { inner })

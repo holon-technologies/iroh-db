@@ -19,6 +19,9 @@ use redb::{Database, ReadableDatabase as _, ReadableTable as _, TableDefinition}
 
 use crate::{BlobStore, BlobStoreError, IndexValue, MaterializedRecord, StoredRecord};
 
+/// Default upper bound for the metadata redb userspace page cache.
+pub const DEFAULT_METADATA_CACHE_SIZE: usize = 8 * 1024 * 1024;
+
 const FORMAT_V5: &str = "iroh-db 5.0\n";
 const FORMAT_CONTENTS: &str = "iroh-db 6.0\n";
 const SNAPSHOT_BASELINE_VERSION: u16 = 1;
@@ -442,6 +445,15 @@ struct StoreInner {
 impl Store {
     /// Opens or creates a local store directory and acquires its writer lock.
     pub fn open(root: impl AsRef<Path>, blobs: Arc<dyn BlobStore>) -> Result<Self, StoreError> {
+        Self::open_with_cache_size(root, blobs, DEFAULT_METADATA_CACHE_SIZE)
+    }
+
+    /// Opens a local store with an explicit redb userspace page-cache bound.
+    pub fn open_with_cache_size(
+        root: impl AsRef<Path>,
+        blobs: Arc<dyn BlobStore>,
+        cache_size: usize,
+    ) -> Result<Self, StoreError> {
         let root = root.as_ref();
         std::fs::create_dir_all(root).map_err(io_error)?;
         std::fs::create_dir_all(root.join("locks")).map_err(io_error)?;
@@ -459,7 +471,11 @@ impl Store {
 
         prepare_store_format(root)?;
 
-        let database = Database::create(root.join("meta-v6.redb")).map_err(database_error)?;
+        let mut builder = Database::builder();
+        builder.set_cache_size(cache_size);
+        let database = builder
+            .create(root.join("meta-v6.redb"))
+            .map_err(database_error)?;
         initialize_tables(&database)?;
         Ok(Self {
             inner: Arc::new(StoreInner {
