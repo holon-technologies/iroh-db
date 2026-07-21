@@ -1,4 +1,9 @@
-use std::time::{Duration, Instant};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write as _,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use iroh_db::{AuthorId, Dot, IrohRecord, Lww, VersionVector};
 use iroh_db_testkit::{TestCluster, rotating_partition};
@@ -27,12 +32,13 @@ fn note(peer: usize, round: usize, author: AuthorId) -> Note {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RunConfig {
     round_limit: Option<usize>,
     minimum_duration: Option<Duration>,
     restart_every: usize,
     operation_timeout: Duration,
+    metrics_path: Option<PathBuf>,
 }
 
 #[tokio::test]
@@ -42,6 +48,7 @@ async fn repeated_partition_reconnect_schedule_converges() {
         minimum_duration: None,
         restart_every: 4,
         operation_timeout: Duration::from_secs(10),
+        metrics_path: None,
     })
     .await;
 }
@@ -69,11 +76,13 @@ async fn extended_partition_reconnect_soak() {
             .unwrap()
             .unwrap_or(10),
     );
+    let metrics_path = std::env::var_os("IROH_DB_SOAK_METRICS_PATH").map(PathBuf::from);
     run_schedule(RunConfig {
         round_limit,
         minimum_duration,
         restart_every,
         operation_timeout,
+        metrics_path,
     })
     .await;
 }
@@ -83,6 +92,9 @@ async fn run_schedule(config: RunConfig) {
     assert!(config.round_limit.is_some() || config.minimum_duration.is_some());
     assert!(config.restart_every > 0);
     let started = Instant::now();
+    if let Some(path) = &config.metrics_path {
+        initialize_resource_metrics(path, started).unwrap();
+    }
     let mut cluster = TestCluster::builder(3)
         .operation_timeout(config.operation_timeout)
         .build()
@@ -119,15 +131,21 @@ async fn run_schedule(config: RunConfig) {
         let writes_elapsed = writes_started.elapsed();
         let schedule = rotating_partition(rounds, cluster.len()).unwrap();
         let sync_started = Instant::now();
-        let report = cluster
-            .apply_schedule(&schedule)
-            .await
-            .unwrap_or_else(|error| {
+        let report = match cluster.apply_schedule(&schedule).await {
+            Ok(report) => report,
+            Err(error) => {
+                let metrics_error = config
+                    .metrics_path
+                    .as_ref()
+                    .and_then(|path| append_resource_metrics(path, started, rounds).err());
                 panic!(
-                    "soak round {rounds} failed after {:.3}s with schedule {schedule:?}: {error}",
-                    round_started.elapsed().as_secs_f64()
+                    "soak round {rounds} failed after {:.3}s (writes {:.3}s, sync {:.3}s) with schedule {schedule:?}: {error}; metrics_error={metrics_error:?}",
+                    round_started.elapsed().as_secs_f64(),
+                    writes_elapsed.as_secs_f64(),
+                    sync_started.elapsed().as_secs_f64(),
                 )
-            });
+            }
+        };
         let sync_elapsed = sync_started.elapsed();
         syncs += report.syncs();
         rounds += 1;
@@ -138,6 +156,9 @@ async fn run_schedule(config: RunConfig) {
             restarts += 1;
         }
         if rounds.is_multiple_of(25) {
+            if let Some(path) = &config.metrics_path {
+                append_resource_metrics(path, started, rounds).unwrap();
+            }
             println!(
                 "iroh-db soak progress: rounds={rounds} elapsed_secs={:.3} last_round_secs={:.3} writes_secs={:.3} sync_secs={:.3} syncs={syncs} restarts={restarts}",
                 started.elapsed().as_secs_f64(),
@@ -168,6 +189,9 @@ async fn run_schedule(config: RunConfig) {
         started.elapsed().as_secs_f64(),
         hex(&convergence.state_root())
     );
+    if let Some(path) = &config.metrics_path {
+        append_resource_metrics(path, started, rounds).unwrap();
+    }
     cluster.shutdown().await.unwrap();
 }
 
@@ -203,6 +227,153 @@ fn qualification_inputs_reject_zero_and_malformed_values() {
     );
     assert!(parse_positive_u64("TEST", Some("0".into())).is_err());
     assert!(parse_positive_u64("TEST", Some("nope".into())).is_err());
+}
+
+#[test]
+fn qualification_resource_samples_parse_linux_process_status() {
+    let status = "Name:\tiroh-db\nVmRSS:\t  24700 kB\nThreads:\t13\n";
+    let sample = parse_linux_process_status(status).unwrap();
+
+    assert_eq!(sample.rss_kib, 24_700);
+    assert_eq!(sample.threads, 13);
+}
+
+#[test]
+fn qualification_resource_samples_reject_incomplete_process_status() {
+    assert!(parse_linux_process_status("Name:\tiroh-db\nThreads:\t3\n").is_err());
+    assert!(parse_linux_process_status("Name:\tiroh-db\nVmRSS:\t100 kB\n").is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qualification_resource_metrics_are_durable_tsv() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("metrics.tsv");
+    let started = Instant::now();
+
+    initialize_resource_metrics(&path, started).unwrap();
+    append_resource_metrics(&path, started, 25).unwrap();
+
+    let contents = fs::read_to_string(path).unwrap();
+    let lines: Vec<_> = contents.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0].split('\t').count(), 7);
+    assert_eq!(lines[1].split('\t').count(), 7);
+    assert_eq!(lines[2].split('\t').count(), 7);
+    assert_eq!(lines[2].split('\t').nth(1), Some("25"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qualification_resource_metrics_parse_host_pressure() {
+    let pressure = "some avg10=1.25 avg60=0.30 avg300=0.10 total=42\nfull avg10=0.00";
+    assert!((parse_linux_pressure_avg10(pressure).unwrap() - 1.25).abs() < f64::EPSILON);
+    assert!(parse_linux_pressure_avg10("full avg10=1.00").is_err());
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessResourceSample {
+    rss_kib: u64,
+    threads: u64,
+}
+
+fn parse_linux_process_status(status: &str) -> Result<ProcessResourceSample, String> {
+    let mut rss_kib = None;
+    let mut threads = None;
+    for line in status.lines() {
+        if let Some(value) = line.strip_prefix("VmRSS:") {
+            rss_kib = value
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse().ok());
+        } else if let Some(value) = line.strip_prefix("Threads:") {
+            threads = value.trim().parse().ok();
+        }
+    }
+    Ok(ProcessResourceSample {
+        rss_kib: rss_kib.ok_or_else(|| "process status is missing VmRSS".to_owned())?,
+        threads: threads.ok_or_else(|| "process status is missing Threads".to_owned())?,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn initialize_resource_metrics(path: &Path, started: Instant) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("create soak metrics file: {error}"))?;
+    writeln!(
+        file,
+        "elapsed_secs\trounds\trss_kib\tthreads\topen_fds\thost_mem_available_kib\tmemory_pressure_avg10"
+    )
+    .map_err(|error| format!("write soak metrics header: {error}"))?;
+    drop(file);
+    append_resource_metrics(path, started, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn append_resource_metrics(path: &Path, started: Instant, rounds: usize) -> Result<(), String> {
+    let process = fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("read process status: {error}"))
+        .and_then(|status| parse_linux_process_status(&status))?;
+    let open_fds = fs::read_dir("/proc/self/fd")
+        .map_err(|error| format!("read process file descriptors: {error}"))?
+        .count();
+    let meminfo = fs::read_to_string("/proc/meminfo")
+        .map_err(|error| format!("read host memory information: {error}"))?;
+    let host_mem_available_kib = parse_linux_key_value(&meminfo, "MemAvailable:")?;
+    let pressure = fs::read_to_string("/proc/pressure/memory")
+        .map_err(|error| format!("read host memory pressure: {error}"))?;
+    let memory_pressure_avg10 = parse_linux_pressure_avg10(&pressure)?;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("open soak metrics file: {error}"))?;
+    writeln!(
+        file,
+        "{:.3}\t{rounds}\t{}\t{}\t{open_fds}\t{host_mem_available_kib}\t{memory_pressure_avg10:.2}",
+        started.elapsed().as_secs_f64(),
+        process.rss_kib,
+        process.threads,
+    )
+    .map_err(|error| format!("append soak metrics sample: {error}"))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_key_value(contents: &str, key: &str) -> Result<u64, String> {
+    contents
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(key)
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse().ok())
+        })
+        .ok_or_else(|| format!("host metrics are missing {key}"))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_pressure_avg10(contents: &str) -> Result<f64, String> {
+    contents
+        .lines()
+        .find(|line| line.starts_with("some "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("avg10="))
+        })
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| "host metrics are missing memory pressure avg10".to_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn initialize_resource_metrics(_path: &Path, _started: Instant) -> Result<(), String> {
+    Err("soak resource metrics require Linux /proc".to_owned())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn append_resource_metrics(_path: &Path, _started: Instant, _rounds: usize) -> Result<(), String> {
+    Err("soak resource metrics require Linux /proc".to_owned())
 }
 
 fn positive_env_usize(name: &str) -> Result<Option<usize>, String> {

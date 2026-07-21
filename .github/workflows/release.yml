@@ -36,6 +36,7 @@ jobs:
       - run: cargo deny check
       - run: cargo deny --manifest-path fuzz/Cargo.toml check
       - run: bash scripts/verify-packages.sh
+      - run: bash scripts/verify-release-ready.sh
       # Cargo cannot verify mutually unpublished workspace tarballs without a
       # registry; the extracted archives are compiled by the preceding step.
       - run: cargo publish --workspace --dry-run --no-verify --locked

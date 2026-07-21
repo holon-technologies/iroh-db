@@ -95,6 +95,7 @@ cargo test --manifest-path fuzz/Cargo.toml
 cargo deny check
 cargo deny --manifest-path fuzz/Cargo.toml check
 bash scripts/verify-packages.sh
+bash scripts/verify-release-ready.sh
 cargo publish --workspace --dry-run --no-verify
 cargo bench -p iroh-db-blobs --bench local_stream
 cargo bench -p iroh-db --bench multisource_stream
@@ -106,8 +107,35 @@ Then run from that exact committed tree:
 IROH_DB_SOAK_DURATION_SECS=259200 \
 IROH_DB_SOAK_RESTART_EVERY=97 \
 IROH_DB_SOAK_OPERATION_TIMEOUT_SECS=30 \
+IROH_DB_SOAK_METRICS_PATH=iroh-db-soak-metrics.tsv \
   cargo test -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --nocapture
 ```
 
 Only a completed wall-clock run with no divergence, leak, deadlock, timeout, or
-unexpected process exit closes the final gate.
+unexpected process exit closes the final gate. Run it on a dedicated Linux host
+without unrelated memory- or I/O-intensive workloads, and retain the TSV
+resource evidence alongside the test log. The metrics capture process RSS,
+thread and descriptor counts plus host available memory and memory-pressure
+stall data every 25 rounds and at a synchronization failure.
+
+The qualification attempt started on 2026-07-20 was invalidated after 4,744.93
+seconds. It completed 20,000 rounds and 206 durable restarts before a sync
+operation timed out during simultaneous host-wide memory pressure. At the same
+timestamp, systemd-journald reported memory-pressure cache flushes, multiple
+Docker health checks and container-runtime operations timed out, and an
+unrelated rejected user service was in a three-second restart loop. That
+service was stopped before rerunning qualification. Because the external
+sampler produced no rows, resource sampling now runs inside the test process
+and the official workflow retains its TSV output. This invalidated attempt is
+not production-readiness evidence and does not reduce the next 72-hour gate.
+
+The new telemetry also exposed a separate linear worker retention issue across
+same-process database reopens. Focused tests isolated it to the upstream
+`iroh-blobs` filesystem runtime rather than iroh networking. `iroh-db` pins the
+audited fix commit and carries regressions for database-only, network-only, and
+combined peer restarts; the fix is proposed upstream in
+[iroh-blobs PR #246](https://github.com/n0-computer/iroh-blobs/pull/246). The
+temporary Git source and dependency-policy exception must be removed in favor
+of the first crates.io release containing that fix before publishing
+`iroh-db` crates. The release workflow enforces this by running
+`scripts/verify-release-ready.sh` before any publish dry-run.

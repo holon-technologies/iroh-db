@@ -43,3 +43,8 @@ wildcards = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+allow-git = [
+  # Temporary audited fix for FsStore runtime workers retained after shutdown.
+  # Upstream: https://github.com/n0-computer/iroh-blobs/pull/246
+  "https://github.com/holon-technologies/iroh-blobs",
+]
