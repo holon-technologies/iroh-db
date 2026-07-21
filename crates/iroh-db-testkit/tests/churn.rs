@@ -1,8 +1,12 @@
 use std::{
-    fs::{self, OpenOptions},
-    io::Write as _,
     path::{Path, PathBuf},
     time::{Duration, Instant},
+};
+
+#[cfg(target_os = "linux")]
+use std::{
+    fs::{self, OpenOptions},
+    io::Write as _,
 };
 
 use iroh_db::{AuthorId, Dot, IrohRecord, Lww, VersionVector};

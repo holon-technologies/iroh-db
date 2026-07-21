@@ -8,13 +8,19 @@ metadata=$(cargo metadata \
   --format-version 1 \
   --no-deps)
 
-mapfile -t git_dependencies < <(
-  jq -r '.packages[]
+if ! git_dependency_lines=$(jq -r '.packages[]
     | .name as $package
     | .dependencies[]
     | select(.source != null and (.source | startswith("git+")))
-    | "\($package): \(.name) \(.req) from \(.source)"' <<<"$metadata" | sort -u
-)
+    | "\($package): \(.name) \(.req) from \(.source)"' <<<"$metadata" | sort -u); then
+  echo "release blocked: failed to inspect dependency sources" >&2
+  exit 1
+fi
+
+git_dependencies=()
+if [[ -n $git_dependency_lines ]]; then
+  mapfile -t git_dependencies <<<"$git_dependency_lines"
+fi
 
 if [[ ${#git_dependencies[@]} -ne 0 ]]; then
   echo "release blocked: Cargo replaces versioned Git dependencies with their registry versions when publishing" >&2
