@@ -118,6 +118,7 @@ IROH_DB_SOAK_DURATION_SECS=259200 \
 IROH_DB_SOAK_RESTART_EVERY=97 \
 IROH_DB_SOAK_RECORD_SLOTS=256 \
 IROH_DB_SOAK_MAX_RSS_ANON_KIB=262144 \
+IROH_DB_SOAK_MIN_ROUND_MILLIS=1000 \
 IROH_DB_SOAK_OPERATION_TIMEOUT_SECS=30 \
 IROH_DB_SOAK_METRICS_PATH=iroh-db-soak-metrics.tsv \
   cargo test --locked -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --exact --nocapture
@@ -127,7 +128,9 @@ The monthly/manual `production soak` workflow runs that 72-hour gate on an
 explicitly labelled self-hosted runner and retains both its log and Linux
 process/host resource metrics. The live record keyspace is bounded so the run
 measures lifecycle retention separately from intentional database growth, and
-the test aborts if anonymous RSS exceeds its 256 MiB qualification budget.
+the test aborts if anonymous RSS exceeds its 256 MiB qualification budget. The
+official one-second cadence still exercises roughly 259,000 rounds over 72
+hours while bounding commit-log disk growth on the dedicated runner.
 
 ## License
 

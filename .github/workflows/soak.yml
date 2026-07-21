@@ -19,6 +19,10 @@ on:
         description: Fail-closed anonymous RSS budget in KiB
         required: true
         default: "262144"
+      min_round_millis:
+        description: Minimum duration of each qualification round
+        required: true
+        default: "1000"
       operation_timeout_seconds:
         description: Deadline for each lifecycle or sync operation
         required: true
@@ -44,6 +48,7 @@ jobs:
       IROH_DB_SOAK_RESTART_EVERY: ${{ inputs.restart_every || '97' }}
       IROH_DB_SOAK_RECORD_SLOTS: ${{ inputs.record_slots || '256' }}
       IROH_DB_SOAK_MAX_RSS_ANON_KIB: ${{ inputs.max_rss_anon_kib || '262144' }}
+      IROH_DB_SOAK_MIN_ROUND_MILLIS: ${{ inputs.min_round_millis || '1000' }}
       IROH_DB_SOAK_OPERATION_TIMEOUT_SECS: ${{ inputs.operation_timeout_seconds || '30' }}
       IROH_DB_SOAK_METRICS_PATH: iroh-db-soak-metrics.tsv
     steps:

@@ -28,6 +28,10 @@ immutable commit history continues to grow normally. Linux telemetry records
 anonymous, file-backed, and shared RSS separately. With metrics enabled, the
 soak defaults to a fail-closed 256 MiB anonymous-RSS limit.
 
+The official qualification cadence is at most one completed round per second.
+This still produces approximately 259,000 rounds and thousands of durable peer
+restarts in 72 hours, while making immutable-history disk demand predictable.
+
 ## Consequences
 
 A normal embedded iroh-db instance has 16 MiB of configured userspace metadata

@@ -52,6 +52,7 @@ struct RunConfig {
     minimum_duration: Option<Duration>,
     record_slots: usize,
     restart_every: usize,
+    minimum_round_duration: Duration,
     operation_timeout: Duration,
     metrics_path: Option<PathBuf>,
     max_rss_anon_kib: Option<u64>,
@@ -64,6 +65,7 @@ async fn repeated_partition_reconnect_schedule_converges() {
         minimum_duration: None,
         record_slots: 4,
         restart_every: 4,
+        minimum_round_duration: Duration::ZERO,
         operation_timeout: Duration::from_secs(10),
         metrics_path: None,
         max_rss_anon_kib: None,
@@ -92,6 +94,11 @@ async fn extended_partition_reconnect_soak() {
     let record_slots = positive_env_usize("IROH_DB_SOAK_RECORD_SLOTS")
         .unwrap()
         .unwrap_or(256);
+    let minimum_round_duration = Duration::from_millis(
+        positive_env_u64("IROH_DB_SOAK_MIN_ROUND_MILLIS")
+            .unwrap()
+            .unwrap_or(0),
+    );
     let operation_timeout = Duration::from_secs(
         positive_env_u64("IROH_DB_SOAK_OPERATION_TIMEOUT_SECS")
             .unwrap()
@@ -108,6 +115,7 @@ async fn extended_partition_reconnect_soak() {
         minimum_duration,
         record_slots,
         restart_every,
+        minimum_round_duration,
         operation_timeout,
         metrics_path,
         max_rss_anon_kib,
@@ -189,6 +197,11 @@ async fn run_schedule(config: RunConfig) {
             drop(cluster.peer(peer).unwrap().collection::<Note>());
             restarts += 1;
         }
+        tokio::time::sleep(remaining_round_delay(
+            config.minimum_round_duration,
+            round_started.elapsed(),
+        ))
+        .await;
         if rounds.is_multiple_of(25) {
             if let Some(path) = &config.metrics_path {
                 let sample = append_resource_metrics(path, started, rounds).unwrap();
@@ -237,6 +250,10 @@ async fn run_schedule(config: RunConfig) {
     cluster.shutdown().await.unwrap();
 }
 
+fn remaining_round_delay(minimum: Duration, elapsed: Duration) -> Duration {
+    minimum.saturating_sub(elapsed)
+}
+
 fn positive_env_u64(name: &str) -> Result<Option<u64>, String> {
     parse_positive_u64(name, std::env::var_os(name))
 }
@@ -269,6 +286,18 @@ fn qualification_inputs_reject_zero_and_malformed_values() {
     );
     assert!(parse_positive_u64("TEST", Some("0".into())).is_err());
     assert!(parse_positive_u64("TEST", Some("nope".into())).is_err());
+}
+
+#[test]
+fn qualification_round_pacing_only_sleeps_for_the_remaining_budget() {
+    assert_eq!(
+        remaining_round_delay(Duration::from_secs(1), Duration::from_millis(250)),
+        Duration::from_millis(750)
+    );
+    assert_eq!(
+        remaining_round_delay(Duration::from_secs(1), Duration::from_secs(2)),
+        Duration::ZERO
+    );
 }
 
 #[test]

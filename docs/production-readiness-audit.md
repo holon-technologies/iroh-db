@@ -108,6 +108,7 @@ IROH_DB_SOAK_DURATION_SECS=259200 \
 IROH_DB_SOAK_RESTART_EVERY=97 \
 IROH_DB_SOAK_RECORD_SLOTS=256 \
 IROH_DB_SOAK_MAX_RSS_ANON_KIB=262144 \
+IROH_DB_SOAK_MIN_ROUND_MILLIS=1000 \
 IROH_DB_SOAK_OPERATION_TIMEOUT_SECS=30 \
 IROH_DB_SOAK_METRICS_PATH=iroh-db-soak-metrics.tsv \
   cargo test -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --nocapture
@@ -120,7 +121,9 @@ resource evidence alongside the test log. The metrics capture total,
 anonymous, file-backed, and shared process RSS; thread and descriptor counts;
 host available memory; and memory-pressure stall data every 25 rounds and at a
 synchronization failure. Anonymous RSS above the configured 256 MiB budget
-fails the test immediately.
+fails the test immediately. The official one-second minimum round duration
+still exercises approximately 259,000 rounds while preventing benchmark-speed
+commit production from exhausting the qualification volume.
 
 The qualification attempt started on 2026-07-20 was invalidated after 4,744.93
 seconds. It completed 20,000 rounds and 206 durable restarts before a sync
