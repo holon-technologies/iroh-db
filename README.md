@@ -117,11 +117,13 @@ convergence reports. The extended qualification soak accepts an exact duration:
 IROH_DB_SOAK_DURATION_SECS=259200 \
 IROH_DB_SOAK_RESTART_EVERY=97 \
 IROH_DB_SOAK_OPERATION_TIMEOUT_SECS=30 \
+IROH_DB_SOAK_METRICS_PATH=iroh-db-soak-metrics.tsv \
   cargo test --locked -p iroh-db-testkit --test churn extended_partition_reconnect_soak -- --ignored --exact --nocapture
 ```
 
 The monthly/manual `production soak` workflow runs that 72-hour gate on an
-explicitly labelled self-hosted runner and retains its log.
+explicitly labelled self-hosted runner and retains both its log and Linux
+process/host resource metrics.
 
 ## License
 
